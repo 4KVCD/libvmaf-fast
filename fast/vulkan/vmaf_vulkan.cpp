@@ -492,6 +492,10 @@ struct vv_context {
     std::vector<Buffer *> buffers;
     Buffer picRef, picDis, blur[2], vifTmp, rdRef[2], rdDis[2], logTable, divTable;
     Buffer bandsRef[2], bandsDis[2], admR, admA, admF, acc;
+    // VMAF NEG's decoupled images, made beside VMAF's by one pass (adm_decouple's
+    // BOTH); VV_ADM_BOTH=0 for a pass each, to compare.
+    Buffer admRB, admAB, admFB;
+    bool admBoth = true;
 
     std::vector<Pass> motion[2];  // by frame parity
     std::vector<Pass> scored;     // VIF and ADM
@@ -882,15 +886,28 @@ int vv_context::build_passes()
                 if (right > bw) right = bw;
                 if (top < 0) top = 0;
                 if (bottom > bh) bottom = bh;
-                const uint32_t constants[] = { (uint32_t)top, (uint32_t)bottom, (uint32_t)left, (uint32_t)right,
-                                               (uint32_t)bandStride, (uint32_t)outStride,
-                                               limit == 0 ? 100u : 1u,
-                                               i_rfactor[scale * 3], i_rfactor[scale * 3 + 1], i_rfactor[scale * 3 + 2] };
-                const int decouple0 = decoupleVariant ? kShader_adm_decouple_0_v1 + decoupleVariant - 1
-                                                      : kShader_adm_decouple_0;
-                error = add_pass(scored, scale == 0 ? decouple0 : kShader_adm_decouple,
-                                 { &bandsRef[set], &bandsDis[set], &admR, &admA, &admF, &divTable }, constants,
-                                 sizeof constants, groups(right - left, 16), groups(bottom - top, 8));
+                const bool both = admBoth && !decoupleVariant;
+                if (both && limit == 0) {
+                    const uint32_t constants[] = { (uint32_t)top, (uint32_t)bottom, (uint32_t)left, (uint32_t)right,
+                                                   (uint32_t)bandStride, (uint32_t)outStride, 100u, 1u,
+                                                   i_rfactor[scale * 3], i_rfactor[scale * 3 + 1],
+                                                   i_rfactor[scale * 3 + 2] };
+                    error = add_pass(scored, scale == 0 ? kShader_adm_decouple_0_both : kShader_adm_decouple_both,
+                                     { &bandsRef[set], &bandsDis[set], &admR, &admA, &admF, &divTable,
+                                       &admRB, &admAB, &admFB },
+                                     constants, sizeof constants, groups(right - left, 16), groups(bottom - top, 8));
+                } else if (!both) {
+                    const uint32_t constants[] = { (uint32_t)top, (uint32_t)bottom, (uint32_t)left, (uint32_t)right,
+                                                   (uint32_t)bandStride, (uint32_t)outStride,
+                                                   limit == 0 ? 100u : 1u,
+                                                   i_rfactor[scale * 3], i_rfactor[scale * 3 + 1],
+                                                   i_rfactor[scale * 3 + 2] };
+                    const int decouple0 = decoupleVariant ? kShader_adm_decouple_0_v1 + decoupleVariant - 1
+                                                          : kShader_adm_decouple_0;
+                    error = add_pass(scored, scale == 0 ? decouple0 : kShader_adm_decouple,
+                                     { &bandsRef[set], &bandsDis[set], &admR, &admA, &admF, &divTable }, constants,
+                                     sizeof constants, groups(right - left, 16), groups(bottom - top, 8));
+                }
                 if (error)
                     break;
             }
@@ -938,8 +955,10 @@ int vv_context::build_passes()
                 constants.shiftInner = ceil_log2(bh);
                 constants.addInner = constants.shiftInner ? 1 << (constants.shiftInner - 1) : 0;
                 constants.slot = (uint32_t)(kSlotCm + limit * kScales * 3 + scale * 3);
+                const bool fromB = admBoth && !decoupleVariant && limit == 1;
                 error = add_pass(scored, scale == 0 ? kShader_adm_cm_0 : kShader_adm_cm,
-                                 { &admR, &admA, &admF, &acc }, &constants, sizeof constants, 1,
+                                 { fromB ? &admRB : &admR, fromB ? &admAB : &admA, fromB ? &admFB : &admF, &acc },
+                                 &constants, sizeof constants, 1,
                                  (uint32_t)std::max(0, end_row - start_row));
             }
         }
@@ -1331,6 +1350,8 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     }
     if (const char *text = getenv("VV_VIF_FUSED"))
         vifFused = strcmp(text, "0") != 0;
+    if (const char *text = getenv("VV_ADM_BOTH"))
+        admBoth = strcmp(text, "0") != 0;
     // For experiments: VV_SUBGROUP="shader=16,shader=8" or "*=16".
     if (const char *text = getenv("VV_SUBGROUP")) {
         std::string spec = text;
@@ -1440,6 +1461,9 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         { &bandsRef[1], (VkDeviceSize)w2 * h2 * 16 }, { &bandsDis[1], (VkDeviceSize)w2 * h2 * 16 },
         { &admR, (VkDeviceSize)w1 * h1 * 16 }, { &admA, (VkDeviceSize)w1 * h1 * 16 },
         { &admF, (VkDeviceSize)w1 * h1 * 16 }, { &acc, kSlots * 8 },
+        { &admRB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
+        { &admAB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
+        { &admFB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
     };
     for (auto &entry : sized) {
         if (int error = create_buffer(*entry.buffer, entry.bytes, false))
@@ -1490,7 +1514,8 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         vk.vkBeginCommandBuffer(cb, &begin);
         for (Buffer *buffer : { &blur[0], &blur[1], &vifTmp, &rdRef[0], &rdDis[0], &rdRef[1], &rdDis[1],
                                 &bandsRef[0], &bandsDis[0], &bandsRef[1], &bandsDis[1], &admR, &admA, &admF,
-                                &picPrev[0], &picPrev[1], &admAdditive, &admCsfR, &admCsfRF })
+                                &admRB, &admAB, &admFB, &picPrev[0], &picPrev[1], &admAdditive, &admCsfR,
+                                &admCsfRF })
             vk.vkCmdFillBuffer(cb, buffer->buffer, 0, VK_WHOLE_SIZE, 0);
         vk.vkEndCommandBuffer(cb);
         VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -1954,12 +1979,12 @@ VV_EXPORT const char *vv_device_name(vv_context *context) { return context->devi
 
 // A device buffer's first `bytes` bytes, after vv_flush; for tests. `which`:
 // 0 admR, 1 admA, 2 admF, 3 bandsRef[0], 4 bandsDis[0], 5 bandsRef[1], 6 bandsDis[1], 7 vifTmp,
-// 8 the division table, 9 the logarithm table.
+// 8 the division table, 9 the logarithm table, 10 admRB, 11 admAB, 12 admFB (VMAF NEG's, BOTH).
 VV_EXPORT int vv_read_buffer(vv_context *context, int which, void *out, uint64_t bytes)
 {
     Buffer *all[] = { &context->admR, &context->admA, &context->admF, &context->bandsRef[0], &context->bandsDis[0],
                       &context->bandsRef[1], &context->bandsDis[1], &context->vifTmp, &context->divTable,
-                      &context->logTable };
+                      &context->logTable, &context->admRB, &context->admAB, &context->admFB };
     if (which < 0 || which >= (int)(sizeof all / sizeof all[0]))
         return fail(-3, "no such buffer");
     Buffer *source = all[which];
