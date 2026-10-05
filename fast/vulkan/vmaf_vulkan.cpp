@@ -75,7 +75,8 @@
     X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCreateFence) X(vkDestroyFence) \
     X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) X(vkDeviceWaitIdle) X(vkGetFenceStatus) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) \
-    X(vkCmdCopyImageToBuffer)
+    X(vkCmdCopyImageToBuffer) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) \
+    X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 namespace {
 
@@ -420,6 +421,10 @@ struct Slot {
     bool busy = false;
     bool scored = false;
     unsigned index = 0;
+    // Timing tests: what each timestamp of this slot's commands follows
+    // (a shader, or kShaderCount: the frames' copies, + 1: the sums' copy).
+    int stamped[64] = {};
+    uint32_t stamps = 0;
 };
 
 enum { kPushBytes = 128, kMaxBindings = 9 };
@@ -506,6 +511,18 @@ struct vv_context {
     std::vector<FrameSums> sums;
     bool failed = false;
 
+    // Timing tests (VV_GPU_TIME=<file>): each pair's time on the GPU, from
+    // timestamps around its commands, added up and appended to the file
+    // when the context closes, with the time from the first pair's start to
+    // the last one's end (the difference: the GPU idle between pairs).
+    VkQueryPool timePool = VK_NULL_HANDLE;
+    std::string timeFile;
+    double timestampNs = 0, gpuNs = 0;
+    uint64_t firstStart = 0, lastEnd = 0;
+    unsigned timed = 0;
+    double passNs[kShaderCount + 2] = {};
+    static constexpr uint32_t kStamps = 64;
+
     ~vv_context();
     int init(int deviceIndex, int width, int height, int bitDepth, int flags);
     int create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported = false);
@@ -528,6 +545,26 @@ vv_context::~vv_context()
     if (!device)
         return;
     vk.vkDeviceWaitIdle(device);
+    if (timePool) {
+        for (Slot &slot : slots)
+            collect(slot);
+        if (FILE *file = fopen(timeFile.c_str(), "a")) {
+            const double span = lastEnd > firstStart ? (double)(lastEnd - firstStart) * timestampNs : 0;
+            fprintf(file, "%dx%d %u pairs: %.3f ms a pair on the GPU, %.3f ms a pair from first to last, busy %.1f%%\n",
+                    w, h, timed, timed ? gpuNs / timed / 1e6 : 0.0, timed ? span / timed / 1e6 : 0.0,
+                    span > 0 ? 100.0 * gpuNs / span : 0.0);
+            std::vector<int> order;
+            for (int i = 0; i < kShaderCount + 2; ++i)
+                if (passNs[i] > 0)
+                    order.push_back(i);
+            std::sort(order.begin(), order.end(), [&](int a, int b) { return passNs[a] > passNs[b]; });
+            for (int i : order)
+                fprintf(file, "    %8.3f ms  %s\n", timed ? passNs[i] / timed / 1e6 : 0.0,
+                        i < kShaderCount ? kShaders[i].name : i == kShaderCount ? "(frames in)" : "(sums out)");
+            fclose(file);
+        }
+        vk.vkDestroyQueryPool(device, timePool, nullptr);
+    }
     for (Slot &slot : slots) {
         if (slot.fence)
             vk.vkDestroyFence(device, slot.fence, nullptr);
@@ -1490,6 +1527,15 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         if (int error = create_buffer(slot.result, kSlots * 8, true))
             return error;
     }
+    if (const char *file = getenv("VV_GPU_TIME"); file && *file && families[queueFamily].timestampValidBits) {
+        VkQueryPoolCreateInfo queryInfo = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        queryInfo.queryCount = kStamps * (uint32_t)slots.size();
+        if (vk.vkCreateQueryPool(device, &queryInfo, nullptr, &timePool) != VK_SUCCESS)
+            timePool = VK_NULL_HANDLE;
+        timeFile = file;
+        timestampNs = properties.limits.timestampPeriod;
+    }
 
     // The tables, and zeros where a first frame reads before anything wrote:
     // the previous blur (as the CUDA code's memset) and the band images.
@@ -1540,6 +1586,20 @@ int vv_context::collect(Slot &slot)
                                              : "the GPU failed (" + std::to_string(result) + ")");
     }
     vk.vkResetFences(device, 1, &slot.fence);
+    if (timePool) {
+        uint64_t stamps[kStamps];
+        const uint32_t query = kStamps * (uint32_t)(&slot - slots.data()), n = slot.stamps;
+        if (n >= 2 && vk.vkGetQueryPoolResults(device, timePool, query, n, sizeof stamps, stamps, 8,
+                                               VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            gpuNs += (double)(stamps[n - 1] - stamps[0]) * timestampNs;
+            for (uint32_t i = 1; i < n; ++i)
+                passNs[slot.stamped[i]] += (double)(stamps[i] - stamps[i - 1]) * timestampNs;
+            if (!timed || stamps[0] < firstStart)
+                firstStart = stamps[0];
+            lastEnd = std::max(lastEnd, stamps[n - 1]);
+            ++timed;
+        }
+    }
     FrameSums &frame = sums[slot.index];
     frame.scored = slot.scored;
     const uint32_t *words = (const uint32_t *)slot.result.mapped;
@@ -1607,6 +1667,18 @@ int vv_context::commit(bool score)
     VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk.vkBeginCommandBuffer(cb, &begin);
+    const uint32_t query = kStamps * (uint32_t)(&slot - slots.data());
+    slot.stamps = 0;
+    // Each timestamp once the GPU is done with everything before it.
+    auto stamp = [&](int what) {
+        if (timePool && slot.stamps < kStamps) {
+            vk.vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timePool, query + slot.stamps);
+            slot.stamped[slot.stamps++] = what;
+        }
+    };
+    if (timePool)
+        vk.vkCmdResetQueryPool(cb, timePool, query, kStamps);
+    stamp(-1);
     barrier(vk, cb, kCompute | kTransfer, kTransfer);
     if (pendingTextures[0] >= 0) {
         // From the decoder's Direct3D textures: taken over from the
@@ -1651,6 +1723,7 @@ int vv_context::commit(bool score)
     }
     vk.vkCmdFillBuffer(cb, acc.buffer, 0, VK_WHOLE_SIZE, 0);
     barrier(vk, cb, kTransfer, kCompute);
+    stamp(kShaderCount);
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
     const std::vector<Pass> *lists[2] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr };
     for (const std::vector<Pass> *list : lists) {
@@ -1668,6 +1741,7 @@ int vv_context::commit(bool score)
             vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pass.constantBytes, pass.constants);
             vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], pass.groups[2]);
             barrier(vk, cb, kCompute, kCompute | kTransfer);
+            stamp(pass.shader);
         }
     }
     if (v1) {
@@ -1677,6 +1751,7 @@ int vv_context::commit(bool score)
     }
     VkBufferCopy back = { 0, 0, kSlots * 8 };
     vk.vkCmdCopyBuffer(cb, acc.buffer, slot.result.buffer, 1, &back);
+    stamp(kShaderCount + 1);
     vk.vkEndCommandBuffer(cb);
     VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.commandBufferCount = 1;
