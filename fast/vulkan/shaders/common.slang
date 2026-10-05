@@ -59,6 +59,29 @@ void store_packed(RWStructuredBuffer<int> buffer, int pixel, int v0, int v1, int
     buffer[pixel * ADM_PACKED_WORDS + 1] = v2;
 }
 
+// ADM's band images (adm_dwt's outputs): each position's h, v and d -- at
+// scale 0 16-bit, h and v in the low and high half of the first word and d
+// in the second; at the other scales 32-bit, three words. The approximation
+// band a, which only the next scale's transform reads, is in an image of its
+// own (one word a position). Four words a position, a h v d together, made
+// the next scale's transform read four times the memory it needs, and scale
+// 0's readers twice.
+#define ADM_HVD_WORDS0 2
+#define ADM_HVD_WORDS 3
+
+void adm_hvd(StructuredBuffer<uint> bands, int position, bool scale0, out int v[3])
+{
+    if (scale0) {
+        int first = int(bands[position * ADM_HVD_WORDS0]);
+        v[0] = sext16(first);
+        v[1] = first >> 16;
+        v[2] = int(bands[position * ADM_HVD_WORDS0 + 1]);
+    } else {
+        for (int b = 0; b < 3; ++b)
+            v[b] = int(bands[position * ADM_HVD_WORDS + b]);
+    }
+}
+
 int msb32(uint v) { return int(firstbithigh(v)); }  // v != 0
 
 int msb64(uint64_t v)  // v != 0

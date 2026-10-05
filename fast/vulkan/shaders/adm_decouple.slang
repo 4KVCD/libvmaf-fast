@@ -161,7 +161,7 @@ void main(uint3 id : SV_DispatchThreadID)
     int i = pc.top + int(id.y), j = pc.left + int(id.x);
     if (i >= pc.bottom || j >= pc.right)
         return;
-    int from = (i * pc.inStride + j) * 4, to = (i * pc.outStride + j) * 4;
+    int from = i * pc.inStride + j, to = (i * pc.outStride + j) * 4;
 #if SCALE0 && VARIANT < 2
     // The outputs, stored packed once the three bands are done.
     int outRestored[LIMITS][3], outA[LIMITS][3], outF[LIMITS][3];
@@ -170,10 +170,8 @@ void main(uint3 id : SV_DispatchThreadID)
 #endif
 #endif
     int o[3], t[3];
-    for (int b = 0; b < 3; ++b) {
-        o[b] = int(refBands[from + 1 + b]);
-        t[b] = int(disBands[from + 1 + b]);
-    }
+    adm_hvd(refBands, from, SCALE0 != 0, o);
+    adm_hvd(disBands, from, SCALE0 != 0, t);
     int64_t otDp = int64_t(o[0]) * t[0] + int64_t(o[1]) * t[1];
     int64_t oMagSq = int64_t(o[0]) * o[0] + int64_t(o[1]) * o[1];
     int64_t tMagSq = int64_t(t[0]) * t[0] + int64_t(t[1]) * t[1];

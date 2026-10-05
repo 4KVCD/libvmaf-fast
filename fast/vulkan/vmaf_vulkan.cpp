@@ -509,7 +509,9 @@ struct vv_context {
     Pipeline pipelines[kShaderCount];
     std::vector<Buffer *> buffers;
     Buffer picRef, picDis, blur[2], vifTmp, rdRef[2], rdDis[2], logTable, divTable;
-    Buffer bandsRef[2], bandsDis[2], admR, admA, admF, acc;
+    // ADM's band images by scale parity: h, v, d (bandsRef, bandsDis) and a
+    // (bandsARef, bandsADis), as common.slang's adm_hvd describes.
+    Buffer bandsRef[2], bandsDis[2], bandsARef[2], bandsADis[2], admR, admA, admF, acc;
     // VMAF NEG's decoupled images, made beside VMAF's by one pass (adm_decouple's
     // BOTH); VV_ADM_BOTH=0 for a pass each, to compare.
     Buffer admRB, admAB, admFB;
@@ -892,8 +894,8 @@ int vv_context::build_passes()
     int inW = w, inH = h, inStride = strideWords;
     for (int scale = 0; scale < kScales && !error && !(skip & 4); ++scale) {
         const int set = scale % 2;
-        Buffer *inRef = scale == 0 ? &picRef : &bandsRef[1 - set];
-        Buffer *inDis = scale == 0 ? &picDis : &bandsDis[1 - set];
+        Buffer *inRef = scale == 0 ? &picRef : &bandsARef[1 - set];
+        Buffer *inDis = scale == 0 ? &picDis : &bandsADis[1 - set];
         const int bw = (inW + 1) / 2, bh = (inH + 1) / 2;
         const int bandStride = set == 0 ? (w + 1) / 2 : ((w + 1) / 2 + 1) / 2;
         const int outStride = (w + 1) / 2;  // of admR, admA, admF
@@ -905,7 +907,8 @@ int vv_context::build_passes()
                                           scale == 0 ? bpc : kV[scale][0], scale == 0 ? 1 << (bpc - 1) : kV[scale][1],
                                           kH[scale][0], kH[scale][1] };
             const int shader = scale == 0 ? (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8) : kShader_adm_dwt;
-            error = add_pass(scored, shader, { inRef, inDis, &bandsRef[set], &bandsDis[set] }, constants,
+            error = add_pass(scored, shader, { inRef, inDis, &bandsRef[set], &bandsDis[set], &bandsARef[set],
+                                               &bandsADis[set] }, constants,
                              sizeof constants, groups(bw, 16), groups(bh, 8));
             if (error)
                 break;
@@ -1102,8 +1105,8 @@ int vv_context::build_passes_v1()
     int inW = w, inH = h, inStride = strideWords;
     for (int scale = 0; scale < kScales && !error; ++scale) {
         const int set = scale % 2;
-        Buffer *inRef = scale == 0 ? &picRef : &bandsRef[1 - set];
-        Buffer *inDis = scale == 0 ? &picDis : &bandsDis[1 - set];
+        Buffer *inRef = scale == 0 ? &picRef : &bandsARef[1 - set];
+        Buffer *inDis = scale == 0 ? &picDis : &bandsADis[1 - set];
         const int bw = (inW + 1) / 2, bh = (inH + 1) / 2;
         const int bandStride = set == 0 ? (w + 1) / 2 : ((w + 1) / 2 + 1) / 2;
         const int outStride = (w + 1) / 2;
@@ -1137,7 +1140,8 @@ int vv_context::build_passes_v1()
                                           scale == 0 ? bpc : kV[scale][0], scale == 0 ? 1 << (bpc - 1) : kV[scale][1],
                                           kH[scale][0], kH[scale][1] };
             const int shader = scale == 0 ? (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8) : kShader_adm_dwt;
-            error = add_pass(scored, shader, { inRef, inDis, &bandsRef[set], &bandsDis[set] }, constants,
+            error = add_pass(scored, shader, { inRef, inDis, &bandsRef[set], &bandsDis[set], &bandsARef[set],
+                                               &bandsADis[set] }, constants,
                              sizeof constants, groups(bw, 16), groups(bh, 8));
             if (error)
                 break;
@@ -1537,8 +1541,11 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         { &admAdditive, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 }, { &admCsfR, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 },
         { &admCsfRF, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 },
         { &logTable, 32768 * 4 }, { &divTable, 65536 * 4 },
-        { &bandsRef[0], (VkDeviceSize)w1 * h1 * 16 }, { &bandsDis[0], (VkDeviceSize)w1 * h1 * 16 },
-        { &bandsRef[1], (VkDeviceSize)w2 * h2 * 16 }, { &bandsDis[1], (VkDeviceSize)w2 * h2 * 16 },
+        // Scales 0 and 2: two words a position at scale 0; 1 and 3: three.
+        { &bandsRef[0], (VkDeviceSize)w1 * h1 * 8 }, { &bandsDis[0], (VkDeviceSize)w1 * h1 * 8 },
+        { &bandsRef[1], (VkDeviceSize)w2 * h2 * 12 }, { &bandsDis[1], (VkDeviceSize)w2 * h2 * 12 },
+        { &bandsARef[0], (VkDeviceSize)w1 * h1 * 4 }, { &bandsADis[0], (VkDeviceSize)w1 * h1 * 4 },
+        { &bandsARef[1], (VkDeviceSize)w2 * h2 * 4 }, { &bandsADis[1], (VkDeviceSize)w2 * h2 * 4 },
         { &admR, (VkDeviceSize)w1 * h1 * 16 }, { &admA, (VkDeviceSize)w1 * h1 * 16 },
         { &admF, (VkDeviceSize)w1 * h1 * 16 }, { &acc, kSlots * 8 },
         { &admRB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
@@ -1604,7 +1611,8 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vk.vkBeginCommandBuffer(cb, &begin);
         for (Buffer *buffer : { &blur[0], &blur[1], &vifTmp, &rdRef[0], &rdDis[0], &rdRef[1], &rdDis[1],
-                                &bandsRef[0], &bandsDis[0], &bandsRef[1], &bandsDis[1], &admR, &admA, &admF,
+                                &bandsRef[0], &bandsDis[0], &bandsRef[1], &bandsDis[1], &bandsARef[0],
+                                &bandsADis[0], &bandsARef[1], &bandsADis[1], &admR, &admA, &admF,
                                 &admRB, &admAB, &admFB, &picPrev[0], &picPrev[1], &admAdditive, &admCsfR,
                                 &admCsfRF })
             vk.vkCmdFillBuffer(cb, buffer->buffer, 0, VK_WHOLE_SIZE, 0);
@@ -2100,12 +2108,14 @@ VV_EXPORT const char *vv_device_name(vv_context *context) { return context->devi
 
 // A device buffer's first `bytes` bytes, after vv_flush; for tests. `which`:
 // 0 admR, 1 admA, 2 admF, 3 bandsRef[0], 4 bandsDis[0], 5 bandsRef[1], 6 bandsDis[1], 7 vifTmp,
-// 8 the division table, 9 the logarithm table, 10 admRB, 11 admAB, 12 admFB (VMAF NEG's, BOTH).
+// 8 the division table, 9 the logarithm table, 10 admRB, 11 admAB, 12 admFB (VMAF NEG's, BOTH),
+// 13 bandsARef[0], 14 bandsADis[0], 15 bandsARef[1], 16 bandsADis[1]. 3-6 hold h, v, d (adm_hvd).
 VV_EXPORT int vv_read_buffer(vv_context *context, int which, void *out, uint64_t bytes)
 {
     Buffer *all[] = { &context->admR, &context->admA, &context->admF, &context->bandsRef[0], &context->bandsDis[0],
                       &context->bandsRef[1], &context->bandsDis[1], &context->vifTmp, &context->divTable,
-                      &context->logTable, &context->admRB, &context->admAB, &context->admFB };
+                      &context->logTable, &context->admRB, &context->admAB, &context->admFB,
+                      &context->bandsARef[0], &context->bandsADis[0], &context->bandsARef[1], &context->bandsADis[1] };
     if (which < 0 || which >= (int)(sizeof all / sizeof all[0]))
         return fail(-3, "no such buffer");
     Buffer *source = all[which];

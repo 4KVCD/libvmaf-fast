@@ -41,8 +41,10 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     int row = (pc.top + int(group.y)) * pc.stride;
     uint64_t sums[3] = { 0, 0, 0 };
     for (int j = pc.left + int(local); j < pc.right; j += 128) {
+        int bands[3];
+        adm_hvd(refBands, row + j, SCALE0 != 0, bands);
         for (int b = 0; b < 3; ++b) {
-            int value = int(refBands[(row + j) * 4 + 1 + b]);
+            int value = bands[b];
 #if SCALE0
             uint64_t t = uint64_t(uint(abs(value)) & 0xFFFFu);
             sums[b] += t * t * t;
@@ -85,8 +87,10 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     uint64_t sums[3] = { 0, 0, 0 };
     for (int i = 0; i < 8; ++i) {
         if (j < pc.right) {
+            int bands[3];
+            adm_hvd(refBands, row + j, SCALE0 != 0, bands);
             for (int b = 0; b < 3; ++b) {
-                int value = int(refBands[(row + j) * 4 + 1 + b]);
+                int value = bands[b];
 #if SCALE0
                 uint64_t t = uint64_t(uint(abs(value)) & 0xFFFFu);
                 sums[b] += t * t * t;
