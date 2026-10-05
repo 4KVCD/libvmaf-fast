@@ -1,3 +1,8 @@
+> **libvmaf-fast** is an unofficial fork of Netflix's VMAF, not affiliated with or endorsed by Netflix.
+> It adds VMAF v0.6.1 and VMAF NEG on any GPU with Vulkan and VMAF v1 with the GPU, bit-identical to libvmaf, and
+> fixes to libvmaf's CUDA backend from open upstream pull requests. See [fast/README.md](fast/README.md).
+> The rest of this page is upstream's README.
+
 # VMAF - Video Multi-Method Assessment Fusion
 
 [![libvmaf](https://github.com/Netflix/vmaf/actions/workflows/libvmaf.yml/badge.svg)](https://github.com/Netflix/vmaf/actions/workflows/libvmaf.yml)
