@@ -79,6 +79,14 @@ static int pooled_picture_release(VmafPicture *pic, void *cookie)
     return 0;
 }
 
+static void free_picture_data(VmafPicturePool *pool, VmafPicture *pic)
+{
+    if (pool->cfg.free_picture_data)
+        pool->cfg.free_picture_data(pic, pool->cfg.cookie);
+    else
+        aligned_free(pic->data[0]);
+}
+
 int vmaf_picture_pool_init(VmafPicturePool **pool,
                            VmafPicturePoolConfig cfg)
 {
@@ -115,12 +123,16 @@ int vmaf_picture_pool_init(VmafPicturePool **pool,
 
     // Pre-allocate all pictures with their data buffers
     for (unsigned i = 0; i < cfg.pic_cnt; i++) {
-        err = vmaf_picture_alloc(&p->pictures[i], cfg.pix_fmt, cfg.bpc,
-                                 cfg.w, cfg.h);
+        err = cfg.alloc_picture ?
+            cfg.alloc_picture(&p->pictures[i], cfg.pix_fmt, cfg.bpc,
+                              cfg.w, cfg.h, cfg.cookie) :
+            vmaf_picture_alloc(&p->pictures[i], cfg.pix_fmt, cfg.bpc,
+                               cfg.w, cfg.h);
         if (err) {
-            // Free any pictures we've already allocated
+            // Free the data of the pictures already allocated (their priv
+            // and ref are gone already, so vmaf_picture_unref cannot)
             for (unsigned j = 0; j < i; j++) {
-                vmaf_picture_unref(&p->pictures[j]);
+                free_picture_data(p, &p->pictures[j]);
             }
             goto free_cond;
         }
@@ -167,7 +179,7 @@ int vmaf_picture_pool_close(VmafPicturePool *pool)
     // Free all pictures (including their data buffers)
     for (unsigned i = 0; i < pool->cfg.pic_cnt; i++) {
         // Data pointers are in the picture, just free them directly
-        aligned_free(pool->pictures[i].data[0]);
+        free_picture_data(pool, &pool->pictures[i]);
     }
 
     pthread_mutex_unlock(&pool->lock);
@@ -179,6 +191,8 @@ int vmaf_picture_pool_close(VmafPicturePool *pool)
     free(pool);
     return 0;
 }
+
+static int hand_out(VmafPicturePool *pool, unsigned idx, VmafPicture *pic);
 
 int vmaf_picture_pool_fetch(VmafPicturePool *pool, VmafPicture *pic)
 {
@@ -202,6 +216,32 @@ int vmaf_picture_pool_fetch(VmafPicturePool *pool, VmafPicture *pic)
 
     pthread_mutex_unlock(&pool->lock);
 
+    return hand_out(pool, idx, pic);
+}
+
+int vmaf_picture_pool_try_fetch(VmafPicturePool *pool, VmafPicture *pic)
+{
+    if (!pool) return -EINVAL;
+    if (!pic) return -EINVAL;
+
+    int err = pthread_mutex_lock(&pool->lock);
+    if (err) return err;
+
+    if (pool->free_list_top == 0) {
+        pthread_mutex_unlock(&pool->lock);
+        return -EAGAIN;
+    }
+    unsigned idx = pool->free_list[--pool->free_list_top];
+
+    pthread_mutex_unlock(&pool->lock);
+
+    return hand_out(pool, idx, pic);
+}
+
+static int hand_out(VmafPicturePool *pool, unsigned idx, VmafPicture *pic)
+{
+    int err = 0;
+
     // Copy the pre-allocated picture (includes all metadata + data pointers)
     *pic = pool->pictures[idx];
 
@@ -212,6 +252,7 @@ int vmaf_picture_pool_fetch(VmafPicturePool *pool, VmafPicture *pic)
         goto return_to_pool;
     }
     memset(priv, 0, sizeof(*priv));
+    priv->base.buf_type = pool->cfg.buf_type;
     priv->pool = pool;
     priv->pic_idx = idx;
     pic->priv = (VmafPicturePrivate*)priv;

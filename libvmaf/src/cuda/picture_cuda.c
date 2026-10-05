@@ -163,6 +163,29 @@ fail:
     return -ENOMEM;
 }
 
+int vmaf_cuda_picture_pool_alloc_pinned(VmafPicture *pic,
+                                        enum VmafPixelFormat pix_fmt,
+                                        unsigned bpc, unsigned w, unsigned h,
+                                        void *cookie)
+{
+    if (!cookie) return -EINVAL;
+    return vmaf_cuda_picture_alloc_pinned(pic, pix_fmt, bpc, w, h, cookie);
+}
+
+int vmaf_cuda_picture_pool_free_pinned(VmafPicture *pic, void *cookie)
+{
+    if (!pic) return -EINVAL;
+    if (!cookie) return -EINVAL;
+
+    VmafCudaState *cuda_state = cookie;
+    CudaFunctions *cu_f = cuda_state->f;
+    CHECK_CUDA(cu_f, cuCtxPushCurrent(cuda_state->ctx));
+    CHECK_CUDA(cu_f, cuMemFreeHost(pic->data[0]));
+    CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL));
+
+    return 0;
+}
+
 int vmaf_cuda_picture_alloc(VmafPicture *pic, void *cookie)
 {
     if (!pic) return -EINVAL;

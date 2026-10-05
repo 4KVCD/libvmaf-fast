@@ -63,6 +63,18 @@ int vmaf_cuda_picture_alloc_pinned(VmafPicture *pic, enum VmafPixelFormat pix_fm
                                    unsigned bpc, unsigned w, unsigned h,
                                    VmafCudaState *cuda_state);
 
+/**
+ * A VmafPicturePool's alloc_picture and free_picture_data for page-locked
+ * pictures (VMAF_CUDA_PICTURE_PREALLOCATION_METHOD_HOST_PINNED). The cookie
+ * is the context's VmafCudaState.
+ */
+int vmaf_cuda_picture_pool_alloc_pinned(VmafPicture *pic,
+                                        enum VmafPixelFormat pix_fmt,
+                                        unsigned bpc, unsigned w, unsigned h,
+                                        void *cookie);
+
+int vmaf_cuda_picture_pool_free_pinned(VmafPicture *pic, void *cookie);
+
 int vmaf_cuda_picture_alloc(VmafPicture *pic, void *cookie);
 
 int vmaf_cuda_picture_free(VmafPicture *pic, void *cookie);

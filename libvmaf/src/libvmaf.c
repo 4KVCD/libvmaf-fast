@@ -82,6 +82,9 @@ typedef struct VmafContext {
         VmafCudaState state;
         VmafCudaCookie cookie;
         VmafRingBuffer* ring_buffer;
+        // Host pictures (page-locked for HOST_PINNED) for
+        // vmaf_cuda_fetch_preallocated_picture, reused from frame to frame
+        VmafPicturePool *host_pool;
     } cuda;
 #endif
     struct {
@@ -200,6 +203,36 @@ int vmaf_cuda_import_state(VmafContext *vmaf, VmafCudaState *cu_state)
     return 0;
 }
 
+/**
+ * The host pictures vmaf_cuda_fetch_preallocated_picture hands out for the
+ * HOST and HOST_PINNED methods, allocated once and reused. Allocating one
+ * for every fetch -- page-locked (cuMemHostAlloc, a synchronization point
+ * for the device), zeroed, and freed again (cuMemFreeHost) -- cost about
+ * 9 ms a 4K frame pair. Enough for a frame pair in flight, the two
+ * reference pictures kept for PREV_REF extractors and the thread pool's
+ * batches; a fetch finding none free falls back to allocating one, as
+ * before.
+ */
+static int prepare_host_pool(VmafContext *vmaf, VmafCudaPictureConfiguration cfg)
+{
+    const int pinned =
+        cfg.pic_prealloc_method == VMAF_CUDA_PICTURE_PREALLOCATION_METHOD_HOST_PINNED;
+    VmafPicturePoolConfig pool_cfg = {
+        .pic_cnt = 2 * vmaf->cfg.n_threads + 6,
+        .w = cfg.pic_params.w,
+        .h = cfg.pic_params.h,
+        .pix_fmt = cfg.pic_params.pix_fmt,
+        .bpc = cfg.pic_params.bpc,
+        .alloc_picture = pinned ? vmaf_cuda_picture_pool_alloc_pinned : NULL,
+        .free_picture_data = pinned ? vmaf_cuda_picture_pool_free_pinned : NULL,
+        .cookie = &vmaf->cuda.state,
+        .buf_type = pinned ? VMAF_PICTURE_BUFFER_TYPE_CUDA_HOST_PINNED :
+                             VMAF_PICTURE_BUFFER_TYPE_HOST,
+    };
+
+    return vmaf_picture_pool_init(&vmaf->cuda.host_pool, pool_cfg);
+}
+
 int vmaf_cuda_preallocate_pictures(VmafContext *vmaf, VmafCudaPictureConfiguration cfg)
 {
     if (!vmaf) return -EINVAL;
@@ -226,6 +259,13 @@ int vmaf_cuda_preallocate_pictures(VmafContext *vmaf, VmafCudaPictureConfigurati
                      "problem during cuda picture preallocation\n");
             return err;
         }
+        if (cfg.pic_prealloc_method != VMAF_CUDA_PICTURE_PREALLOCATION_METHOD_DEVICE)
+            err = prepare_host_pool(vmaf, cfg);
+        if (err) {
+            vmaf_log(VMAF_LOG_LEVEL_ERROR,
+                     "problem during cuda host picture preallocation\n");
+            return err;
+        }
         break;
     default:
         vmaf_log(VMAF_LOG_LEVEL_ERROR,
@@ -242,7 +282,11 @@ int vmaf_cuda_fetch_preallocated_picture(VmafContext *vmaf, VmafPicture* pic)
     if (!pic) return -EINVAL;
     if (!vmaf->cuda.ring_buffer) return -EINVAL;
 
-    //TODO: preallocate host pics
+    if (vmaf->cuda.host_pool) {
+        int err = vmaf_picture_pool_try_fetch(vmaf->cuda.host_pool, pic);
+        if (err != -EAGAIN) return err;
+        // All pool pictures are in use: allocate one, as before the pool
+    }
 
     switch (vmaf->cuda.cfg.pic_prealloc_method) {
     case VMAF_CUDA_PICTURE_PREALLOCATION_METHOD_DEVICE:
@@ -357,6 +401,8 @@ int vmaf_close(VmafContext *vmaf)
     if (vmaf->picture_pool)
         vmaf_picture_pool_close(vmaf->picture_pool);
 #ifdef HAVE_CUDA
+    if (vmaf->cuda.host_pool)
+        vmaf_picture_pool_close(vmaf->cuda.host_pool);
     if (vmaf->cuda.ring_buffer)
         vmaf_ring_buffer_close(vmaf->cuda.ring_buffer);
     if (vmaf->cuda.state.ctx)
@@ -893,6 +939,20 @@ int vmaf_read_pictures(VmafContext *vmaf, VmafPicture *ref, VmafPicture *dist,
 
     VmafPicture dist_host = { 0 }, dist_device = { 0 };
     err = translate_picture(vmaf, dist, &dist_host, &dist_device, hw_flags);
+
+    // Host pictures are released below, or by the thread pool, and a pooled
+    // one is then reused at once. An upload from page-locked memory runs on
+    // after cuMemcpy2DAsync returns, so it must be complete before that;
+    // nothing waited for it explicitly while every picture was a new
+    // allocation. From pageable memory the call returns once the data is
+    // staged: no wait.
+    if (!err && ref_device.priv && dist_device.priv &&
+        vmaf->pic_params.buf_type == VMAF_PICTURE_BUFFER_TYPE_CUDA_HOST_PINNED)
+    {
+        CudaFunctions *cu_f = vmaf->cuda.state.f;
+        CHECK_CUDA(cu_f, cuEventSynchronize(vmaf_cuda_picture_get_ready_event(&ref_device)));
+        CHECK_CUDA(cu_f, cuEventSynchronize(vmaf_cuda_picture_get_ready_event(&dist_device)));
+    }
 #endif
 
     for (unsigned i = 0; i < vmaf->registered_feature_extractors.cnt; i++) {
