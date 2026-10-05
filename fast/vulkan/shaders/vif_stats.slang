@@ -166,6 +166,94 @@ int64_t gain_term(uint64_t gm, int ge, int sigma1, uint limit)
 #endif
 }
 
+#ifndef VIF_FAST
+#define VIF_FAST 1
+#endif
+// Verification builds: the first of three spare sums (the engine's kSlots
+// raised by three) for the fast path's disagreements, refusals and pixels.
+#ifndef VIF_STATS_VERIFY
+#define VIF_STATS_VERIFY 0
+#endif
+
+// The fast path to what gain(), residual(), above() and gain_term() give
+// a pixel with sigma12 > 0, sigma2 > 0 and sigma1 >= 2^17: the residual sv
+// and the two limits' gain terms, from one exact integer division and a
+// few floats -- or false where the floats cannot settle them, and then the
+// exact path does.
+//
+// With D = sigma1 + eps as a double (the divisor gain() rounds), g = sigma12
+// / D, and P = sigma12^2 / sigma1 = Q + R / sigma1 (Q, R integers, found
+// exactly below):
+//   g * sigma12 = P / (1 + e),   g^2 * sigma1 = P / (1 + e)^2,   e = (D - sigma1) / sigma1 < 2^-34
+// so the double residual sigma2 - g * sigma12 is (sigma2 - Q) + (c - R /
+// sigma1) and the double gain term Q + (R / sigma1 - c2), c = P e / (1 + e),
+// c2 = c (2 + e) / (1 + e) = 2c to within c 2^-34. What is left is the
+// doubles' own rounding: g to 53 bits, the residual rounded once, the gain
+// term's two products -- at most (P + sigma2) 2^-51 together -- plus the
+// floats' error here (each operation within a few units in the last place:
+// at most (c + 1) 2^-20 for the fractions below). Their integer parts are
+// decided only where the float fraction is further than twice that from an
+// integer (Er, Et); elsewhere the exact path. g > limit is exactly
+// sigma12 > limit * sigma1: D exceeds sigma1 by under 2^-17, far less than
+// 1 / limit, and g is then at least 2^-38 (relative) away from limit, far
+// more than its rounding.
+bool fast_gain(int sigma12, int sigma1, int sigma2, out int sv, out int64_t terms[2])
+{
+    sv = 0;
+    terms[0] = terms[1] = 0;
+    const uint64_t S = uint64_t(uint(sigma12)) * uint(sigma12);
+    const int64_t divisor = int64_t(sigma1);
+    const float inv = 1.0 / float(uint(sigma1));
+    const float estimate = float(S) * inv;
+    if (!(estimate < 70368744177664.0))  // 2^46
+        return false;
+    // Q = S / sigma1 exactly: the estimate (within 2^25), two corrections
+    // from the remainder (each within 2^-21 of it), then the last unit.
+    int64_t q = int64_t(estimate);
+    int64_t rem = int64_t(S) - q * divisor;
+    for (int round = 0; round < 2; ++round) {
+        const int64_t d = int64_t(floor(float(rem) * inv));
+        q += d;
+        rem -= d * divisor;
+    }
+    for (int fix = 0; fix < 2; ++fix) {
+        if (rem < 0) {
+            q--;
+            rem += divisor;
+        } else if (rem >= divisor) {
+            q++;
+            rem -= divisor;
+        }
+    }
+    if (rem < 0 || rem >= divisor || q < 0)
+        return false;
+    const float fraction = float(uint(rem)) * inv;  // R / sigma1
+    const float P = float(q) + fraction;
+    const float c = P * (6.5536e-6 * inv);          // P eps / sigma1
+    // The residual: max((int)(sigma2 - g * sigma12), 0).
+    const float phi = c - fraction;
+    const float Er = (c + 1.0) * 1.9073486e-6 + (P + float(sigma2)) * 3.5527137e-15;  // 2^-19, 2^-48
+    const float whole = floor(phi);
+    if (phi - whole < Er || whole + 1.0 - phi < Er)
+        return false;
+    const int64_t residual = int64_t(sigma2) - q + int64_t(whole);
+    sv = residual > 0 ? int(residual) : 0;  // residual <= sigma2
+    // The gain terms, g capped at each limit.
+    if (uint64_t(uint(sigma12)) > uint64_t(pc.gainA) * uint(sigma1)) {
+        terms[0] = int64_t(uint64_t(pc.gainA) * pc.gainA * uint64_t(sigma1));
+    } else {
+        const float psi = fraction - 2.0 * c;
+        const float Et = (c + 1.0) * 1.9073486e-6 + P * 7.1054274e-15;  // 2^-19, 2^-47
+        const float part = floor(psi);
+        if (psi - part < Et || part + 1.0 - psi < Et)
+            return false;
+        terms[0] = q + int64_t(part);
+    }
+    terms[1] = pc.gainB == pc.gainA || uint64_t(uint(sigma12)) <= uint64_t(pc.gainB) * uint(sigma1)
+        ? terms[0] : int64_t(uint64_t(pc.gainB) * pc.gainB * uint64_t(sigma1));
+    return true;
+}
+
 void statistics(uint mu1, uint mu2, uint xx, uint yy, uint xy, inout int sums[SUMS])
 {
     uint mu1Sq = uint((uint64_t(mu1) * mu1 + 2147483648ull) >> 32);
@@ -188,24 +276,44 @@ void statistics(uint mu1, uint mu2, uint xx, uint yy, uint xy, inout int sums[SU
     if (sigma12 < 0)
         return;
     bool gained = sigma12 > 0 && sigma2 != 0;
-    uint64_t gm = 0;
-    int ge = 0;
     int sv = sigma2;
+    int64_t terms[2] = { 0, 0 };
+    bool fast = false;
+#if VIF_FAST && !NATIVE_F64
+    if (gained)
+        fast = fast_gain(sigma12, sigma1, sigma2, sv, terms);
+#endif
+#if VIF_STATS_VERIFY
+    // Verification builds: the exact path for every gained pixel too, and
+    // counts of the fast path's disagreements, refusals and pixels.
+    const int fastSv = sv;
+    const int64_t fastTerms[2] = { terms[0], terms[1] };
     if (gained) {
+#else
+    if (gained && !fast) {
+#endif
+        uint64_t gm = 0;
+        int ge = 0;
         gain(sigma12, sigma1, gm, ge);
         sv = residual(sigma2, gm, ge, sigma12);
-    }
-    uint numer1 = uint(sv + kSigmaNsq);
-    int x2;
-    uint denLog = log_generate(best16(uint64_t(numer1), x2));
-    // The gain term is the same for both limits unless g is above the
-    // lower one, and then that limit's term is just limit * limit * sigma1_sq.
-    int64_t terms[2] = { 0, 0 };
-    if (gained) {
+        // The gain term is the same for both limits unless g is above the
+        // lower one, and then that limit's term is just limit * limit * sigma1_sq.
         terms[0] = gain_term(gm, ge, sigma1, pc.gainA);
         terms[1] = pc.gainB == pc.gainA || !above(gm, ge, pc.gainB)
             ? terms[0] : int64_t(uint64_t(pc.gainB) * pc.gainB * uint64_t(sigma1));
     }
+#if VIF_STATS_VERIFY
+    if (gained) {
+        InterlockedAdd(acc[2 * (VIF_STATS_VERIFY + 2)], 1u);
+        if (!fast)
+            InterlockedAdd(acc[2 * (VIF_STATS_VERIFY + 1)], 1u);
+        else if (fastSv != sv || fastTerms[0] != terms[0] || fastTerms[1] != terms[1])
+            InterlockedAdd(acc[2 * VIF_STATS_VERIFY], 1u);
+    }
+#endif
+    uint numer1 = uint(sv + kSigmaNsq);
+    int x2;
+    uint denLog = log_generate(best16(uint64_t(numer1), x2));
     for (int v = 0; v < 2; ++v) {
         int64_t numer = int64_t(numer1) + terms[v];
         int x1;
