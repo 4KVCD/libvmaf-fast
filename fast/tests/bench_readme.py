@@ -1,6 +1,7 @@
-"""The README's speed table: VMAF v0.6.1 with VMAF NEG, and VMAF v1, on the CPU,
-with libvmaf's CUDA code and with Vulkan, from frames in system memory and
-from frames already in GPU memory (as a hardware decoder leaves them).
+"""The README's speed tables: VMAF v0.6.1 with VMAF NEG, and VMAF v1, on the
+CPU, with libvmaf's CUDA code and with Vulkan, for frames decoded on the CPU
+(in system memory) and frames decoded on the GPU (already in its memory, as
+NVIDIA's hardware decoder leaves them).
 
     python fast/tests/bench_readme.py REFERENCE DISTORTED [--size WxH] [--bits 10]
         [--frames 48] [--start 2] [--pairs 480] [--vmaf-only] [--only NAME...]
@@ -16,8 +17,13 @@ path it has:
 
 - CPU: libvmaf with pictures it allocates once and reuses
   (vmaf_preallocate_pictures), at 4, 8, 12, 16 and 24 threads.
-- CUDA from system memory: libvmaf's pinned host pictures
-  (VMAF_CUDA_PICTURE_PREALLOCATION_METHOD_HOST_PINNED), which it uploads.
+- CUDA from system memory: libvmaf's device pictures
+  (VMAF_CUDA_PICTURE_PREALLOCATION_METHOD_DEVICE), each luma copied into one
+  page-locked buffer allocated once and uploaded from there (as vv_submit
+  does). Also, as "libvmaf host": libvmaf's own pinned host pictures
+  (..._HOST_PINNED), which it uploads itself -- but for every picture
+  vmaf_cuda_fetch_preallocated_picture allocates, page-locks and zeroes a new
+  buffer (cuMemHostAlloc), which costs about 9 ms a 4K pair.
 - CUDA from GPU memory: libvmaf's device pictures, filled by copies on the
   GPU from frames held in GPU memory.
 - Vulkan from system memory: vv_submit (the luma copied into the engine's
@@ -30,7 +36,7 @@ path it has:
 
 VMAF v0.6.1 and NEG read only the luma, and only the luma is given to their
 scorers; VMAF v1's CAMBI and SpEED read the chroma too. Speed is pairs a
-second; CPU is the process's CPU time over the same span, in cores.
+second; cores is the process's CPU time over the same span.
 """
 from __future__ import annotations
 
@@ -164,6 +170,27 @@ class GpuFrames:
 
     def unimport(self, memory):
         self.cuda.cu.cuDestroyExternalMemory(ctypes.c_void_p(memory))
+
+
+class HostUpload:
+    """copy_luma for libvmaf's device pictures from frames in system memory:
+    the luma copied into one page-locked buffer, allocated once, and uploaded
+    from there -- what vv_submit does with the Vulkan engine's staging
+    memory."""
+
+    def __init__(self, cuda: Cuda, frames: list[bytearray], width: int, height: int, sample: int):
+        self.cuda, self.frames = cuda, frames
+        self.row, self.height = width * sample, height
+        self.staging = ctypes.c_void_p()
+        cuda.check(cuda.cu.cuMemHostAlloc(ctypes.byref(self.staging), ctypes.c_size_t(self.row * height), 0))
+
+    def copy_luma(self, slot, address, pitch):
+        frame = self.frames[slot]
+        ctypes.memmove(self.staging, (ctypes.c_char * len(frame)).from_buffer(frame), self.row * self.height)
+        c = _Memcpy2D(srcMemoryType=1, srcHost=self.staging.value, srcPitch=self.row, dstMemoryType=2,
+                      dstDevice=address, dstPitch=pitch, WidthInBytes=self.row, Height=self.height)
+        self.cuda.check(self.cuda.cu.cuMemcpy2DAsync_v2(ctypes.byref(c), self.cuda.stream))
+        self.cuda.check(self.cuda.cu.cuStreamSynchronize(self.cuda.stream))
 
 
 # --------------------------------------------------------------- scorers
@@ -301,24 +328,27 @@ def main():
         runs.append((f"v0 cpu {threads}", f"{v0}, libvmaf on the CPU, {threads} threads",
                      lambda t=threads: LibvmafScorer(w, h, bits, V0_MODELS, t), host))
     if cuda:
-        runs.append(("v0 cuda host", f"{v0}, libvmaf's CUDA code, from system memory (pinned)",
+        uploads = (HostUpload(cuda, ref[:n], w, h, sample), HostUpload(cuda, dis[:n], w, h, sample))
+        runs.append(("v0 cuda host", f"{v0}, libvmaf's CUDA code, CPU-decoded frames",
+                     lambda: LibvmafScorer(w, h, bits, V0_MODELS, cuda=_DEVICE, frames=uploads), device))
+        runs.append(("v0 cuda libvmaf host", f"{v0}, libvmaf's CUDA code, CPU-decoded, libvmaf's pinned pictures",
                      lambda: LibvmafScorer(w, h, bits, V0_MODELS, cuda=_HOST_PINNED), host))
-        runs.append(("v0 cuda gpu", f"{v0}, libvmaf's CUDA code, from GPU memory",
+        runs.append(("v0 cuda gpu", f"{v0}, libvmaf's CUDA code, GPU-decoded frames",
                      lambda: LibvmafScorer(w, h, bits, V0_MODELS, cuda=_DEVICE, frames=(gpu_ref, gpu_dis)), device))
     for index, name in devices.items():
-        runs.append((f"v0 vulkan host {index}", f"{v0}, Vulkan on {name}, from system memory",
+        runs.append((f"v0 vulkan host {index}", f"{v0}, Vulkan on {name}, CPU-decoded frames",
                      lambda i=index: vk.VulkanScorer(w, h, bits, V0_MODELS, device=i), host))
     if cuda:
-        runs.append(("v0 vulkan gpu", f"{v0}, Vulkan on {devices[nvidia]}, from GPU memory",
+        runs.append(("v0 vulkan gpu", f"{v0}, Vulkan on {devices[nvidia]}, GPU-decoded frames",
                      lambda: vk.VulkanScorer(w, h, bits, V0_MODELS, device=nvidia, shared=gpu_dis), shared_v0))
     for threads in (4, 8, 12, 16, 24):
         runs.append((f"v1 cpu {threads}", f"VMAF v1, libvmaf on the CPU, {threads} threads",
                      lambda t=threads: LibvmafScorer(w, h, bits, {}, t, v1_model=V1_MODEL), host))
     for index, name in devices.items():
-        runs.append((f"v1 hybrid host {index}", f"VMAF v1, CPU + Vulkan on {name}, from system memory",
+        runs.append((f"v1 hybrid host {index}", f"VMAF v1, CPU + Vulkan on {name}, CPU-decoded frames",
                      lambda i=index: v1.V1Scorer(w, h, bits, V1_MODEL, device=i), host))
     if cuda:
-        runs.append(("v1 hybrid gpu", f"VMAF v1, CPU + Vulkan on {devices[nvidia]}, from GPU memory",
+        runs.append(("v1 hybrid gpu", f"VMAF v1, CPU + Vulkan on {devices[nvidia]}, GPU-decoded frames",
                      lambda: v1.V1Scorer(w, h, bits, V1_MODEL, device=nvidia, shared=gpu_dis), shared_v1))
 
     scores = {}
@@ -341,7 +371,7 @@ def main():
             check = "scores identical"
         else:
             check = f"scores differ by at most {np.max(np.abs(first - values)):.6f}"
-        print(f"  {label:66s} {fps:7.1f} fps   {cores:5.1f} cores   mean {mean:.6f}, {check}", flush=True)
+        print(f"  {label:76s} {fps:7.1f} fps   {cores:5.1f} cores   mean {mean:.6f}, {check}", flush=True)
 
 
 if __name__ == "__main__":

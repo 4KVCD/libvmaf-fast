@@ -54,8 +54,8 @@ python fast\tests\bench_readme.py REFERENCE DISTORTED [--size 1920x1080 --pairs 
   DIFFER. Run all three on every GPU (`--device`, Vulkan's GPU number, which
   the scripts list) after any change to the engine.
 - `bench_readme.py`: the landing page's speed tables, every route on every
-  GPU it finds, with the CPU time each keeps busy (its docstring lists the
-  runs). The routes from GPU memory need an NVIDIA GPU.
+  GPU it finds (its docstring lists the runs). The GPU-decoded routes need an
+  NVIDIA GPU.
 
 `VMAF_FAST_DIST` points the bindings at DLLs elsewhere, `VMAF_FAST_MODELS` at
 the model files (by default `model/` of this repository).
