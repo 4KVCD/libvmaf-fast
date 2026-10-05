@@ -148,6 +148,13 @@ void main(uint3 id : SV_DispatchThreadID)
     if (i >= pc.bottom || j >= pc.right)
         return;
     int from = (i * pc.inStride + j) * 4, to = (i * pc.outStride + j) * 4;
+#if SCALE0 && VARIANT < 2
+    // The outputs, stored packed once the three bands are done.
+    int outRestored[3], outA[3], outF[3];
+#if V1
+    int outAdditive[3], outR[3], outRF[3];
+#endif
+#endif
     int o[3], t[3];
     for (int b = 0; b < 3; ++b) {
         o[b] = int(refBands[from + 1 + b]);
@@ -208,17 +215,17 @@ void main(uint3 id : SV_DispatchThreadID)
         int shown[6] = { quotient, k, int(wide >> 15), int(uint(wide)), int(uint(wide >> 32)), product };
         restored[to + b] = shown[VARIANT - 2];
 #else
-        restored[to + b] = sext16(rest);
+        outRestored[b] = sext16(rest);
         additive = sext16(t[b] - rest);
 
         int filtered = sext16((int(rfactor[b] * uint(additive)) + kAdd[b]) >> kShift[b]);
-        csfA[to + b] = filtered;
-        csfF[to + b] = sext16((4369 * abs(filtered) + 2048) >> 12);
+        outA[b] = filtered;
+        outF[b] = sext16((4369 * abs(filtered) + 2048) >> 12);
 #if V1
-        additiveOut[to + b] = additive;
+        outAdditive[b] = additive;
         int filteredR = sext16((int(rfactor[b] * uint(sext16(rest))) + kAdd[b]) >> kShift[b]);
-        csfR[to + b] = filteredR;
-        csfRF[to + b] = sext16((4369 * abs(filteredR) + 2048) >> 12);
+        outR[b] = filteredR;
+        outRF[b] = sext16((4369 * abs(filteredR) + 2048) >> 12);
 #endif
 #endif
 #else
@@ -255,4 +262,15 @@ void main(uint3 id : SV_DispatchThreadID)
 #endif
 #endif
     }
+#if SCALE0 && VARIANT < 2
+    int pixel = i * pc.outStride + j;
+    store_packed(restored, pixel, outRestored[0], outRestored[1], outRestored[2]);
+    store_packed(csfA, pixel, outA[0], outA[1], outA[2]);
+    store_packed(csfF, pixel, outF[0], outF[1], outF[2]);
+#if V1
+    store_packed(additiveOut, pixel, outAdditive[0], outAdditive[1], outAdditive[2]);
+    store_packed(csfR, pixel, outR[0], outR[1], outR[2]);
+    store_packed(csfRF, pixel, outRF[0], outRF[1], outRF[2]);
+#endif
+#endif
 }

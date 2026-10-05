@@ -43,9 +43,23 @@ struct Params {
 // x, num_x, den_log, num_non_log, den_non_log, then x2 and num_log per limit
 #define GROUP 64
 
-// A thread's sums fit in 32 bits; eight threads' may not.
-groupshared int gSums[GROUP * SUMS];
-groupshared int64_t gPartial[(GROUP / 8) * SUMS];
+// The group's threads add their sums up in two steps, in 32 bits: a GPU
+// without 64-bit integers of its own is slow at each 64-bit one, and here
+// every thread took part in them. A pixel's sums as WORDS values of which 64
+// cannot overflow 32 bits:
+//   0  -x (the shift k, 3..16) | num_x << 11 | den_non_log << 18   (the two
+//      are 0 or 1 a pixel)
+//   1  den_log (a logarithm: 16 bits)
+//   2, 3  num_non_log's low and high 16 bits (sigma2_sq: 31 bits)
+//   4, 6  x2 of each limit (a difference of two shifts)
+//   5, 7  num_log of each limit (a difference of two logarithms)
+#define WORDS 8
+groupshared int gSums[GROUP * WORDS];
+// The row's stretch the group's filters read, read once from tmp by the
+// group: each pixel's words are read by FW threads.
+#define TILE (GROUP + FW - 1)
+groupshared uint gTile[TILE * VIF_TMP_WORDS];
+groupshared int gPartial[(GROUP / 8) * WORDS];
 
 uint log_generate(uint v) { return logTable[v & 0x7FFFu]; }
 
@@ -261,6 +275,19 @@ void main(uint3 id : SV_DispatchThreadID, uint local : SV_GroupIndex)
     int sums[SUMS];
     for (int i = 0; i < SUMS; ++i)
         sums[i] = 0;
+    // The tile: the columns x - FW/2 .. x + FW/2 of the group's pixels,
+    // mirrored at the edges as the filter mirrors them. Columns only the
+    // group's pixels beyond the row read are clamped into it (and unused).
+    for (int i = int(local); i < TILE; i += GROUP) {
+        int column = abs(x - int(local) - FW / 2 + i);
+        if (column >= pc.w)
+            column = 2 * pc.w - column - 2;
+        column = clamp(column, 0, pc.w - 1);
+        uint from = (uint(y * pc.w) + uint(column)) * VIF_TMP_WORDS;
+        for (int word = 0; word < VIF_TMP_WORDS; ++word)
+            gTile[i * VIF_TMP_WORDS + word] = tmp[from + word];
+    }
+    GroupMemoryBarrierWithGroupSync();
     if (x < pc.w && y < pc.h) {
         uint mu1 = 0, mu2 = 0, refRdSum = 0, disRdSum = 0;
         // The 48-bit sums of coefficient * value in two 32-bit halves (of the
@@ -268,16 +295,13 @@ void main(uint3 id : SV_DispatchThreadID, uint local : SV_GroupIndex)
         // coefficients add up to 65536. No 64-bit multiply-adds, which a GPU
         // without 64-bit integers of its own is slow at.
         uint refSqHigh = 0, refSqLow = 0, disSqHigh = 0, disSqLow = 0, refDisHigh = 0, refDisLow = 0;
-        uint row = uint(y * pc.w);
         for (int fj = 0; fj < FW; ++fj) {
-            int column = abs(x - FW / 2 + fj);
-            if (column >= pc.w)
-                column = 2 * pc.w - column - 2;
-            uint at = (row + uint(column)) * 8;
+            uint at = (local + uint(fj)) * VIF_TMP_WORDS;
             uint coefficient = kVifFilter[SCALE][fj];
-            mu1 += coefficient * tmp[at + 0];
-            mu2 += coefficient * tmp[at + 1];
-            uint refSq = tmp[at + 2], disSq = tmp[at + 3], refDis = tmp[at + 4];
+            uint means = gTile[at + 0];
+            mu1 += coefficient * (means & 0xFFFFu);
+            mu2 += coefficient * (means >> 16);
+            uint refSq = gTile[at + 1], disSq = gTile[at + 2], refDis = gTile[at + 3];
             refSqHigh += coefficient * (refSq >> 16);
             refSqLow += coefficient * (refSq & 0xFFFFu);
             disSqHigh += coefficient * (disSq >> 16);
@@ -287,8 +311,9 @@ void main(uint3 id : SV_DispatchThreadID, uint local : SV_GroupIndex)
 #if FW_RD > 0
             if (fj >= OFF && fj < FW - OFF && (x & 1) == 0) {
                 uint next = kVifFilter[SCALE + 1][fj - OFF];
-                refRdSum += next * tmp[at + 5];
-                disRdSum += next * tmp[at + 6];
+                uint samples = gTile[at + 4];
+                refRdSum += next * (samples & 0xFFFFu);
+                disRdSum += next * (samples >> 16);
             }
 #endif
         }
@@ -303,25 +328,44 @@ void main(uint3 id : SV_DispatchThreadID, uint local : SV_GroupIndex)
         }
 #endif
     }
-    for (int i = 0; i < SUMS; ++i)
-        gSums[local * SUMS + i] = sums[i];
+    gSums[local * WORDS + 0] = -sums[0] | (sums[1] << 11) | (sums[4] << 18);
+    gSums[local * WORDS + 1] = sums[2];
+    gSums[local * WORDS + 2] = sums[3] & 0xFFFF;
+    gSums[local * WORDS + 3] = sums[3] >> 16;
+    gSums[local * WORDS + 4] = sums[5];
+    gSums[local * WORDS + 5] = sums[6];
+    gSums[local * WORDS + 6] = sums[7];
+    gSums[local * WORDS + 7] = sums[8];
     GroupMemoryBarrierWithGroupSync();
     if ((local & 7) == 0) {
-        for (int i = 0; i < SUMS; ++i) {
-            int64_t sum = 0;
+        for (int i = 0; i < WORDS; ++i) {
+            int sum = 0;
             for (uint t = 0; t < 8; ++t)
-                sum += int64_t(gSums[(local + t) * SUMS + i]);
-            gPartial[(local / 8) * SUMS + i] = sum;
+                sum += gSums[(local + t) * WORDS + i];
+            gPartial[(local / 8) * WORDS + i] = sum;
         }
     }
     GroupMemoryBarrierWithGroupSync();
     if (local == 0) {
-        for (int i = 0; i < SUMS; ++i) {
-            int64_t sum = 0;
+        int words[WORDS];
+        for (int i = 0; i < WORDS; ++i) {
+            words[i] = 0;
             for (uint t = 0; t < GROUP / 8; ++t)
-                sum += gPartial[t * SUMS + i];
-            if (sum != 0)
-                acc_add64(acc, pc.slot + uint(i), uint64_t(sum));
+                words[i] += gPartial[t * WORDS + i];
+        }
+        int64_t totals[SUMS];
+        totals[0] = -int64_t(words[0] & 0x7FF);
+        totals[1] = int64_t((words[0] >> 11) & 0x7F);
+        totals[2] = int64_t(words[1]);
+        totals[3] = int64_t(words[2]) + (int64_t(words[3]) << 16);
+        totals[4] = int64_t((words[0] >> 18) & 0x7F);
+        totals[5] = int64_t(words[4]);
+        totals[6] = int64_t(words[5]);
+        totals[7] = int64_t(words[6]);
+        totals[8] = int64_t(words[7]);
+        for (int i = 0; i < SUMS; ++i) {
+            if (totals[i] != 0)
+                acc_add64(acc, pc.slot + uint(i), uint64_t(totals[i]));
         }
     }
 }

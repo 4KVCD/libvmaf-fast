@@ -48,7 +48,7 @@ _W1, _H1 = (WIDTH + 1) // 2, (HEIGHT + 1) // 2
 _W2, _H2 = (_W1 + 1) // 2, (_H1 + 1) // 2
 BUFFERS = {"admR": _W1 * _H1 * 16, "admA": _W1 * _H1 * 16, "admF": _W1 * _H1 * 16,
            "bandsRef0": _W1 * _H1 * 16, "bandsDis0": _W1 * _H1 * 16,
-           "bandsRef1": _W2 * _H2 * 16, "bandsDis1": _W2 * _H2 * 16, "vifTmp": WIDTH * HEIGHT * 32}
+           "bandsRef1": _W2 * _H2 * 16, "bandsDis1": _W2 * _H2 * 16, "vifTmp": WIDTH * HEIGHT * 20}
 #: The scored passes in the order vmaf_vulkan.cpp's build_passes adds them.
 PASSES = ([f"vif_{kind} scale {scale}" for scale in range(4) for kind in ("vert", "hori")]
           + [f"adm_{kind} scale {scale}" for scale in range(4)

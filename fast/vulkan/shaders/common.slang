@@ -45,6 +45,20 @@ uint pixel(StructuredBuffer<uint> picture, int x, int y, int strideWords)
 
 int sext16(int v) { return (v << 16) >> 16; }
 
+// ADM's decoupled images at scale 0 (adm_decouple's outputs, adm_cm's
+// inputs), whose values are all 16-bit: two words a pixel, bands 0 and 1 in
+// the first (low and high half), band 2 in the second. Four words a pixel,
+// one per band and one unused, made those two passes write and read twice
+// the memory -- most of adm_decouple's time on an integrated GPU. The other
+// scales' values are 32-bit: four words a pixel.
+#define ADM_PACKED_WORDS 2
+
+void store_packed(RWStructuredBuffer<int> buffer, int pixel, int v0, int v1, int v2)
+{
+    buffer[pixel * ADM_PACKED_WORDS] = (v0 & 0xFFFF) | (v1 << 16);
+    buffer[pixel * ADM_PACKED_WORDS + 1] = v2;
+}
+
 int msb32(uint v) { return int(firstbithigh(v)); }  // v != 0
 
 int msb64(uint64_t v)  // v != 0

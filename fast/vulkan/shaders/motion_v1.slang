@@ -22,6 +22,10 @@ struct Params {
 static const int kFilter[5] = { 3571, 16004, 26386, 16004, 3571 };
 
 groupshared uint gSum[256];
+// The vertical pass's rounded values for the group's 16 rows and its 16
+// columns with two either side: each worked out once, by one thread, where
+// every pixel worked out the five it needs (each column five times over).
+groupshared int gColumns[16][20];
 
 int mirror(int idx, int size)
 {
@@ -30,28 +34,45 @@ int mirror(int idx, int size)
     return idx;
 }
 
+// The column's 5-tap blur of the frames' difference at (column, y), rounded
+// as the CPU code rounds it. In 32 bits up to 15-bit samples (65536 times a
+// difference below 2^15); 16-bit ones need 64.
+int vertical(int column, int y)
+{
+    int sum32 = 0;
+    int64_t sum64 = 0;
+    for (int k = 0; k < 5; ++k) {
+        int row = clamp(mirror(y - 2 + k, pc.h), 0, pc.h - 1);
+        int difference = int(pixel(previous, column, row, pc.strideWords))
+                       - int(pixel(current, column, row, pc.strideWords));
+        if (pc.shiftY < 16)
+            sum32 += kFilter[k] * difference;
+        else
+            sum64 += int64_t(kFilter[k]) * difference;
+    }
+    if (pc.shiftY < 16)
+        return (sum32 + pc.addY) >> pc.shiftY;
+    return int((sum64 + pc.addY) >> pc.shiftY);
+}
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID, uint local : SV_GroupIndex)
+void main(uint3 id : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID, uint local : SV_GroupIndex)
 {
     int x = int(id.x), y = int(id.y);
+    int first = x - int(lid.x) - 2;  // the tile's first column in the picture
+    for (int c = int(lid.x); c < 20; c += 16) {
+        int column = clamp(mirror(first + c, pc.w), 0, pc.w - 1);
+        gColumns[lid.y][c] = vertical(column, y);
+    }
+    GroupMemoryBarrierWithGroupSync();
     uint distance = 0;
     if (x < pc.w && y < pc.h) {
-        int rows[5];
-        for (int k = 0; k < 5; ++k)
-            rows[k] = mirror(y - 2 + k, pc.h);
         int64_t blurred = 0;
-        for (int xf = 0; xf < 5; ++xf) {
-            int column = mirror(x - 2 + xf, pc.w);
-            int64_t vertical = 0;
-            for (int k = 0; k < 5; ++k) {
-                int difference = int(pixel(previous, column, rows[k], pc.strideWords))
-                               - int(pixel(current, column, rows[k], pc.strideWords));
-                vertical += int64_t(kFilter[k] * difference);
-            }
-            int rounded = int((vertical + pc.addY) >> pc.shiftY);
-            blurred += int64_t(kFilter[xf]) * rounded;
-        }
+        // Tap xf is the tile's column lid.x + xf: first + lid.x + xf is
+        // x - 2 + xf, mirrored there as the CPU code mirrors it.
+        for (int xf = 0; xf < 5; ++xf)
+            blurred += int64_t(kFilter[xf]) * gColumns[lid.y][int(lid.x) + xf];
         distance = uint(abs(int((blurred + 32768) >> 16)));
     }
     gSum[local] = distance;

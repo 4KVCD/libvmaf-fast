@@ -4,6 +4,13 @@
 // of this repository.
 //
 // vif_filter1d_table of libvmaf's integer_vif.h: the Gaussian of each scale.
+// The vertical pass's results for a pixel, which the horizontal pass filters
+// along the rows: the two means (16 bits each) in one word, the three sums of
+// squares and products (32 bits each), and the next scale's two samples (16
+// bits each) in one word. Eight words a pixel, each value in its own, were
+// 60% more memory for the horizontal pass to read 17 times over.
+#define VIF_TMP_WORDS 5
+
 static const uint kVifFilter[4][18] = {
     { 489, 935, 1640, 2640, 3896, 5274, 6547, 7455, 7784, 7455, 6547, 5274, 3896, 2640, 1640, 935, 489, 0 },
     { 1244, 3663, 7925, 12590, 14692, 12590, 7925, 3663, 1244, 0, 0, 0, 0, 0, 0, 0, 0, 0 },

@@ -36,6 +36,20 @@ struct Params {
 #define GROUP 128
 groupshared int64_t gSums[GROUP * 3];
 
+// A pixel's three bands as adm_decouple stored them (common.slang).
+void bands(StructuredBuffer<uint> buffer, int pixel, out int v[3])
+{
+#if SCALE0
+    int low = int(buffer[pixel * ADM_PACKED_WORDS]);
+    v[0] = sext16(low);
+    v[1] = low >> 16;
+    v[2] = int(buffer[pixel * ADM_PACKED_WORDS + 1]);
+#else
+    for (int b = 0; b < 3; ++b)
+        v[b] = int(buffer[pixel * 4 + b]);
+#endif
+}
+
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
@@ -51,28 +65,36 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     const int addCub[3] = { pc.addCub0, pc.addCub1, pc.addCub2 };
     for (int j = pc.startCol + int(local); j < pc.endCol; j += GROUP) {
         int columns[3] = { min(abs(j - 1), pc.w - 1), j, min(j + 1, pc.w - 1) };
+        // The 3x3 neighbourhood's csfF of every band, but the centre's own,
+        // which is csfA's: the same 27 terms as the CUDA kernel adds, in
+        // another order (32-bit integer sums: the order makes no difference),
+        // each pixel's bands read at once.
         int threshold = 0;
-        for (int theta = 0; theta < 3; ++theta) {
-            for (int di = 0; di < 3; ++di) {
-                int row = rows[di] * pc.stride;
-                threshold += int(csfF[(row + columns[0]) * 4 + theta]);
-                if (di == 1) {
-                    int center = abs(int(csfA[(row + j) * 4 + theta]));
+        int v[3];
+        for (int di = 0; di < 3; ++di) {
+            int row = rows[di] * pc.stride;
+            for (int c = 0; c < 3; ++c) {
+                if (di == 1 && c == 1) {
+                    bands(csfA, row + j, v);
+                    for (int theta = 0; theta < 3; ++theta) {
+                        int center = abs(v[theta]);
 #if SCALE0
-                    threshold += sext16((8738 * center + 2048) >> 12);
+                        threshold += sext16((8738 * center + 2048) >> 12);
 #else
-                    // (int32_t)(1u << 31) again: the rounding term is negative.
-                    threshold += int((int64_t(286331153) * center - 2147483648ll) >> 32);
+                        // (int32_t)(1u << 31) again: the rounding term is negative.
+                        threshold += int((int64_t(286331153) * center - 2147483648ll) >> 32);
 #endif
+                    }
                 } else {
-                    threshold += int(csfF[(row + columns[1]) * 4 + theta]);
+                    bands(csfF, row + columns[c], v);
+                    threshold += v[0] + v[1] + v[2];
                 }
-                threshold += int(csfF[(row + columns[2]) * 4 + theta]);
             }
         }
-        int at = (i * pc.stride + j) * 4;
+        int sources[3];
+        bands(restored, i * pc.stride + j, sources);
         for (int b = 0; b < 3; ++b) {
-            int source = int(restored[at + b]);
+            int source = sources[b];
 #if SCALE0
             int value = abs(int(rfactor[b] * uint(source))) - (threshold << shiftSub[b]);
 #else

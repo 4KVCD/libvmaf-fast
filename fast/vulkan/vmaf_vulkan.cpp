@@ -159,6 +159,7 @@ std::vector<VkPhysicalDevice> physical_devices(InstanceApi *api)
 // --------------------------------------------------------------- features
 
 enum { kScales = 4, kVifSums = 9 };
+enum { kVifTmpWords = 5 };  // VIF_TMP_WORDS of shaders/vif_filter.slang
 // The sums' slots (64 bits each) in the accumulator buffer.
 enum {
     kSlotSad = 0,
@@ -1326,7 +1327,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     const VkDeviceSize v0 = v1 ? 0 : 1, only1 = v1 ? 1 : 0;  // buffers one of the two uses hold 4 bytes in the other
     struct { Buffer *buffer; VkDeviceSize bytes; } sized[] = {
         { &picRef, planeBytes }, { &picDis, planeBytes },
-        { &blur[0], pixels * 4 * v0 + 4 }, { &blur[1], pixels * 4 * v0 + 4 }, { &vifTmp, pixels * 32 * v0 + 4 },
+        { &blur[0], pixels * 4 * v0 + 4 }, { &blur[1], pixels * 4 * v0 + 4 }, { &vifTmp, pixels * 4 * kVifTmpWords * v0 + 4 },
         { &rdRef[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 }, { &rdDis[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 },
         { &rdRef[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 }, { &rdDis[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 },
         { &picPrev[0], planeBytes * only1 + 4 }, { &picPrev[1], planeBytes * only1 + 4 },

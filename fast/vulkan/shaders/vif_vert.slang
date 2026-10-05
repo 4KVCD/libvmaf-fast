@@ -23,7 +23,7 @@ struct Params {
 [[vk::push_constant]] Params pc;
 [[vk::binding(0, 0)]] StructuredBuffer<uint> refIn;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> disIn;
-[[vk::binding(2, 0)]] RWStructuredBuffer<uint> tmp;   // 8 words per pixel
+[[vk::binding(2, 0)]] RWStructuredBuffer<uint> tmp;   // VIF_TMP_WORDS per pixel (vif_filter.slang)
 
 #define OFF ((FW - FW_RD) / 2)
 // 8-bit pictures: the sums of squares fit in 32 bits (65536 * 255 * 255), and
@@ -93,20 +93,18 @@ void main(uint3 id : SV_DispatchThreadID)
         }
 #endif
     }
-    uint at = uint(y * pc.w + x) * 8;
-    tmp[at + 0] = ((mu1 + pc.addVP) >> pc.shiftVP) & 0xFFFFu;
-    tmp[at + 1] = ((mu2 + pc.addVP) >> pc.shiftVP) & 0xFFFFu;
+    uint at = uint(y * pc.w + x) * VIF_TMP_WORDS;
+    tmp[at + 0] = (((mu1 + pc.addVP) >> pc.shiftVP) & 0xFFFFu) | ((((mu2 + pc.addVP) >> pc.shiftVP) & 0xFFFFu) << 16);
 #if SMALL
-    tmp[at + 2] = refSq;
-    tmp[at + 3] = disSq;
-    tmp[at + 4] = refDis;
+    tmp[at + 1] = refSq;
+    tmp[at + 2] = disSq;
+    tmp[at + 3] = refDis;
 #else
-    tmp[at + 2] = uint((total48(refSq) + pc.addSq) >> pc.shiftSq);
-    tmp[at + 3] = uint((total48(disSq) + pc.addSq) >> pc.shiftSq);
-    tmp[at + 4] = uint((total48(refDis) + pc.addSq) >> pc.shiftSq);
+    tmp[at + 1] = uint((total48(refSq) + pc.addSq) >> pc.shiftSq);
+    tmp[at + 2] = uint((total48(disSq) + pc.addSq) >> pc.shiftSq);
+    tmp[at + 3] = uint((total48(refDis) + pc.addSq) >> pc.shiftSq);
 #endif
 #if FW_RD > 0
-    tmp[at + 5] = ((refRd + pc.addVP) >> pc.shiftVP) & 0xFFFFu;
-    tmp[at + 6] = ((disRd + pc.addVP) >> pc.shiftVP) & 0xFFFFu;
+    tmp[at + 4] = (((refRd + pc.addVP) >> pc.shiftVP) & 0xFFFFu) | ((((disRd + pc.addVP) >> pc.shiftVP) & 0xFFFFu) << 16);
 #endif
 }
