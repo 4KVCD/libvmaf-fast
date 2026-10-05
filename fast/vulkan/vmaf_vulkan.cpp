@@ -804,7 +804,7 @@ int vv_context::build_passes()
         const int32_t constants[] = { w, h, strideWords, bpc, 1 << (bpc - 1), kSlotSad };
         error = add_pass(motion[parity], deep ? kShader_motion_16 : kShader_motion_8,
                          { &picRef, &blur[parity], &blur[1 - parity], &acc }, constants, sizeof constants,
-                         groups(w, 16), groups(h, 16));
+                         groups(w, 32), groups(h, 16));
     }
 
     // VIF (integer_vif_cuda.c: filter1d_8, filter1d_16).
@@ -1486,7 +1486,8 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     const VkDeviceSize twoPass = vifFused && !nativeDouble ? 0 : 1;
     struct { Buffer *buffer; VkDeviceSize bytes; } sized[] = {
         { &picRef, planeBytes }, { &picDis, planeBytes },
-        { &blur[0], pixels * 4 * v0 + 4 }, { &blur[1], pixels * 4 * v0 + 4 },
+        // Motion's blur, 16-bit: two pixels a word.
+        { &blur[0], (VkDeviceSize)(w + 1) / 2 * h * 4 * v0 + 4 }, { &blur[1], (VkDeviceSize)(w + 1) / 2 * h * 4 * v0 + 4 },
         { &vifTmp, pixels * 4 * kVifTmpWords * v0 * twoPass + 4 },
         { &rdRef[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 }, { &rdDis[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 },
         { &rdRef[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 }, { &rdDis[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 },
