@@ -255,6 +255,14 @@ test_cuda_adm_decouple_angle = executable('test_cuda_adm_decouple_angle',
     c_args: ['-DHAVE_CUDA=1']
 )
 
+test_cuda_adm_csf_den_shift = executable('test_cuda_adm_csf_den_shift',
+    ['test.c', 'test_cuda_adm_csf_den_shift.c'],
+    include_directories : [libvmaf_inc, test_inc],
+    link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
+    dependencies: [math_lib, cuda_dependency],
+    c_args: ['-DHAVE_CUDA=1']
+)
+
 test('test_ring_buffer', test_ring_buffer)
 test('test_cuda_pic_preallocation', test_cuda_pic_preallocation)
 test('test_cuda_vif_order', test_cuda_vif_order)
@@ -262,6 +270,7 @@ test('test_cuda_adm_cm_border', test_cuda_adm_cm_border, timeout : 300)
 test('test_cuda_adm_cm_row_rounding', test_cuda_adm_cm_row_rounding, timeout : 300)
 test('test_cuda_adm_cm_scale0_border', test_cuda_adm_cm_scale0_border, timeout : 300)
 test('test_cuda_adm_decouple_angle', test_cuda_adm_decouple_angle, timeout : 300)
+test('test_cuda_adm_csf_den_shift', test_cuda_adm_csf_den_shift, timeout : 300)
 endif
 
 test_pic_preallocation = executable('test_pic_preallocation',
