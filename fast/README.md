@@ -40,6 +40,7 @@ python fast\tests\compare_vmaf_vulkan.py --matrix [--device N]
 python fast\tests\compare_vmaf_v1.py --matrix [--device N]
 python fast\tests\diagnose_vmaf_vulkan.py [--device N]
 python fast\tests\bench_vmaf_vulkan.py REFERENCE DISTORTED --size 3840x2160 --bits 10
+python fast\tests\bench_readme.py REFERENCE DISTORTED [--size 1920x1080 --pairs 960] [--vmaf-only]
 ```
 
 - `compare_vmaf_vulkan.py --matrix`: Vulkan's features and VMAF and NEG scores
@@ -52,6 +53,9 @@ python fast\tests\bench_vmaf_vulkan.py REFERENCE DISTORTED --size 3840x2160 --bi
 - Each prints IDENTICAL per case; `--matrix` ends with ALL IDENTICAL or SOME
   DIFFER. Run all three on every GPU (`--device`, Vulkan's GPU number, which
   the scripts list) after any change to the engine.
+- `bench_readme.py`: the landing page's speed tables, every route on every
+  GPU it finds, with the CPU time each keeps busy (its docstring lists the
+  runs). The routes from GPU memory need an NVIDIA GPU.
 
 `VMAF_FAST_DIST` points the bindings at DLLs elsewhere, `VMAF_FAST_MODELS` at
 the model files (by default `model/` of this repository).

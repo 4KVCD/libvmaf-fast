@@ -7,11 +7,16 @@
 // Shared by every VMAF compute shader (see ../vmaf_vulkan.cpp).
 //
 // The shaders are a port of libvmaf's CUDA kernels (libvmaf/src/feature/cuda,
-// with the pull requests fast/README.md lists) and are written
-// to give the same integers as those kernels on any GPU: all arithmetic is
-// integer, also where the CUDA code uses float and double, because Vulkan
-// leaves the rounding of floating point to the driver and Intel's GPUs have no
-// double at all.
+// with the pull requests README.md lists) and are written to give the same
+// integers as those kernels on any GPU. Where the CUDA code uses float or
+// double, the shaders calculate its rounded result exactly in integers,
+// because Vulkan leaves the rounding of floating point to the driver (which
+// may also fuse a multiply and an add) and some GPUs (Intel's recent
+// integrated ones) have no double at all. Float is used only for estimates
+// the result does not depend on: ADM's one-degree test is decided in float
+// only where float's error cannot change the answer, and VIF's division
+// starts from a float estimate that is then made exact. Double is used only
+// with NATIVE_F64 (vv_create's flag 1, off by default).
 
 // A 64-bit sum kept as two 32-bit words, added to with 32-bit atomics (64-bit
 // atomics are optional in Vulkan). The carry out of the low word is added to

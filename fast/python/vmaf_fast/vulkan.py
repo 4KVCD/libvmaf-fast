@@ -4,8 +4,10 @@ built by fast/scripts/build_vmaf_vulkan.ps1), a port of libvmaf's CUDA
 feature extractors to Vulkan compute shaders.
 
 The port gives the same feature values as libvmaf's CUDA code
-(vmaf_fast.libvmaf), to the last bit, on any GPU: its shaders use integer
-arithmetic only. The score is then predicted from them by libvmaf itself
+(vmaf_fast.libvmaf), to the last bit, on any GPU: where the CUDA code uses
+float or double, its shaders calculate the same rounded result exactly in
+integers (fast/vulkan/shaders/common.slang). The score is then predicted
+from them by libvmaf itself
 (this fork's libvmaf.dll, on the CPU: vmaf_import_feature_score and
 vmaf_score_at_index), so a score is the
 same number whichever of the two calculated the features.
@@ -387,7 +389,7 @@ def probe() -> tuple[bool, int | None, str]:
     """(whether Vulkan scores VMAF on this PC, on which GPU, what it is or
     why not). Scores the probe's frames at 8 and 10 bits and accepts the GPU
     only if its sums are exactly the known ones: a driver that compiles a
-    shader wrongly (Intel's did one, see native/vmaf_vulkan) gives wrong
+    shader wrongly (Intel's and AMD's each did one, see fast/vulkan) gives wrong
     scores, not an error. Run in a process of its own."""
     if not LIBRARY_PATH.is_file():
         return False, None, "vmaf_vulkan.dll is not bundled"

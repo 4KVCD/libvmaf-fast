@@ -1,3 +1,10 @@
+// Derived from libvmaf (https://github.com/Netflix/vmaf): its CUDA feature
+// extractors, Copyright 2016-2023 Netflix, Inc. and Copyright 2021 NVIDIA
+// Corporation, and for VMAF v1 its CPU code (integer_adm.c), Copyright
+// 2016-2020 Netflix, Inc.; licensed under the BSD+Patent License
+// (https://opensource.org/licenses/BSDplusPatent); see LICENSE at the root
+// of this repository.
+//
 // ADM, the denominator: adm_csf_den_scale_line_kernel (SCALE0) and
 // adm_csf_den_s123_line_kernel of adm_csf_den.cu, the sum of the reference
 // bands' cubes.

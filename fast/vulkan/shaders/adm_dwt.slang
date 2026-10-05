@@ -1,3 +1,9 @@
+// Derived from libvmaf (https://github.com/Netflix/vmaf), whose CUDA feature
+// extractors are Copyright 2016-2023 Netflix, Inc. and Copyright 2021 NVIDIA
+// Corporation, licensed under the BSD+Patent License
+// (https://opensource.org/licenses/BSDplusPatent); see
+// LICENSE at the root of this repository.
+//
 // ADM, the wavelet transform of both pictures. SCALE0: adm_dwt2_8_vert_hori_kernel
 // of adm_dwt2.cu (the pictures to 16-bit bands); otherwise
 // dwt_s123_combined_vert_kernel and _hori_kernel (the previous scale's

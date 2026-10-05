@@ -1,3 +1,8 @@
+// Derived from libvmaf (https://github.com/Netflix/vmaf): integer_motion.c,
+// Copyright 2016-2026 Netflix, Inc., licensed under the BSD+Patent License
+// (https://opensource.org/licenses/BSDplusPatent); see LICENSE at the root
+// of this repository.
+//
 // Motion for VMAF v1: motion_score_pipeline_8 / _16 of libvmaf's
 // integer_motion.c (the CPU code: VMAF v1's motion has no CUDA version). The
 // difference of two reference frames is blurred with the 5-tap filter, each

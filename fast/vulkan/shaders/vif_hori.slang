@@ -1,3 +1,9 @@
+// Derived from libvmaf (https://github.com/Netflix/vmaf), whose CUDA feature
+// extractors are Copyright 2016-2023 Netflix, Inc. and Copyright 2021 NVIDIA
+// Corporation, licensed under the BSD+Patent License
+// (https://opensource.org/licenses/BSDplusPatent); see
+// LICENSE at the root of this repository.
+//
 // VIF, horizontal pass and statistics: filter1d_8_horizontal_kernel /
 // filter1d_16_horizontal_kernel of filter1d.cu with vif_statistic_calculation
 // of vif_statistics.cuh. One shader per scale (SCALE, FW, FW_RD).

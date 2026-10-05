@@ -1,5 +1,5 @@
 # Builds this fork's libvmaf with CUDA (libvmaf.dll) from the tree it is in:
-# Netflix/vmaf with the pull requests fast/README.md lists merged, for VMAF
+# Netflix/vmaf with the pull requests README.md lists merged, for VMAF
 # and VMAF NEG on NVIDIA GPUs.
 #
 # Needs git, Visual Studio 2022 Build Tools (C++), the CUDA Toolkit (13.x),

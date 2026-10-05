@@ -1,12 +1,13 @@
 """VMAF v1 with the GPU: the score FFmpeg's libvmaf gives for a VMAF v1 model
-(vmaf_v1.0.16 and its variants), calculated several times faster.
+(vmaf_v1.0.16 and its variants), calculated faster with fewer CPU cores
+(the speeds are in the README).
 
 VMAF v1 is predicted from four features. Where each is calculated here:
 
-- ADM3 and motion3, about two thirds of the CPU's work: on the GPU, by
-  vmaf_vulkan.dll's VMAF v1 mode (native/vmaf_vulkan), which follows
+- ADM3 and motion3, most of the CPU's work: on the GPU, by
+  vmaf_vulkan.dll's VMAF v1 mode (fast/vulkan), which follows
   libvmaf's CPU code (integer_adm.c, integer_motion.c) in integer arithmetic
-  and gives its values bit for bit, on any GPU.
+  and gives its values bit for bit (fast/tests/compare_vmaf_v1.py).
 - CAMBI and SpEED chroma: by libvmaf's own CPU extractors, from the bundled
   libvmaf.dll, on a pool of threads beside the GPU. They are the same code
   on the same frames, so the same values.
@@ -23,9 +24,6 @@ From NVIDIA's decoder it takes them without a CPU copy (add_decoded): the
 lumas are copied on the GPU into memory the decoder and Vulkan share
 (vmaf_vulkan.SharedLumas), and the planes CAMBI and SpEED read are downloaded
 straight into libvmaf's pictures, page-locked, which the GPU writes by itself.
-Through system memory, as before, the one thread that feeds both halves spent
-9.7 ms a 4K frame pair copying -- all of its time at 98 frames a second; now
-0.6 ms, and the CPU's half sets the pace (about 145 frames a second).
 """
 from __future__ import annotations
 

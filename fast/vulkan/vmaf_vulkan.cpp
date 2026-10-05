@@ -10,7 +10,7 @@
 // A port of libvmaf's CUDA feature extractors (libvmaf/src/feature/cuda:
 // integer_vif_cuda.c, integer_adm_cuda.c, integer_motion_cuda.c and their
 // kernels, at the commit and with the pull requests that
-// fast/README.md lists). The compute shaders in shaders/ give
+// README.md lists). The compute shaders in shaders/ give
 // the integer sums the CUDA kernels give; the functions below marked "as
 // libvmaf" turn them into feature scores with libvmaf's own expressions, in
 // the same types and order, so a feature is the same double as CUDA's.
@@ -21,7 +21,8 @@
 //     filters, ADM's wavelet transform and denominator are shared, and only
 //     the limited parts are calculated per limit. libvmaf runs VIF and ADM
 //     twice.
-//   - No float or double on the GPU (see shaders/common.slang).
+//   - CUDA's float and double steps are exact integer arithmetic on the GPU
+//     (see shaders/common.slang).
 //   - Sums are kept as pairs of 32-bit words (64-bit atomics are optional).
 //
 // The library scores features only. The caller predicts VMAF from them with

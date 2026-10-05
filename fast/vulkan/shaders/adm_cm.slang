@@ -1,3 +1,9 @@
+// Derived from libvmaf (https://github.com/Netflix/vmaf), whose CUDA feature
+// extractors are Copyright 2016-2023 Netflix, Inc. and Copyright 2021 NVIDIA
+// Corporation, licensed under the BSD+Patent License
+// (https://opensource.org/licenses/BSDplusPatent); see
+// LICENSE at the root of this repository.
+//
 // ADM, contrast masking and the numerator's sum. SCALE0: adm_cm_line_kernel;
 // otherwise i4_adm_cm_line_kernel; both with adm_cm_reduce_line_kernel
 // (adm_cm.cu).

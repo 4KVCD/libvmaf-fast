@@ -1,3 +1,8 @@
+// Derived from libvmaf (https://github.com/Netflix/vmaf): integer_vif.h,
+// Copyright 2016-2020 Netflix, Inc., licensed under the BSD+Patent License
+// (https://opensource.org/licenses/BSDplusPatent); see LICENSE at the root
+// of this repository.
+//
 // vif_filter1d_table of libvmaf's integer_vif.h: the Gaussian of each scale.
 static const uint kVifFilter[4][18] = {
     { 489, 935, 1640, 2640, 3896, 5274, 6547, 7455, 7784, 7455, 6547, 5274, 3896, 2640, 1640, 935, 489, 0 },

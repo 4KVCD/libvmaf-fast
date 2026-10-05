@@ -1,3 +1,9 @@
+// Derived from libvmaf (https://github.com/Netflix/vmaf), whose CUDA feature
+// extractors are Copyright 2016-2023 Netflix, Inc. and Copyright 2021 NVIDIA
+// Corporation, licensed under the BSD+Patent License
+// (https://opensource.org/licenses/BSDplusPatent); see
+// LICENSE at the root of this repository.
+//
 // Motion: calculate_motion_score_kernel_8bpc / _16bpc of motion_score.cu.
 // Blurs the reference with the 5-tap filter (each column rounded before the
 // horizontal pass, as the CUDA kernel does), keeps the blur for the next
