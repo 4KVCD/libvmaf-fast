@@ -110,8 +110,10 @@ powershell -ExecutionPolicy Bypass -File fast\scripts\build_vmaf_vulkan.ps1
 They write `fast/dist/libvmaf/libvmaf.dll` and
 `fast/dist/vmaf_vulkan/vmaf_vulkan.dll`, each with its licences. Both link the
 C runtime statically and need only Windows and a GPU driver at run time. Both
-builds are reproducible: the same commit gives the same bytes. libvmaf reports
-the commit it was built from as its version.
+builds are reproducible: the same commit, built with the same versions of the
+tools (Visual Studio, the CUDA Toolkit, meson), gives the same bytes, wherever
+the checkout is. Other tool versions give equivalent code, not identical
+bytes. libvmaf reports the commit it was built from as its version.
 
 `fast\scripts\package.ps1 -Version <version>` makes the release archive from
 them, with a SHA-256 of every file.
