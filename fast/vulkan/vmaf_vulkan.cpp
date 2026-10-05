@@ -406,9 +406,15 @@ struct Pipeline {
     uint32_t bindings = 0;
 };
 
+enum { kMaxSlots = 16 };
+
 struct Pass {
     int shader;
     VkDescriptorSet set;
+    // Passes that read the frames, where they read them from the frame
+    // slots' staging buffers (vv_context::direct): a set for each slot.
+    bool perSlot;
+    VkDescriptorSet slotSets[kMaxSlots];
     uint32_t constants[32];
     uint32_t constantBytes;
     uint32_t groups[3];
@@ -416,6 +422,7 @@ struct Pass {
 
 struct Slot {
     Buffer staging, result;
+    Buffer stagingDis;  // vv_context::direct: the distorted's plane (staging: the reference's)
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool busy = false;
@@ -470,6 +477,12 @@ struct vv_context {
     // VIF's two passes as one (vif_fused); VV_VIF_FUSED=0 for the two, to compare.
     bool vifFused = true;
     uint32_t strideBytes = 0, planeBytes = 0;
+    // The first passes read each pair's frames where they were written (the
+    // frame slot's staging buffers: the reference's in staging, the
+    // distorted's in stagingDis), not from picRef and picDis after a copy:
+    // all but VMAF v1 and frames from a decoder's CUDA (shared).
+    // VV_DIRECT_FRAMES=0 for the copy, to compare.
+    bool direct = true;
     // The frames' luma planes come from another API on this GPU (a decoder's
     // CUDA), which writes them into the slots' staging buffers: GPU memory it
     // imports by the handles vv_export gives, in place of host memory.
@@ -736,6 +749,19 @@ int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_l
         ++count;
     }
     vk.vkUpdateDescriptorSets(device, count, writes, 0, nullptr);
+    for (Buffer *buffer : bound)
+        pass.perSlot = pass.perSlot || (direct && (buffer == &picRef || buffer == &picDis));
+    for (size_t i = 0; pass.perSlot && i < slots.size(); ++i) {
+        if (vk.vkAllocateDescriptorSets(device, &allocate, &pass.slotSets[i]) != VK_SUCCESS)
+            return fail(-1, "vkAllocateDescriptorSets failed");
+        for (uint32_t b = 0; b < count; ++b) {
+            Buffer *buffer = bound.begin()[b];
+            infos[b].buffer = buffer == &picRef ? slots[i].staging.buffer
+                              : buffer == &picDis ? slots[i].stagingDis.buffer : buffer->buffer;
+            writes[b].dstSet = pass.slotSets[i];
+        }
+        vk.vkUpdateDescriptorSets(device, count, writes, 0, nullptr);
+    }
     memcpy(pass.constants, constants, constantBytes);
     pass.constantBytes = constantBytes;
     pass.groups[0] = gx;
@@ -1385,6 +1411,9 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
             if (!strncmp(kShaders[i].name, "adm_", 4))
                 subgroupSizes[i] = 8;
     }
+    if (const char *text = getenv("VV_DIRECT_FRAMES"))
+        direct = strcmp(text, "0") != 0;
+    direct = direct && !shared && !v1;
     if (const char *text = getenv("VV_VIF_FUSED"))
         vifFused = strcmp(text, "0") != 0;
     // vif_fused adds up its group's sums with subgroup arithmetic (Vulkan
@@ -1478,9 +1507,10 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     poolInfo.queueFamilyIndex = queueFamily;
     if (vk.vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS)
         return fail(-1, "vkCreateCommandPool failed");
-    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 * kMaxBindings };
+    // A set a pass, and one a frame slot more for each pass that reads the frames.
+    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (64 + 8 * kMaxSlots) * kMaxBindings };
     VkDescriptorPoolCreateInfo descriptorInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    descriptorInfo.maxSets = 64;
+    descriptorInfo.maxSets = 64 + 8 * kMaxSlots;
     descriptorInfo.poolSizeCount = 1;
     descriptorInfo.pPoolSizes = &poolSize;
     if (vk.vkCreateDescriptorPool(device, &descriptorInfo, nullptr, &descriptorPool) != VK_SUCCESS)
@@ -1497,7 +1527,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // keeps them in group memory) -- 166 MB at 4K.
     const VkDeviceSize twoPass = vifFused && !nativeDouble ? 0 : 1;
     struct { Buffer *buffer; VkDeviceSize bytes; } sized[] = {
-        { &picRef, planeBytes }, { &picDis, planeBytes },
+        { &picRef, direct ? 4 : planeBytes }, { &picDis, direct ? 4 : planeBytes },
         // Motion's blur, 16-bit: two pixels a word.
         { &blur[0], (VkDeviceSize)(w + 1) / 2 * h * 4 * v0 + 4 }, { &blur[1], (VkDeviceSize)(w + 1) / 2 * h * 4 * v0 + 4 },
         { &vifTmp, pixels * 4 * kVifTmpWords * v0 * twoPass + 4 },
@@ -1535,7 +1565,9 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         if (vk.vkCreateFence(device, &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS)
             return fail(-1, "vkCreateFence failed");
-        if (int error = create_buffer(slot.staging, (VkDeviceSize)planeBytes * 2, !shared, shared))
+        if (int error = create_buffer(slot.staging, (VkDeviceSize)planeBytes * (direct ? 1 : 2), !shared, shared))
+            return error;
+        if (int error = create_buffer(slot.stagingDis, direct ? planeBytes : 4, true))
             return error;
         if (int error = create_buffer(slot.result, kSlots * 8, true))
             return error;
@@ -1634,7 +1666,7 @@ int vv_context::staging(uint8_t **ref, uint8_t **dis)
         return error;
     pending = &slot;
     *ref = (uint8_t *)slot.staging.mapped;
-    *dis = (uint8_t *)slot.staging.mapped + planeBytes;
+    *dis = direct ? (uint8_t *)slot.stagingDis.mapped : (uint8_t *)slot.staging.mapped + planeBytes;
     return 0;
 }
 
@@ -1698,7 +1730,7 @@ int vv_context::commit(bool score)
         // "external" queue family for the copy and handed back after it,
         // in the general layout throughout (the memory is Direct3D's).
         const int textures[2] = { pendingTextures[0], score ? pendingTextures[1] : -1 };
-        Buffer *targets[2] = { &picRef, &picDis };
+        Buffer *targets[2] = { direct ? &slot.staging : &picRef, direct ? &slot.stagingDis : &picDis };
         pendingTextures[0] = pendingTextures[1] = -1;
         for (int i = 0; i < 2; ++i) {
             if (textures[i] < 0)
@@ -1726,7 +1758,7 @@ int vv_context::commit(bool score)
             vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
                                     nullptr, 0, nullptr, 1, &give);
         }
-    } else {
+    } else if (!direct) {
         VkBufferCopy copy = { 0, 0, planeBytes };
         vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
         if (score) {
@@ -1750,7 +1782,8 @@ int vv_context::commit(bool score)
                 continue;
             const Pipeline &pipeline = pipelines[pass.shader];
             vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
-            vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &pass.set, 0, nullptr);
+            const VkDescriptorSet *set = pass.perSlot ? &pass.slotSets[&slot - slots.data()] : &pass.set;
+            vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, set, 0, nullptr);
             vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pass.constantBytes, pass.constants);
             vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], pass.groups[2]);
             barrier(vk, cb, kCompute, kCompute | kTransfer);
