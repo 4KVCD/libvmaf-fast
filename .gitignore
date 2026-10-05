@@ -15,3 +15,6 @@ dist/
 vmaf_output.xml
 compile_commands.json
 libvmaf/subprojects/checkasm/
+
+# libvmaf-fast: meson's lock file, written by every build
+libvmaf/subprojects/.wraplock
