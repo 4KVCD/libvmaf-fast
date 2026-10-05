@@ -36,7 +36,11 @@ if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 Copy-Item -Recurse (Join-Path $dist 'libvmaf') $stage
 Copy-Item -Recurse (Join-Path $dist 'vmaf_vulkan') $stage
-Set-Content -Path (Join-Path $stage 'BUILD.txt') -Encoding ascii -Value @(
+# Text files with LF line ends, which sha256sum -c and other systems read.
+function Write-Lines([string]$path, [string[]]$lines) {
+    [System.IO.File]::WriteAllText($path, (($lines -join "`n") + "`n"), [System.Text.Encoding]::ASCII)
+}
+Write-Lines (Join-Path $stage 'BUILD.txt') @(
     "libvmaf-fast $Version",
     "Built from https://github.com/4KVCD/libvmaf-fast/commit/$commit",
     "libvmaf.dll reports version $reported.",
@@ -44,17 +48,30 @@ Set-Content -Path (Join-Path $stage 'BUILD.txt') -Encoding ascii -Value @(
     'libvmaf/libvmaf.dll      libvmaf with CUDA (fast/scripts/build_libvmaf_cuda.ps1)',
     'vmaf_vulkan/vmaf_vulkan.dll  VMAF features with Vulkan (fast/scripts/build_vmaf_vulkan.ps1)',
     'Both need only Windows x64 and a GPU driver; licences are in each folder.')
-$sums = Get-ChildItem -Recurse -File $stage | Sort-Object FullName | ForEach-Object {
-    $relative = $_.FullName.Substring($stage.Length + 1).Replace('\', '/')
-    "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $relative"
+$files = Get-ChildItem -Recurse -File $stage | Sort-Object FullName | ForEach-Object {
+    [pscustomobject]@{ Path = $_.FullName; Name = $_.FullName.Substring($stage.Length + 1).Replace('\', '/') }
 }
-Set-Content -Path (Join-Path $stage 'SHA256SUMS') -Encoding ascii -Value $sums
+$sums = $files | ForEach-Object { "$((Get-FileHash $_.Path -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)" }
+Write-Lines (Join-Path $stage 'SHA256SUMS') $sums
 
+# The archive written entry by entry: Windows PowerShell's Compress-Archive
+# names entries with backslashes, which the zip format does not allow and
+# other systems unpack as part of the file name.
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
 $archive = Join-Path $out "$name.zip"
 if (Test-Path $archive) { Remove-Item -Force $archive }
-Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive
+$zip = [System.IO.Compression.ZipFile]::Open($archive, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+    foreach ($file in @($files) + [pscustomobject]@{ Path = (Join-Path $stage 'SHA256SUMS'); Name = 'SHA256SUMS' }) {
+        [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+            $zip, $file.Path, $file.Name, [System.IO.Compression.CompressionLevel]::Optimal)
+    }
+}
+finally {
+    $zip.Dispose()
+}
 $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-Set-Content -Path "$archive.sha256" -Encoding ascii -Value "$hash  $name.zip"
+Write-Lines "$archive.sha256" @("$hash  $name.zip")
 Remove-Item -Recurse -Force $stage
 Write-Host "libvmaf-fast $Version ($($commit.Substring(0, 8))): $archive"
 Write-Host "SHA-256 $hash"
