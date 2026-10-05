@@ -61,7 +61,7 @@
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) \
     X(vkGetPhysicalDeviceFeatures) X(vkGetPhysicalDeviceMemoryProperties) \
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) \
-    X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceFeatures2)
+    X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceProperties2)
 
 #define VK_DEVICE_FUNCTIONS(X) \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) \
@@ -1387,6 +1387,18 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     }
     if (const char *text = getenv("VV_VIF_FUSED"))
         vifFused = strcmp(text, "0") != 0;
+    // vif_fused adds up its group's sums with subgroup arithmetic (Vulkan
+    // 1.1's, optional): without it, VIF's two passes.
+    {
+        VkPhysicalDeviceSubgroupProperties subgroup = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES };
+        VkPhysicalDeviceProperties2 query = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        query.pNext = &subgroup;
+        if (api->vkGetPhysicalDeviceProperties2)
+            api->vkGetPhysicalDeviceProperties2(physical, &query);
+        const VkSubgroupFeatureFlags needed = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
+        if (!(subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) || (subgroup.supportedOperations & needed) != needed)
+            vifFused = false;
+    }
     if (const char *text = getenv("VV_ADM_BOTH"))
         admBoth = strcmp(text, "0") != 0;
     // For experiments: VV_SUBGROUP="shader=16,shader=8" or "*=16".

@@ -44,13 +44,15 @@ struct Params {
 #define TCOLS (TW + FW - 1)    // the columns the tile's horizontal filters read
 // The group's sums: the nine of statistics(), the fourth (num_non_log, 31
 // bits a pixel) as its low and high 16 bits. 512 pixels' worth of each
-// fits in 32 bits. Kept in the tile's memory once the tile is used: group
-// memory limits how many groups a core runs at once.
+// fits in 32 bits.
 #define VALUES 10
 #define TILE_WORDS (VIF_TMP_WORDS * TH * TCOLS)
-#define SUM_WORDS (VALUES * THREADS)
-// The vertical pass's results, word by word, row by row; then the sums.
-groupshared uint gTile[TILE_WORDS > SUM_WORDS ? TILE_WORDS : SUM_WORDS];
+// The vertical pass's results, word by word, row by row.
+groupshared uint gTile[TILE_WORDS];
+// The group's sums, each subgroup's added in (the engine uses this shader
+// only where the GPU has subgroup arithmetic). Integer sums: the same in
+// any order.
+groupshared int gTotals[VALUES];
 
 #include "vif_stats.slang"
 
@@ -132,6 +134,8 @@ void vertical(int x, int y, uint at)
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
     const int x0 = int(group.x) * TW, y0 = int(group.y) * TH;
+    if (local < VALUES)
+        gTotals[local] = 0;  // before the barrier below; added to after it
     // The vertical pass for the tile's columns x0 - FW/2 .. x0 + TW - 1 + FW/2,
     // mirrored at the edges as the horizontal filter mirrors them (columns
     // only pixels beyond the row read are clamped into it, and unused).
@@ -207,28 +211,17 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 #endif
     }
 
-    GroupMemoryBarrierWithGroupSync();  // every thread is done with the tile
-    for (int i = 0; i < VALUES; ++i)
-        gTile[i * THREADS + local] = uint(totals[i]);
-    GroupMemoryBarrierWithGroupSync();
-    for (uint half = THREADS / 2; half > 0; half >>= 1) {
-        if (local < half) {
-            for (int i = 0; i < VALUES; ++i)
-                gTile[i * THREADS + local] += gTile[i * THREADS + local + half];
-        }
-        GroupMemoryBarrierWithGroupSync();
+    for (int i = 0; i < VALUES; ++i) {
+        const int sum = WaveActiveSum(totals[i]);
+        if (WaveIsFirstLane())
+            InterlockedAdd(gTotals[i], sum);
     }
-    if (local == 0) {
-        int64_t group[SUMS];
-        group[0] = int64_t(int(gTile[0]));
-        group[1] = int64_t(int(gTile[THREADS]));
-        group[2] = int64_t(int(gTile[2 * THREADS]));
-        group[3] = int64_t(int(gTile[3 * THREADS])) + (int64_t(int(gTile[4 * THREADS])) << 16);
-        for (int i = 4; i < SUMS; ++i)
-            group[i] = int64_t(int(gTile[(i + 1) * THREADS]));
-        for (int i = 0; i < SUMS; ++i) {
-            if (group[i] != 0)
-                acc_add64(acc, pc.slot + uint(i), uint64_t(group[i]));
-        }
+    GroupMemoryBarrierWithGroupSync();
+    if (local < SUMS) {  // a sum a thread
+        const int64_t value = local < 3 ? int64_t(gTotals[local])
+                              : local == 3 ? int64_t(gTotals[3]) + (int64_t(gTotals[4]) << 16)
+                                           : int64_t(gTotals[local + 1]);
+        if (value != 0)
+            acc_add64(acc, pc.slot + local, uint64_t(value));
     }
 }
