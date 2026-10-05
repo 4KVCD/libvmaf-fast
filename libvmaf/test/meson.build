@@ -273,6 +273,14 @@ test('test_cuda_adm_decouple_angle', test_cuda_adm_decouple_angle, timeout : 300
 test('test_cuda_adm_csf_den_shift', test_cuda_adm_csf_den_shift, timeout : 300)
 endif
 
+test_read_pictures_release = executable('test_read_pictures_release',
+    ['test.c', 'test_read_pictures_release.c', '../src/ref.c'],
+    include_directories : [libvmaf_inc, test_inc, include_directories('../src/')],
+    link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
+    dependencies : stdatomic_dependency,
+)
+test('test_read_pictures_release', test_read_pictures_release, timeout : 20)
+
 test_pic_preallocation = executable('test_pic_preallocation',
     ['test.c', 'test_pic_preallocation.c'],
     include_directories : [libvmaf_inc, test_inc, pthreadwin32_inc],
