@@ -862,7 +862,9 @@ int vv_context::build_passes()
                                            shiftVP, addVP, shiftSq, addSq, (uint32_t)nextStride,
                                            (uint32_t)(kSlotVif + scale * kVifSums), 100, 1,
                                            (uint32_t)epsilon, (uint32_t)(epsilon >> 32) };
-                const int shader = scale == 0 ? (deep ? kShader_vif_fused_0_16 : kShader_vif_fused_0_8)
+                // 9 to 12 bits: the sums of squares in two 32-bit words (NARROW).
+                const int shader = scale == 0 ? (!deep ? kShader_vif_fused_0_8
+                                                 : bpc <= 12 ? kShader_vif_fused_0_12 : kShader_vif_fused_0_16)
                                               : kShader_vif_fused_1 + (scale - 1);
                 error = add_pass(scored, shader, { inRef, inDis, &rdRef[scale % 2], &rdDis[scale % 2], &acc, &logTable },
                                  fused, sizeof fused, groups(sw, 80), groups(sh, 2));  // its TW x TH tiles

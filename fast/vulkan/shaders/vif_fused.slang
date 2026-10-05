@@ -77,6 +77,23 @@ uint64_t total48(Sum48 sum)
     return (uint64_t(sum.high) << 16) + (uint64_t(sum.carries) << 32) + uint64_t(sum.low);
 }
 
+#ifndef NARROW
+#define NARROW 0
+#endif
+#if NARROW
+// Pictures of 9 to 12 bits (shiftSq 2..8): the sums of squares and
+// products kept as high and low parts split at bit 8, without vif_vert's
+// carries. Each product a * b is a coefficient times a sample (a below
+// 2^29) times a sample: the low parts, (a & 255) * b, add up to under 2^29
+// over the 17 taps, and the high parts, (a >> 8) * b, are kept modulo 2^32,
+// which keeps their total, high * 2^8 + low, right modulo 2^40. Only bits
+// shiftSq .. shiftSq + 31 of it are kept (the result is a 32-bit word), all
+// below 2^40: the same word as the 48-bit sum's, whatever the samples. (At
+// 10 bits nothing wraps at all: the high parts add up to under 2^28.)
+#define add48(sum, a, b) { sum.high += ((a) >> 8) * (b); sum.low += ((a) & 0xFFu) * (b); }
+#define total48(sum) ((uint64_t(sum.high) << 8) + uint64_t(sum.low))
+#endif
+
 // vif_vert.slang's main for one pixel, into the tile at `at`.
 void vertical(int x, int y, uint at)
 {
