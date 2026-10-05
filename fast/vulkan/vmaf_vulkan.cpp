@@ -863,7 +863,7 @@ int vv_context::build_passes()
                 const int shader = scale == 0 ? (deep ? kShader_vif_fused_0_16 : kShader_vif_fused_0_8)
                                               : kShader_vif_fused_1 + (scale - 1);
                 error = add_pass(scored, shader, { inRef, inDis, &rdRef[scale % 2], &rdDis[scale % 2], &acc, &logTable },
-                                 fused, sizeof fused, groups(sw, 64), groups(sh, 4));
+                                 fused, sizeof fused, groups(sw, 80), groups(sh, 2));  // its TW x TH tiles
                 sourceStride = nextStride;
                 continue;
             }

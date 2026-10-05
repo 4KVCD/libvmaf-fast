@@ -36,11 +36,15 @@ struct Params {
 #define OFF ((FW - FW_RD) / 2)
 #define SMALL (SRC_PICTURE && !BPC16)
 #define SUMS 9
-#define TW 64                  // the tile: pixels along a row
+// The tile: TW pixels along a row, TH rows, a thread a pixel. Of 20 shapes
+// timed on the Core Ultra 9 285K's iGPU (32-128 wide, 1-8 rows, 64-256
+// threads), two rows of 80 or 96 were the fastest (1080p VIF scale 0 4.00
+// ms against 4.38 for 64 x 4) -- many small groups, little group memory each.
+#define TW 80
 #ifndef TH
-#define TH 4                   // and rows
+#define TH 2
 #endif
-#define THREADS 128
+#define THREADS 160
 #define TCOLS (TW + FW - 1)    // the columns the tile's horizontal filters read
 // The group's sums: the nine of statistics(), the fourth (num_non_log, 31
 // bits a pixel) as its low and high 16 bits. 512 pixels' worth of each
