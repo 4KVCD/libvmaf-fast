@@ -480,7 +480,8 @@ struct vv_context {
     // The first passes read each pair's frames where they were written (the
     // frame slot's staging buffers: the reference's in staging, the
     // distorted's in stagingDis), not from picRef and picDis after a copy:
-    // all but VMAF v1 and frames from a decoder's CUDA (shared).
+    // on integrated GPUs, but for VMAF v1 and frames from a decoder's CUDA
+    // (shared).
     // VV_DIRECT_FRAMES=0 for the copy, to compare.
     bool direct = true;
     // The frames' luma planes come from another API on this GPU (a decoder's
@@ -1419,7 +1420,10 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     }
     if (const char *text = getenv("VV_DIRECT_FRAMES"))
         direct = strcmp(text, "0") != 0;
-    direct = direct && !shared && !v1;
+    // Only where the staging memory is the GPU's own (an integrated GPU): a
+    // discrete GPU's shaders would read it across PCIe -- an RTX 5090's 4K
+    // pair took 13.6 ms of GPU time that way against 1.5 with the copy.
+    direct = direct && !shared && !v1 && properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     if (const char *text = getenv("VV_VIF_FUSED"))
         vifFused = strcmp(text, "0") != 0;
     // vif_fused adds up its group's sums with subgroup arithmetic (Vulkan
