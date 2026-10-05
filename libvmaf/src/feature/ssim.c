@@ -25,10 +25,13 @@
 #include <string.h>
 #include <math.h>
 
+#include <errno.h>
+
 #include "mem.h"
 #include "iqa/math_utils.h"
 #include "iqa/decimate.h"
 #include "iqa/ssim_tools.h"
+#include "ssim.h"
 
 /* _ssim_map */
 int _ssim_map(const struct _ssim_int *si, void *ctx)
@@ -43,6 +46,163 @@ float _ssim_reduce(int w, int h, void *ctx)
 {
     double *ssim_sum = (double*)ctx;
     return (float)(*ssim_sum / (double)(w*h));
+}
+
+int ssim_scale(int w, int h, int scale_override)
+{
+    if (scale_override > 0)
+        return scale_override;
+    return _max( 1, _round( (float)_min(w,h) / 256.0f ) );
+}
+
+/*
+ * libvmaf-fast: compute_ssim()'s decimation, made from a picture's samples.
+ *
+ * compute_ssim() converts each picture to floats (picture_copy: the sample,
+ * divided by 4, 16 or 256 above 8 bits), copies that into a second buffer,
+ * and decimates it in place (_iqa_decimate): each output sample is
+ * _iqa_filter_pixel() of the scale x scale box, every float value times the
+ * float 1/(scale*scale), the products added up in a double, mirrored at the
+ * edges by KBND_SYMMETRIC. At 4K that is two 33 MB float images written and
+ * read again a frame, which made float_ssim memory-bound.
+ *
+ * Here each output is the same sum, from the samples. Every product is an
+ * exact float (a value of up to 16 significant bits times one float), and
+ * every partial sum of up to 100 of them is exact in a double (they span
+ * fewer than 53 bits), so the order they are added in cannot change the
+ * result. Where 1/(scale*scale) is a power of two (scales 2, 4 and 8: 540p,
+ * 1080p and 4K), each product is the value times it exactly, and the sum is
+ * the integer sum of the samples times one power of two. Otherwise each
+ * sample's product is looked up in a table of them.
+ */
+static int ssim_mirror(int i, int n)
+{
+    if (i < 0) return -1 - i;                /* KBND_SYMMETRIC */
+    if (i >= n) return (n - (i - n)) - 1;
+    return i;
+}
+
+static int decimate_picture(VmafPicture *pic, int scale, float *dst,
+                            int sw, int sh, const double *table)
+{
+    const int w = pic->w[0], h = pic->h[0];
+    const int wide = pic->bpc > 8;
+    const ptrdiff_t stride = wide ? pic->stride[0] / 2 : pic->stride[0];
+    const uint8_t *data8 = pic->data[0];
+    const uint16_t *data16 = pic->data[0];
+    /* _iqa_filter_pixel's window: -uc .. uc - even, around x * scale */
+    const int uc = scale / 2, even = (scale & 1) ? 0 : 1;
+    double *acc = malloc(sizeof(double) * sw);
+    int *columns = malloc(sizeof(int) * sw * scale);
+    if (!acc || !columns) {
+        free(acc);
+        free(columns);
+        return -ENOMEM;
+    }
+    for (int x = 0; x < sw; x++)
+        for (int u = 0; u < scale; u++)
+            columns[x * scale + u] = ssim_mirror(x * scale - uc + u, w);
+    /* table == NULL: 1/(scale*scale) and the conversion are powers of two */
+    const double unit = 1.0 / (double)(scale * scale) /
+                        (pic->bpc == 10 ? 4.0 : pic->bpc == 12 ? 16.0 :
+                         pic->bpc == 16 ? 256.0 : 1.0);
+    for (int y = 0; y < sh; y++) {
+        for (int x = 0; x < sw; x++)
+            acc[x] = 0.0;
+        for (int v = 0; v < scale; v++) {
+            const int row = ssim_mirror(y * scale - uc + v, h);
+            const uint8_t *r8 = data8 + row * stride;
+            const uint16_t *r16 = data16 + row * stride;
+            for (int x = 0; x < sw; x++) {
+                const int *c = columns + x * scale;
+                if (table) {
+                    double sum = 0.0;
+                    for (int u = 0; u < scale; u++)
+                        sum += table[wide ? r16[c[u]] : r8[c[u]]];
+                    acc[x] += sum;
+                } else {
+                    uint32_t sum = 0;
+                    for (int u = 0; u < scale; u++)
+                        sum += wide ? r16[c[u]] : r8[c[u]];
+                    acc[x] += (double)sum;
+                }
+            }
+        }
+        float *out = dst + (size_t)y * sw;
+        for (int x = 0; x < sw; x++)
+            out[x] = (float)(table ? acc[x] : acc[x] * unit);
+    }
+    (void) even;
+    free(acc);
+    free(columns);
+    return 0;
+}
+
+static int ssim_of_floats(float *ref_f, float *cmp_f, int w, int h,
+                          double *score, double *l_score, double *c_score,
+                          double *s_score);
+
+int compute_ssim_decimated(VmafPicture *ref, VmafPicture *cmp, int scale,
+                           double *score, double *l_score, double *c_score,
+                           double *s_score)
+{
+    const int w = ref->w[0], h = ref->h[0];
+    const unsigned bpc = ref->bpc;
+    if (scale <= 1 || cmp->w[0] != (unsigned)w || cmp->h[0] != (unsigned)h)
+        return -EINVAL;
+    if (bpc != 8 && bpc != 10 && bpc != 12 && bpc != 16)
+        return -EINVAL;  /* picture_copy reads others as 8-bit */
+    const int sw = w / scale + (w & 1), sh = h / scale + (h & 1);
+    /* low_pass.kernel[] as compute_ssim() makes it */
+    const float k = 1.0f / (scale * scale);
+    const int power_of_two = (scale & (scale - 1)) == 0;
+    double *table = NULL;
+    if (!power_of_two) {
+        const size_t values = (size_t)1 << bpc;
+        const float scaler = bpc == 10 ? 4.0f : bpc == 12 ? 16.0f : bpc == 16 ? 256.0f : 1.0f;
+        table = malloc(sizeof(double) * values);
+        if (!table) return -ENOMEM;
+        for (size_t i = 0; i < values; i++) {
+            /* picture_copy's value, times the kernel's float, in float */
+            const float value = bpc == 8 ? (float)i + 0 : (float)i / scaler + 0;
+            const float product = value * k;
+            table[i] = (double)product;
+        }
+    }
+    float *ref_f = malloc(sizeof(float) * sw * sh);
+    float *cmp_f = malloc(sizeof(float) * sw * sh);
+    int err = (!ref_f || !cmp_f) ? -ENOMEM : 0;
+    if (!err) err = decimate_picture(ref, scale, ref_f, sw, sh, table);
+    if (!err) err = decimate_picture(cmp, scale, cmp_f, sw, sh, table);
+    if (!err)
+        err = ssim_of_floats(ref_f, cmp_f, sw, sh, score, l_score, c_score, s_score);
+    free(ref_f);
+    free(cmp_f);
+    free(table);
+    return err;
+}
+
+/* compute_ssim()'s SSIM of two (decimated) float images, as it is there. */
+static int ssim_of_floats(float *ref_f, float *cmp_f, int w, int h,
+                          double *score, double *l_score, double *c_score,
+                          double *s_score)
+{
+    struct _kernel window;
+    struct _map_reduce mr;
+    float l, c, s;
+    const struct iqa_ssim_args *args = 0;
+    window.kernel = (float*)g_gaussian_window;
+    window.kernel_h = (float*)g_gaussian_window_h;
+    window.kernel_v = (float*)g_gaussian_window_v;
+    window.w = window.h = GAUSSIAN_LEN;
+    window.normalized = 1;
+    window.bnd_opt = KBND_SYMMETRIC;
+    const float result = _iqa_ssim(ref_f, cmp_f, w, h, &window, &mr, args, &l, &c, &s);
+    *score = (double)result;
+    *l_score = (double)l;
+    *c_score = (double)c;
+    *s_score = (double)s;
+    return 0;
 }
 
 int compute_ssim(const float *ref, const float *cmp, int w, int h,
