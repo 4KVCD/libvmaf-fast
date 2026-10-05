@@ -59,7 +59,7 @@
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) \
     X(vkGetPhysicalDeviceFeatures) X(vkGetPhysicalDeviceMemoryProperties) \
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) \
-    X(vkEnumerateDeviceExtensionProperties)
+    X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceProperties2)
 
 #define VK_DEVICE_FUNCTIONS(X) \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) \
@@ -382,6 +382,7 @@ struct Buffer {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
     VkDeviceSize allocation = 0;  // of its memory, which another API imports by that size
+    uint32_t memoryType = 0;      // which another API on Vulkan imports it as
     void *mapped = nullptr;
 };
 
@@ -452,10 +453,13 @@ struct vv_context {
     int decoupleVariant = 0;  // adm_decouple_0's VARIANT (shaders/adm_decouple.slang)
     uint32_t strideBytes = 0, planeBytes = 0;
     // The frames' luma planes come from another API on this GPU (a decoder's
-    // CUDA), which writes them into the slots' staging buffers: GPU memory it
-    // imports by the handles vv_export gives, in place of host memory.
+    // CUDA, or its own Vulkan device), which writes them into the slots'
+    // staging buffers: GPU memory it imports by the handles vv_export gives,
+    // in place of host memory. Vulkan imports them only on the same GPU and
+    // driver (vv_shared_device).
     bool shared = false;
     PFN_vkGetMemoryWin32HandleKHR getMemoryHandle = nullptr;
+    uint8_t deviceUuid[VK_UUID_SIZE] = {}, driverUuid[VK_UUID_SIZE] = {};
 
     Pipeline pipelines[kShaderCount];
     std::vector<Buffer *> buffers;
@@ -562,6 +566,7 @@ int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisibl
         allocate.pNext = &exportInfo;
     }
     buffer.allocation = requirements.size;
+    buffer.memoryType = (uint32_t)type;
     if (vk.vkAllocateMemory(device, &allocate, nullptr, &buffer.memory) != VK_SUCCESS)
         return fail(-2, "out of GPU memory (" + std::to_string(requirements.size >> 20) + " MB buffer)");
     if (vk.vkBindBufferMemory(device, buffer.buffer, buffer.memory, 0) != VK_SUCCESS)
@@ -1233,6 +1238,14 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         if (!found)
             return fail(-4, deviceName + " cannot share its memory with a decoder");
     }
+    if (shared) {
+        VkPhysicalDeviceIDProperties ids = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+        VkPhysicalDeviceProperties2 properties2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        properties2.pNext = &ids;
+        api->vkGetPhysicalDeviceProperties2(physical, &properties2);
+        memcpy(deviceUuid, ids.deviceUUID, VK_UUID_SIZE);
+        memcpy(driverUuid, ids.driverUUID, VK_UUID_SIZE);
+    }
     decoupleVariant = (flags >> 28) & 7;
     api->vkGetPhysicalDeviceMemoryProperties(physical, &memoryProperties);
 
@@ -1608,9 +1621,10 @@ VV_EXPORT int vv_shared_next(vv_context *context, int *slot, uint32_t *stride, u
 }
 
 // A slot's staging buffer as a Win32 handle another API on this GPU imports
-// (CUDA: an opaque Win32 handle of a dedicated allocation of *bytes). The
-// caller closes the handle once it has imported it; the memory lives as long
-// as the context.
+// (an opaque Win32 handle of a dedicated allocation of *bytes: CUDA's
+// cuImportExternalMemory, or Vulkan's VkImportMemoryWin32HandleInfoKHR with
+// what vv_shared_device gives). The caller closes the handle once it has
+// imported it; the memory lives as long as the context.
 VV_EXPORT int vv_export(vv_context *context, int slot, void **handle, uint64_t *bytes)
 {
     if (!context->shared || slot < 0 || slot >= (int)context->slots.size())
@@ -1624,6 +1638,22 @@ VV_EXPORT int vv_export(vv_context *context, int slot, void **handle, uint64_t *
         return fail(-1, "vkGetMemoryWin32HandleKHR failed (" + std::to_string(result) + ")");
     *handle = win32;
     *bytes = context->slots[(size_t)slot].staging.allocation;
+    return 0;
+}
+
+// For a context made with flag bit 19: what another Vulkan device must match
+// to import the staging buffers vv_export gives -- the GPU and driver
+// (VkPhysicalDeviceIDProperties' deviceUUID and driverUUID, 16 bytes each:
+// Vulkan imports an opaque handle only where both are the exporter's) -- and
+// the memory type they were allocated from, the index the importer allocates
+// with (the same GPU and driver list the same types).
+VV_EXPORT int vv_shared_device(vv_context *context, uint8_t *deviceUuid, uint8_t *driverUuid, uint32_t *memoryType)
+{
+    if (!context->shared)
+        return fail(-3, "this context takes its frames from host memory");
+    memcpy(deviceUuid, context->deviceUuid, VK_UUID_SIZE);
+    memcpy(driverUuid, context->driverUuid, VK_UUID_SIZE);
+    *memoryType = context->slots[0].staging.memoryType;
     return 0;
 }
 

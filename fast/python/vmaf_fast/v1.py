@@ -20,10 +20,13 @@ V1Scorer takes the frames vmaf_cuda.GpuScorer takes -- 4:2:0 frames packed as
 FFmpeg's rawvideo writes them, here with their chroma, which SpEED reads --
 and returns the frame numbers scored and their scores.
 
-From NVIDIA's decoder it takes them without a CPU copy (add_decoded): the
-lumas are copied on the GPU into memory the decoder and Vulkan share
-(vmaf_vulkan.SharedLumas), and the planes CAMBI and SpEED read are downloaded
-straight into libvmaf's pictures, page-locked, which the GPU writes by itself.
+From a hardware decoder that keeps its pictures on the GPU (NVIDIA's, through
+CUDA; AMD's, through its own Vulkan device) it takes them without a CPU copy
+(add_decoded): the lumas are copied on the GPU into memory the decoder and
+Vulkan share (vmaf_vulkan.SharedLumas), and the planes CAMBI and SpEED read
+are downloaded straight into libvmaf's pictures, page-locked, which the GPU
+writes by itself. Memory one decoder pins (the distorted one's) the other
+writes into too.
 """
 from __future__ import annotations
 
@@ -519,9 +522,11 @@ class MultiScorer:
 
     def __init__(self, width: int, height: int, bit_depth: int, models: dict[str, str], n_subsample: int = 1,
                  backend: str = "cuda", device: int | None = None, shared=None):
-        """`shared`: NVIDIA's decoder (GpuFrameStream), whose pictures the
-        scorers then take on the GPU (add_decoded) instead of from system
-        memory (add). VmafGpuError where they cannot."""
+        """`shared`: a decoder that keeps its pictures on the GPU
+        (GpuFrameStream: NVIDIA's; AMD's handing over), which the scorers then
+        take on the GPU (add_decoded) instead of from system memory (add).
+        libvmaf's CUDA code takes only NVIDIA's. VmafGpuError where they
+        cannot."""
         models = dict(models)
         v1_model = models.pop(V1_KEY, None)
         self._scorers = []
