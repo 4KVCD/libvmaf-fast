@@ -14,7 +14,7 @@ libvmaf's own numbers:
   score, bit for bit.
 - **libvmaf's CUDA code, fixed.** 11 open upstream pull requests are merged.
   They fix its build, a crash, races and leaks, and bring it closer to the
-  CPU code. Upstream's native MSVC build is merged too. A fix of the fork's
+  CPU code. A fix of the fork's
   own makes CUDA about five times as fast with CPU-decoded frames.
 
 **Ready-made tool:** [VideoMetricsLab](https://github.com/4KVCD/VideoMetricsLab)
@@ -160,13 +160,12 @@ CPU-decoded frames go through `vv_submit`.
 ### libvmaf's CUDA code
 
 The `fast` branch is upstream at
-[cea2b4d8](https://github.com/Netflix/vmaf/commit/cea2b4d832a105116a3f16f56d6f5d953421952c)
-(2026-10-01) with these pull requests merged, each at the commit that was
+[b41d2340](https://github.com/Netflix/vmaf/commit/b41d2340a881c69682efb08fbffd0856485c57b9)
+(2026-10-05) with these pull requests merged, each at the commit that was
 tested. They are their authors' work:
 
 | Pull request | Author | Fixes |
 |---|---|---|
-| [#1477](https://github.com/Netflix/vmaf/pull/1477) | StormBytePP | Native MSVC build (merged upstream on 2026-10-02) |
 | [#1573](https://github.com/Netflix/vmaf/pull/1573) | StormBytePP | CUDA builds outside the source tree; a crash in pinned pictures |
 | [#1583](https://github.com/Netflix/vmaf/pull/1583) | jmsether | A double flush that fails threaded CUDA runs at the end; a race in motion |
 | [#1644](https://github.com/Netflix/vmaf/pull/1644) | lusoris | CUDA motion: the CPU's edge mirror |
