@@ -12,9 +12,10 @@ libvmaf's own numbers:
   CPU work, are calculated on the GPU, bit-identical to libvmaf's CPU code.
   CAMBI and SpEED stay on libvmaf's CPU code. The score is libvmaf's CPU
   score, bit for bit.
-- **libvmaf's CUDA code with 11 open upstream pull requests merged.** They fix
-  its build, a crash, races and leaks, and bring it closer to the CPU code.
-  Upstream's native MSVC build is merged too.
+- **libvmaf's CUDA code, fixed.** 11 open upstream pull requests are merged.
+  They fix its build, a crash, races and leaks, and bring it closer to the
+  CPU code. Upstream's native MSVC build is merged too. A fix of the fork's
+  own makes CUDA about five times as fast with CPU-decoded frames.
 
 **Ready-made tool:** [VideoMetricsLab](https://github.com/4KVCD/VideoMetricsLab)
 is a Windows app for scoring and comparing video encodes. From version 1.5 it
@@ -58,9 +59,9 @@ the RTX 5090.
 | | VMAF, 4K | VMAF, 1080p | VMAF + NEG, 4K | VMAF + NEG, 1080p |
 |---|--:|--:|--:|--:|
 | CPU, 24 threads | 52 | 210 | 24 | 110 |
-| CUDA, CPU-decoded | 330 | 840 | 260 | 670 |
+| CUDA, CPU-decoded | 340 | 860 | 280 | 680 |
 | CUDA, GPU-decoded | 470 | 1250 | 300 | 850 |
-| Vulkan, RTX 5090, CPU-decoded | 310 | 1130 | 310 | 1120 |
+| Vulkan, RTX 5090, CPU-decoded | 320 | 1160 | 320 | 1120 |
 | Vulkan, RTX 5090, GPU-decoded | 380 | 1070 | 380 | 1030 |
 | Vulkan, Intel iGPU, CPU-decoded | 14 | 54 | 14 | 54 |
 
@@ -68,14 +69,10 @@ the RTX 5090.
   as well, Vulkan is faster (380 against 300 fps at 4K). Vulkan calculates
   what VMAF and NEG share once, while libvmaf calculates VIF and ADM twice.
 - **CPU-decoded: Vulkan is as fast or faster.** For VMAF alone at 4K the two
-  are about even; CUDA's two runs gave 300 and 370 fps. In the other three
-  columns Vulkan is faster.
-- **libvmaf's own host pictures are slow.** In the CUDA CPU-decoded row, the
-  program uploads each frame into libvmaf's GPU pictures through one reused
-  page-locked buffer, as the Vulkan engine does. Handing libvmaf host
-  pictures instead gives only about 60 fps at 4K. For every picture, libvmaf
-  allocates, page-locks and zeroes a new 25 MB buffer, taking about 9 ms per
-  4K frame pair.
+  are about even. In the other three columns Vulkan is faster.
+- **CUDA with CPU-decoded frames needs this fork's fix.** Upstream libvmaf
+  gives about 60 fps at 4K here, because it allocates a new host picture
+  for every frame (see below).
 - **The Intel integrated GPU is slower than the CPU.**
 
 ### VMAF v1
@@ -180,6 +177,15 @@ tested. They are their authors' work:
 
 Seven of them (#1644 and #1647 to #1652) have new commits since. The fork
 keeps the tested commits until the new ones are tested.
+
+One fix is the fork's own (8ebd5f5d, not yet in a release). With the HOST or
+HOST_PINNED method, `vmaf_cuda_fetch_preallocated_picture` used to allocate
+a new picture for every frame. For HOST_PINNED, that meant a new 25 MB
+page-locked buffer, zeroed, then freed again, about 9 ms per 4K frame pair.
+It now hands out pictures from a pool. It waits for each upload from a
+pinned picture before that picture can be reused, and allocates as before
+if the pool runs out. At 4K, VMAF went from 64 to about 350 fps, with
+scores unchanged.
 
 CUDA still differs slightly from the CPU in motion. The CPU blurs the
 difference of two frames; CUDA blurs each frame and subtracts, which rounds
