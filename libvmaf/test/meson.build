@@ -223,6 +223,8 @@ test_cuda_vif_order = executable('test_cuda_vif_order',
     link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
     dependencies : [cuda_dependency, math_lib],
     c_args : ['-DHAVE_CUDA=1'],
+)
+
 test_cuda_adm_cm_border = executable('test_cuda_adm_cm_border',
     ['test.c', 'test_cuda_adm_cm_border.c'],
     include_directories : [libvmaf_inc, test_inc],
