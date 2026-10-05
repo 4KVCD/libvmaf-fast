@@ -41,6 +41,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <algorithm>
@@ -60,7 +61,7 @@
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) \
     X(vkGetPhysicalDeviceFeatures) X(vkGetPhysicalDeviceMemoryProperties) \
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) \
-    X(vkEnumerateDeviceExtensionProperties)
+    X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceFeatures2)
 
 #define VK_DEVICE_FUNCTIONS(X) \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) \
@@ -72,7 +73,9 @@
     X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkResetCommandBuffer) \
     X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) \
     X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCreateFence) X(vkDestroyFence) \
-    X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) X(vkDeviceWaitIdle)
+    X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) X(vkDeviceWaitIdle) X(vkGetFenceStatus) \
+    X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) \
+    X(vkCmdCopyImageToBuffer)
 
 namespace {
 
@@ -459,12 +462,31 @@ struct vv_context {
     int skip = 0;  // timing tests: 1 = no motion, 2 = no VIF, 4 = no ADM
     int passLimit = 0;  // timing tests: only the first N scored passes
     int decoupleVariant = 0;  // adm_decouple_0's VARIANT (shaders/adm_decouple.slang)
+    // VIF's two passes as one (vif_fused); VV_VIF_FUSED=0 for the two, to compare.
+    bool vifFused = true;
     uint32_t strideBytes = 0, planeBytes = 0;
     // The frames' luma planes come from another API on this GPU (a decoder's
     // CUDA), which writes them into the slots' staging buffers: GPU memory it
     // imports by the handles vv_export gives, in place of host memory.
     bool shared = false;
     PFN_vkGetMemoryWin32HandleKHR getMemoryHandle = nullptr;
+    // Or a decoder on this GPU writes them into Direct3D 11 textures, which
+    // the context imports (vv_import_texture) and copies from on the GPU
+    // (vv_commit_textures): the frames never leave the GPU's memory.
+    struct Imported {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+    };
+    std::vector<Imported> imported;
+    PFN_vkGetMemoryWin32HandlePropertiesKHR getHandleProperties = nullptr;
+    int pendingTextures[2] = { -1, -1 };
+    int import_texture(void *handle, int *index);
+    int commit_textures(int ref, int dis, bool score);
+    unsigned completed();
+    // The SIMD width each shader is compiled for (VK_EXT_subgroup_size_control:
+    // 8, 16 or 32 lanes on Intel's GPUs), 0 for the driver's choice.
+    uint32_t subgroupSizes[kShaderCount] = {};
+    bool subgroupSizeControl = false;
 
     Pipeline pipelines[kShaderCount];
     std::vector<Buffer *> buffers;
@@ -511,6 +533,10 @@ vv_context::~vv_context()
             vk.vkDestroyBuffer(device, buffer->buffer, nullptr);
         if (buffer->memory)
             vk.vkFreeMemory(device, buffer->memory, nullptr);
+    }
+    for (Imported &texture : imported) {
+        if (texture.image) vk.vkDestroyImage(device, texture.image, nullptr);
+        if (texture.memory) vk.vkFreeMemory(device, texture.memory, nullptr);
     }
     for (Pipeline &pipeline : pipelines) {
         if (pipeline.pipeline) vk.vkDestroyPipeline(device, pipeline.pipeline, nullptr);
@@ -630,6 +656,12 @@ int vv_context::create_pipeline(int shader, uint32_t bindings)
     info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     info.stage.module = pipeline.module;
     info.stage.pName = "main";
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT required = {
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT };
+    if (subgroupSizeControl && subgroupSizes[shader]) {
+        required.requiredSubgroupSize = subgroupSizes[shader];
+        info.stage.pNext = &required;
+    }
     info.layout = pipeline.layout;
     if (vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline.pipeline) != VK_SUCCESS)
         return fail(-1, std::string("the GPU driver could not compile the shader ") + kShaders[shader].name);
@@ -754,6 +786,20 @@ int vv_context::build_passes()
             Buffer *inRef = scale == 0 ? &picRef : &rdRef[(scale - 1) % 2];
             Buffer *inDis = scale == 0 ? &picDis : &rdDis[(scale - 1) % 2];
             const int nextStride = (sw + 1) / 2;
+            if (vifFused && !nativeDouble) {
+                // Both passes in one, the vertical pass's results in group
+                // memory (shaders/vif_fused.slang).
+                const uint32_t fused[] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)sourceStride,
+                                           shiftVP, addVP, shiftSq, addSq, (uint32_t)nextStride,
+                                           (uint32_t)(kSlotVif + scale * kVifSums), 100, 1,
+                                           (uint32_t)epsilon, (uint32_t)(epsilon >> 32) };
+                const int shader = scale == 0 ? (deep ? kShader_vif_fused_0_16 : kShader_vif_fused_0_8)
+                                              : kShader_vif_fused_1 + (scale - 1);
+                error = add_pass(scored, shader, { inRef, inDis, &rdRef[scale % 2], &rdDis[scale % 2], &acc, &logTable },
+                                 fused, sizeof fused, groups(sw, 64), groups(sh, 4));
+                sourceStride = nextStride;
+                continue;
+            }
             const uint32_t vertical[] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)sourceStride,
                                           shiftVP, addVP, shiftSq, addSq };
             const int verticalShader = scale == 0 ? (deep ? kShader_vif_vert_0_16 : kShader_vif_vert_0_8)
@@ -1243,18 +1289,67 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     skip = (flags >> 16) & 7;
     passLimit = (flags >> 20) & 0xFF;
     shared = (flags >> 19) & 1;
-    const char *extensions[] = { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME };
-    if (shared) {
-        uint32_t count = 0;
-        api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr);
-        std::vector<VkExtensionProperties> listed(count);
-        if (count)
-            api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, listed.data());
-        bool found = false;
-        for (uint32_t i = 0; i < count; ++i)
-            found = found || !strcmp(listed[i].extensionName, extensions[0]);
-        if (!found)
-            return fail(-4, deviceName + " cannot share its memory with a decoder");
+    uint32_t listedCount = 0;
+    api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &listedCount, nullptr);
+    std::vector<VkExtensionProperties> listed(listedCount);
+    if (listedCount)
+        api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &listedCount, listed.data());
+    auto has = [&](const char *name) {
+        for (const VkExtensionProperties &extension : listed)
+            if (!strcmp(extension.extensionName, name))
+                return true;
+        return false;
+    };
+    std::vector<const char *> extensions;
+    // Win32 external memory, where the driver has it: for frames from a
+    // decoder (shared, or Direct3D textures imported).
+    const bool externalMemory = has(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+    if (shared && !externalMemory)
+        return fail(-4, deviceName + " cannot share its memory with a decoder");
+    if (externalMemory)
+        extensions.push_back(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+    // The SIMD width per shader, where the GPU lets it be chosen.
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sizeControl = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT };
+    if (has(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME) && api->vkGetPhysicalDeviceFeatures2) {
+        VkPhysicalDeviceFeatures2 query = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        query.pNext = &sizeControl;
+        api->vkGetPhysicalDeviceFeatures2(physical, &query);
+        subgroupSizeControl = sizeControl.subgroupSizeControl == VK_TRUE;
+        if (subgroupSizeControl)
+            extensions.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+        sizeControl.computeFullSubgroups = VK_FALSE;
+        sizeControl.pNext = nullptr;
+    }
+    // Intel's GPUs run ADM's shaders fastest at 8 lanes (Core Ultra 9 285K's
+    // iGPU: ADM 2.97 -> 2.42 ms a 1080p pair); the others at the driver's
+    // choice. No shader uses subgroup operations: the width changes no sum.
+    if (subgroupSizeControl && properties.vendorID == 0x8086) {
+        for (int i = 0; i < kShaderCount; ++i)
+            if (!strncmp(kShaders[i].name, "adm_", 4))
+                subgroupSizes[i] = 8;
+    }
+    if (const char *text = getenv("VV_VIF_FUSED"))
+        vifFused = strcmp(text, "0") != 0;
+    // For experiments: VV_SUBGROUP="shader=16,shader=8" or "*=16".
+    if (const char *text = getenv("VV_SUBGROUP")) {
+        std::string spec = text;
+        size_t at = 0;
+        while (at < spec.size()) {
+            size_t end = spec.find(',', at);
+            std::string item = spec.substr(at, end == std::string::npos ? std::string::npos : end - at);
+            size_t equals = item.find('=');
+            if (equals != std::string::npos) {
+                std::string name = item.substr(0, equals);
+                uint32_t size = (uint32_t)atoi(item.c_str() + equals + 1);
+                for (int i = 0; i < kShaderCount; ++i)
+                    if (name == "*" || name == kShaders[i].name)
+                        subgroupSizes[i] = size;
+            }
+            if (end == std::string::npos)
+                break;
+            at = end + 1;
+        }
     }
     decoupleVariant = (flags >> 28) & 7;
     api->vkGetPhysicalDeviceMemoryProperties(physical, &memoryProperties);
@@ -1283,13 +1378,13 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     enabled.shaderInt64 = VK_TRUE;
     enabled.shaderFloat64 = nativeDouble ? VK_TRUE : VK_FALSE;
     VkDeviceCreateInfo deviceInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+    if (subgroupSizeControl)
+        deviceInfo.pNext = &sizeControl;
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
     deviceInfo.pEnabledFeatures = &enabled;
-    if (shared) {
-        deviceInfo.enabledExtensionCount = 1;
-        deviceInfo.ppEnabledExtensionNames = extensions;
-    }
+    deviceInfo.enabledExtensionCount = (uint32_t)extensions.size();
+    deviceInfo.ppEnabledExtensionNames = extensions.empty() ? nullptr : extensions.data();
     VkResult result = api->vkCreateDevice(physical, &deviceInfo, nullptr, &device);
     if (result != VK_SUCCESS) {
         device = VK_NULL_HANDLE;
@@ -1304,6 +1399,9 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         if (!getMemoryHandle)
             return fail(-4, deviceName + " cannot share its memory with a decoder");
     }
+    if (externalMemory)
+        getHandleProperties = (PFN_vkGetMemoryWin32HandlePropertiesKHR)api->vkGetDeviceProcAddr(
+            device, "vkGetMemoryWin32HandlePropertiesKHR");
 
     VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1481,11 +1579,46 @@ int vv_context::commit(bool score)
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk.vkBeginCommandBuffer(cb, &begin);
     barrier(vk, cb, kCompute | kTransfer, kTransfer);
-    VkBufferCopy copy = { 0, 0, planeBytes };
-    vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
-    if (score) {
-        copy.srcOffset = planeBytes;
-        vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picDis.buffer, 1, &copy);
+    if (pendingTextures[0] >= 0) {
+        // From the decoder's Direct3D textures: taken over from the
+        // "external" queue family for the copy and handed back after it,
+        // in the general layout throughout (the memory is Direct3D's).
+        const int textures[2] = { pendingTextures[0], score ? pendingTextures[1] : -1 };
+        Buffer *targets[2] = { &picRef, &picDis };
+        pendingTextures[0] = pendingTextures[1] = -1;
+        for (int i = 0; i < 2; ++i) {
+            if (textures[i] < 0)
+                continue;
+            VkImageMemoryBarrier take = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+            take.srcAccessMask = 0;
+            take.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            take.oldLayout = take.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            take.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+            take.dstQueueFamilyIndex = queueFamily;
+            take.image = imported[(size_t)textures[i]].image;
+            take.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                    nullptr, 0, nullptr, 1, &take);
+            VkBufferImageCopy region = {};
+            region.bufferRowLength = strideBytes / (bpc > 8 ? 2 : 1);
+            region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.imageExtent = { (uint32_t)w, (uint32_t)h, 1 };
+            vk.vkCmdCopyImageToBuffer(cb, take.image, VK_IMAGE_LAYOUT_GENERAL, targets[i]->buffer, 1, &region);
+            VkImageMemoryBarrier give = take;
+            give.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            give.dstAccessMask = 0;
+            give.srcQueueFamilyIndex = queueFamily;
+            give.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+            vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+                                    nullptr, 0, nullptr, 1, &give);
+        }
+    } else {
+        VkBufferCopy copy = { 0, 0, planeBytes };
+        vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
+        if (score) {
+            copy.srcOffset = planeBytes;
+            vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picDis.buffer, 1, &copy);
+        }
     }
     vk.vkCmdFillBuffer(cb, acc.buffer, 0, VK_WHOLE_SIZE, 0);
     barrier(vk, cb, kTransfer, kCompute);
@@ -1527,6 +1660,95 @@ int vv_context::commit(bool score)
     slot.busy = true;
     return 0;
 }
+
+// A Direct3D 11 texture shared by its NT handle (D3D11_RESOURCE_MISC_SHARED_
+// NTHANDLE), the context's size and R16_UINT (more than 8 bits) or R8_UINT:
+// one frame's luma, as a decoder writes it. The handle stays the caller's.
+int vv_context::import_texture(void *handle, int *index)
+{
+    if (!getHandleProperties)
+        return fail(-4, deviceName + " cannot import Direct3D textures");
+    const VkExternalMemoryHandleTypeFlagBits type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+    VkExternalMemoryImageCreateInfo external = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+    external.handleTypes = type;
+    VkImageCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    info.pNext = &external;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = bpc > 8 ? VK_FORMAT_R16_UINT : VK_FORMAT_R8_UINT;
+    info.extent = { (uint32_t)w, (uint32_t)h, 1 };
+    info.mipLevels = info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imported.emplace_back();
+    Imported &texture = imported.back();
+    if (vk.vkCreateImage(device, &info, nullptr, &texture.image) != VK_SUCCESS)
+        return fail(-1, "vkCreateImage failed for a Direct3D texture");
+    VkMemoryWin32HandlePropertiesKHR properties = { VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
+    VkResult result = getHandleProperties(device, type, (HANDLE)handle, &properties);
+    if (result != VK_SUCCESS)
+        return fail(-1, "the Direct3D texture's handle was refused (" + std::to_string(result) + ")");
+    VkMemoryRequirements requirements;
+    vk.vkGetImageMemoryRequirements(device, texture.image, &requirements);
+    const uint32_t bits = requirements.memoryTypeBits & (properties.memoryTypeBits ? properties.memoryTypeBits : ~0u);
+    if (!bits)
+        return fail(-1, "no memory type takes the Direct3D texture");
+    uint32_t memoryType = 0;
+    while (!(bits & (1u << memoryType)))
+        ++memoryType;
+    VkMemoryDedicatedAllocateInfo dedicated = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+    dedicated.image = texture.image;
+    VkImportMemoryWin32HandleInfoKHR import = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+    import.pNext = &dedicated;
+    import.handleType = type;
+    import.handle = (HANDLE)handle;
+    VkMemoryAllocateInfo allocate = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    allocate.pNext = &import;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = memoryType;
+    result = vk.vkAllocateMemory(device, &allocate, nullptr, &texture.memory);
+    if (result != VK_SUCCESS)
+        return fail(-1, "importing the Direct3D texture failed (" + std::to_string(result) + ")");
+    if (vk.vkBindImageMemory(device, texture.image, texture.memory, 0) != VK_SUCCESS)
+        return fail(-1, "vkBindImageMemory failed for a Direct3D texture");
+    *index = (int)imported.size() - 1;
+    return 0;
+}
+
+// The next frame pair from two imported textures (`dis` unused when the
+// frame is not scored). The caller must not let the decoder write either
+// texture again before completed() counts this frame.
+int vv_context::commit_textures(int ref, int dis, bool score)
+{
+    const int count = (int)imported.size();
+    if (ref < 0 || ref >= count || (score && (dis < 0 || dis >= count)))
+        return fail(-3, "no such imported texture");
+    uint8_t *unused[2];
+    if (int error = staging(&unused[0], &unused[1]))
+        return error;
+    pendingTextures[0] = ref;
+    pendingTextures[1] = score ? dis : -1;
+    return commit(score);
+}
+
+// How many frames the GPU has finished, without waiting: the oldest frames'
+// slots whose fences have signalled are collected.
+unsigned vv_context::completed()
+{
+    for (size_t i = 0; i < slots.size(); ++i) {
+        Slot &slot = slots[(nextSlot + i) % slots.size()];
+        if (!slot.busy)
+            continue;
+        if (vk.vkGetFenceStatus(device, slot.fence) != VK_SUCCESS || collect(slot))
+            break;
+    }
+    unsigned busy = 0;
+    for (const Slot &slot : slots)
+        busy += slot.busy ? 1 : 0;
+    return frames - busy;
+}
+
 
 int vv_context::flush()
 {
@@ -1659,6 +1881,26 @@ VV_EXPORT int vv_export(vv_context *context, int slot, void **handle, uint64_t *
 
 // Waits for every submitted frame.
 VV_EXPORT int vv_flush(vv_context *context) { return context->flush(); }
+// Frames from a Direct3D 11 decoder on this GPU (Intel's, through oneVPL):
+// each shared texture is imported once (*index), then each frame pair is
+// committed by its two textures' indices. vv_completed gives how many
+// frames the GPU has finished, so the decoder may reuse their textures.
+VV_EXPORT int vv_import_texture(vv_context *context, void *handle, int *index)
+{
+    return context->import_texture(handle, index);
+}
+
+VV_EXPORT int vv_commit_textures(vv_context *context, int reference, int distorted, int score)
+{
+    return context->commit_textures(reference, distorted, score != 0);
+}
+
+VV_EXPORT int vv_completed(vv_context *context, unsigned *frames)
+{
+    *frames = context->completed();
+    return context->failed ? fail(-5, "the GPU failed on an earlier frame") : 0;
+}
+
 
 // A frame's features (kFeatures doubles), after vv_flush. Returns 1 when
 // the frame was scored, 0 when only its motion was (the others are 0 then).
