@@ -4,9 +4,9 @@
 # Writes fast/release/libvmaf-fast-<version>-windows-x64.zip and its
 # .sha256 beside it.
 #
-# Build both from a clean checkout of the commit to be released first:
-# libvmaf reports the commit it was built from as its version, and this
-# script refuses a checkout with changes or a libvmaf built from another
+# Build both from a clean checkout of the commit to be released first: each
+# reports the commit it was built from (vmaf_version, vv_version), and this
+# script refuses a checkout with changes or a library built from another
 # commit.
 param(
     [Parameter(Mandatory = $true)][string]$Version,  # e.g. 3.2.0-fast.1
@@ -29,6 +29,11 @@ $reported = (& $Python -c "import ctypes, sys; lib = ctypes.CDLL(sys.argv[1]); l
 if (-not $commit.StartsWith($reported)) {
     throw "libvmaf.dll was built from $reported, not from $($commit.Substring(0, 8)): build it again"
 }
+$vulkan = Join-Path $dist 'vmaf_vulkan/vmaf_vulkan.dll'
+$vulkanReported = (& $Python -c "import ctypes, sys; lib = ctypes.CDLL(sys.argv[1]); lib.vv_version.restype = ctypes.c_char_p; print(lib.vv_version().decode())" $vulkan).Trim()
+if (-not $vulkanReported -or -not $commit.StartsWith($vulkanReported)) {
+    throw "vmaf_vulkan.dll was built from '$vulkanReported', not from $($commit.Substring(0, 8)): build it again"
+}
 
 $name = "libvmaf-fast-$Version-windows-x64"
 $stage = Join-Path $out $name
@@ -43,7 +48,7 @@ function Write-Lines([string]$path, [string[]]$lines) {
 Write-Lines (Join-Path $stage 'BUILD.txt') @(
     "libvmaf-fast $Version",
     "Built from https://github.com/4KVCD/libvmaf-fast/commit/$commit",
-    "libvmaf.dll reports version $reported.",
+    "libvmaf.dll reports version $reported, vmaf_vulkan.dll $vulkanReported.",
     '',
     'libvmaf/libvmaf.dll      libvmaf with CUDA (fast/scripts/build_libvmaf_cuda.ps1)',
     'vmaf_vulkan/vmaf_vulkan.dll  VMAF features with Vulkan (fast/scripts/build_vmaf_vulkan.ps1)',

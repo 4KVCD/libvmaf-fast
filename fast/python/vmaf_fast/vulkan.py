@@ -338,7 +338,7 @@ def predict(version: str, frames: np.ndarray, rows: np.ndarray) -> np.ndarray:
 DEVICE_VARIABLE = "VMAF_FAST_VULKAN_DEVICE"
 #: SHA-256 of the sums the probe's frames give (8-bit, then 10-bit), which
 #: are the sums behind feature values identical to libvmaf's CUDA code's
-#: (tests/test_vmaf_vulkan.py compares them where CUDA runs).
+#: (fast/tests/compare_vmaf_vulkan.py compares them where CUDA runs).
 _PROBE_SUMS = ("33668b74708340de30734d996e3b60ea025c4c55a5d977707ea6482467f85dee",
                "76f6f75034298e831c97642952e3682d896b85713efddf8e32d65a19c09bc3b1")
 _PROBE_SIZE = (320, 192)

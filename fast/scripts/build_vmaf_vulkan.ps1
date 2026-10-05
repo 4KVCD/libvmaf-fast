@@ -140,7 +140,12 @@ $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer
 $visualStudio = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $visualStudio) { throw 'Visual Studio with the C++ tools was not found' }
 New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
-$compile = "cl /nologo /LD /O2 /MT /EHsc /std:c++17 /W3 /wd4244 /wd4305 /wd4996 /Brepro /I`"$build`" /I`"$(Join-Path $headers 'include')`" " +
+# The commit it is built from, which vv_version() reports (package.ps1 checks
+# it, as it does libvmaf's): build from a clean checkout of the commit released.
+$commit = (git -C $repository rev-parse --short=8 HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $commit) { throw 'The commit being built could not be read (git rev-parse)' }
+if (git -C $repository status --porcelain --untracked-files=no) { $commit += '-dirty' }
+$compile = "cl /nologo /LD /O2 /MT /EHsc /std:c++17 /W3 /wd4244 /wd4305 /wd4996 /Brepro /DVV_COMMIT=\`"$commit\`" /I`"$build`" /I`"$(Join-Path $headers 'include')`" " +
     "`"$(Join-Path $source 'vmaf_vulkan.cpp')`" /Fo`"$build\\`" /Fe`"$output`" /link /Brepro /IMPLIB:`"$build\vmaf_vulkan.lib`""
 $batch = Join-Path $build 'compile.bat'
 Set-Content -Path $batch -Encoding ascii -Value @(
@@ -158,5 +163,5 @@ Copy-Item (Join-Path $repository 'LICENSE') (Join-Path $licenses 'LICENSE.libvma
 Remove-Item (Join-Path $outputDirectory 'vmaf_vulkan.lib'), (Join-Path $outputDirectory 'vmaf_vulkan.exp') -ErrorAction SilentlyContinue
 
 $hash = (Get-FileHash $output -Algorithm SHA256).Hash.ToLowerInvariant()
-Write-Host "VMAF for Vulkan: $output"
+Write-Host "VMAF for Vulkan ($commit): $output"
 Write-Host "SHA-256 $hash, $((Get-Item $output).Length) bytes"

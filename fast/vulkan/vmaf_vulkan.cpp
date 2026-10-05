@@ -44,6 +44,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -99,41 +100,48 @@ int fail(int code, const std::string &message)
 }
 
 // One instance per process, made on first use and kept: vulkan-1.dll is
-// loaded by the first call, never inside DllMain.
+// loaded by the first call, never inside DllMain. Made once whichever
+// threads ask first; why there is none is told to every caller, on its own
+// thread, not only to the first.
 InstanceApi *instance_api()
 {
     static InstanceApi api;
-    static bool tried = false;
-    if (tried)
-        return api.instance ? &api : nullptr;
-    tried = true;
-    api.library = LoadLibraryW(L"vulkan-1.dll");
-    if (!api.library) {
-        g_error = "vulkan-1.dll was not found (no Vulkan driver)";
-        return nullptr;
-    }
-    api.vkGetInstanceProcAddr =
-        (PFN_vkGetInstanceProcAddr)GetProcAddress(api.library, "vkGetInstanceProcAddr");
-    auto create = (PFN_vkCreateInstance)api.vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
-    if (!create) {
-        g_error = "vulkan-1.dll has no vkCreateInstance";
-        return nullptr;
-    }
-    VkApplicationInfo application = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
-    application.pApplicationName = "libvmaf-fast";
-    application.apiVersion = VK_API_VERSION_1_1;
-    VkInstanceCreateInfo info = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
-    info.pApplicationInfo = &application;
-    VkInstance instance;
-    VkResult result = create(&info, nullptr, &instance);
-    if (result != VK_SUCCESS) {
-        g_error = "vkCreateInstance failed (" + std::to_string(result) + ")";
-        return nullptr;
-    }
+    static std::string why;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        api.library = LoadLibraryW(L"vulkan-1.dll");
+        if (!api.library) {
+            why = "vulkan-1.dll was not found (no Vulkan driver)";
+            return;
+        }
+        api.vkGetInstanceProcAddr =
+            (PFN_vkGetInstanceProcAddr)GetProcAddress(api.library, "vkGetInstanceProcAddr");
+        auto create = api.vkGetInstanceProcAddr
+            ? (PFN_vkCreateInstance)api.vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance") : nullptr;
+        if (!create) {
+            why = "vulkan-1.dll has no vkCreateInstance";
+            return;
+        }
+        VkApplicationInfo application = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
+        application.pApplicationName = "libvmaf-fast";
+        application.apiVersion = VK_API_VERSION_1_1;
+        VkInstanceCreateInfo info = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+        info.pApplicationInfo = &application;
+        VkInstance instance;
+        VkResult result = create(&info, nullptr, &instance);
+        if (result != VK_SUCCESS) {
+            why = "vkCreateInstance failed (" + std::to_string(result) + ")";
+            return;
+        }
 #define X(name) api.name = (PFN_##name)api.vkGetInstanceProcAddr(instance, #name);
-    VK_INSTANCE_FUNCTIONS(X)
+        VK_INSTANCE_FUNCTIONS(X)
 #undef X
-    api.instance = instance;
+        api.instance = instance;
+    });
+    if (!api.instance) {
+        g_error = why;
+        return nullptr;
+    }
     return &api;
 }
 
@@ -474,6 +482,7 @@ struct vv_context {
     ~vv_context();
     int init(int deviceIndex, int width, int height, int bitDepth, int flags);
     int create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported = false);
+    void destroy_last_buffer(Buffer &buffer);
     int create_pipeline(int shader, uint32_t bindings);
     int add_pass(std::vector<Pass> &list, int shader, std::initializer_list<Buffer *> bound,
                  const void *constants, uint32_t constantBytes, uint32_t gx, uint32_t gy);
@@ -569,6 +578,19 @@ int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisibl
     if (hostVisible && vk.vkMapMemory(device, buffer.memory, 0, VK_WHOLE_SIZE, 0, &buffer.mapped) != VK_SUCCESS)
         return fail(-1, "vkMapMemory failed");
     return 0;
+}
+
+// Frees a buffer made for one call, the last create_buffer made (or began to
+// make: what it got as far as). The context keeps a pointer to every buffer
+// it makes, for its destructor, and such a buffer is the caller's local.
+void vv_context::destroy_last_buffer(Buffer &buffer)
+{
+    if (buffer.buffer)
+        vk.vkDestroyBuffer(device, buffer.buffer, nullptr);
+    if (buffer.memory)
+        vk.vkFreeMemory(device, buffer.memory, nullptr);
+    buffer = Buffer();
+    buffers.pop_back();
 }
 
 int vv_context::create_pipeline(int shader, uint32_t bindings)
@@ -673,8 +695,10 @@ int ceil_log2(int value) { return (int)ceil(log2((double)value)); }
 int vv_context::upload(Buffer &target, const void *data, size_t bytes)
 {
     Buffer staging;
-    if (int error = create_buffer(staging, bytes, true))
+    if (int error = create_buffer(staging, bytes, true)) {
+        destroy_last_buffer(staging);
         return error;
+    }
     memcpy(staging.mapped, data, bytes);
     VkCommandBuffer commands = slots[0].commands;
     VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -689,9 +713,7 @@ int vv_context::upload(Buffer &target, const void *data, size_t bytes)
     VkResult result = vk.vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
     if (result == VK_SUCCESS)
         result = vk.vkDeviceWaitIdle(device);
-    vk.vkDestroyBuffer(device, staging.buffer, nullptr);
-    vk.vkFreeMemory(device, staging.memory, nullptr);
-    buffers.pop_back();
+    destroy_last_buffer(staging);
     return result == VK_SUCCESS ? 0 : fail(-1, "uploading a table to the GPU failed");
 }
 
@@ -1567,6 +1589,13 @@ VV_EXPORT void vv_destroy(vv_context *context) { delete context; }
 
 VV_EXPORT const char *vv_error() { return g_error.c_str(); }
 
+// The commit of libvmaf-fast the library was built from (as libvmaf's
+// vmaf_version() gives its own), "unknown" when built outside the script.
+#ifndef VV_COMMIT
+#define VV_COMMIT "unknown"
+#endif
+VV_EXPORT const char *vv_version() { return VV_COMMIT; }
+
 // The next frame pair's luma planes (16-bit little-endian samples above 8
 // bits). `score` 0: only motion is calculated for the frame (libvmaf's
 // n_subsample), and `distorted` may be null.
@@ -1689,8 +1718,10 @@ VV_EXPORT int vv_read_buffer(vv_context *context, int which, void *out, uint64_t
     Buffer *source = all[which];
     bytes = std::min<uint64_t>(bytes, source->size);
     Buffer staging;
-    if (int error = context->create_buffer(staging, bytes, true))
+    if (int error = context->create_buffer(staging, bytes, true)) {
+        context->destroy_last_buffer(staging);
         return error;
+    }
     const DeviceApi &vk = context->vk;
     VkCommandBuffer cb = context->slots[0].commands;
     VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -1709,9 +1740,7 @@ VV_EXPORT int vv_read_buffer(vv_context *context, int which, void *out, uint64_t
         result = vk.vkDeviceWaitIdle(context->device);
     if (result == VK_SUCCESS)
         memcpy(out, staging.mapped, (size_t)bytes);
-    vk.vkDestroyBuffer(context->device, staging.buffer, nullptr);
-    vk.vkFreeMemory(context->device, staging.memory, nullptr);
-    context->buffers.pop_back();
+    context->destroy_last_buffer(staging);
     return result == VK_SUCCESS ? 0 : fail(-1, "reading a GPU buffer failed");
 }
 
