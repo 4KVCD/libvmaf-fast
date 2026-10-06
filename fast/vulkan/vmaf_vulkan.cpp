@@ -1997,6 +1997,9 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // VIF's vertical results: only the two-pass VIF writes them (vif_fused
     // keeps them in group memory) -- 166 MB at 4K.
     const VkDeviceSize twoPass = vifFused && !nativeDouble ? 0 : 1;
+    // ADM's decoupled images: only the separate decouple and masking passes
+    // write them -- adm_dcm keeps them in group memory (190 MB at 4K).
+    const VkDeviceSize decoupled = admFused ? 0 : 1;
     struct { Buffer *buffer; VkDeviceSize bytes; } sized[] = {
         { &picRef, direct ? 4 : planeBytes }, { &picDis, direct ? 4 : planeBytes },
         // Motion's blur, 16-bit: two pixels a word.
@@ -2014,11 +2017,11 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         { &bandsRef[1], (VkDeviceSize)w2 * h2 * 12 }, { &bandsDis[1], (VkDeviceSize)w2 * h2 * 12 },
         { &bandsARef[0], (VkDeviceSize)w1 * h1 * 4 }, { &bandsADis[0], (VkDeviceSize)w1 * h1 * 4 },
         { &bandsARef[1], (VkDeviceSize)w2 * h2 * 4 }, { &bandsADis[1], (VkDeviceSize)w2 * h2 * 4 },
-        { &admR, (VkDeviceSize)w1 * h1 * 16 }, { &admA, (VkDeviceSize)w1 * h1 * 16 },
-        { &admF, (VkDeviceSize)w1 * h1 * 16 }, { &acc, kSlots * 8 },
-        { &admRB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
-        { &admAB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
-        { &admFB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
+        { &admR, (VkDeviceSize)w1 * h1 * 16 * decoupled + 4 }, { &admA, (VkDeviceSize)w1 * h1 * 16 * decoupled + 4 },
+        { &admF, (VkDeviceSize)w1 * h1 * 16 * decoupled + 4 }, { &acc, kSlots * 8 },
+        { &admRB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) * decoupled + 4 },
+        { &admAB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) * decoupled + 4 },
+        { &admFB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) * decoupled + 4 },
         // Six 64-bit sums a row of contrast masking at each scale: at most its
         // band images' rows.
         { &admRows[0], (VkDeviceSize)h1 * 6 * 8 * (admFused ? 1 : 0) + 4 },
