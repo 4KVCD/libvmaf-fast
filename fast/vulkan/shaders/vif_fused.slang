@@ -111,6 +111,8 @@ uint64_t total48(Sum48 sum)
 void vertical(int x, int y, uint at)
 {
     uint mu1 = 0, mu2 = 0, refRdSum = 0, disRdSum = 0;
+    // The next scale's samples come from even rows only.
+    const bool nextRow = (y & 1) == 0;
 #if SMALL
     uint refSq = 0, disSq = 0, refDis = 0;
 #else
@@ -152,7 +154,7 @@ void vertical(int x, int y, uint at)
             add48(refDis, cr, d);
 #endif
 #if FW_RD > 0
-            if (fi >= OFF && fi < FW - OFF) {
+            if (nextRow && fi >= OFF && fi < FW - OFF) {
                 uint next = kVifFilter[SCALE + 1][fi - OFF];
                 refRdSum += next * r;
                 disRdSum += next * d;
@@ -183,7 +185,7 @@ void vertical(int x, int y, uint at)
             add48(refDis, cr, d);
 #endif
 #if FW_RD > 0
-            if (fi >= OFF && fi < FW - OFF) {
+            if (nextRow && fi >= OFF && fi < FW - OFF) {
                 uint next = kVifFilter[SCALE + 1][fi - OFF];
                 refRdSum += next * r;
                 disRdSum += next * d;
@@ -203,8 +205,9 @@ void vertical(int x, int y, uint at)
     gTile[3 * plane + at] = uint((total48(refDis) + pc.addSq) >> pc.shiftSq);
 #endif
 #if FW_RD > 0
-    gTile[4 * plane + at] = (((refRdSum + pc.addVP) >> pc.shiftVP) & 0xFFFFu)
-                            | ((((disRdSum + pc.addVP) >> pc.shiftVP) & 0xFFFFu) << 16);
+    if (nextRow)
+        gTile[4 * plane + at] = (((refRdSum + pc.addVP) >> pc.shiftVP) & 0xFFFFu)
+                                | ((((disRdSum + pc.addVP) >> pc.shiftVP) & 0xFFFFu) << 16);
 #endif
 }
 
@@ -240,7 +243,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         if (x >= pc.w || y >= pc.h)
             continue;
         const uint base = uint(row * TCOLS + px);
-        uint mu1 = 0, mu2 = 0, refRdSum = 0, disRdSum = 0;
+        uint mu1 = 0, mu2 = 0;
         uint refSqHigh = 0, refSqLow = 0, disSqHigh = 0, disSqLow = 0, refDisHigh = 0, refDisLow = 0;
         // vif_hori.slang's filter: symmetric taps added before their
         // coefficient multiplies them, 48-bit sums in two 32-bit halves.
@@ -260,14 +263,6 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
             disSqLow += coefficient * ((disSqA & 0xFFFFu) + (disSqB & 0xFFFFu));
             refDisHigh += coefficient * ((refDisA >> 16) + (refDisB >> 16));
             refDisLow += coefficient * ((refDisA & 0xFFFFu) + (refDisB & 0xFFFFu));
-#if FW_RD > 0
-            if (fj >= OFF && (x & 1) == 0) {
-                uint next = kVifFilter[SCALE + 1][fj - OFF];
-                uint samplesA = gTile[4 * plane + a], samplesB = pair ? gTile[4 * plane + b] : 0u;
-                refRdSum += next * ((samplesA & 0xFFFFu) + (samplesB & 0xFFFFu));
-                disRdSum += next * ((samplesA >> 16) + (samplesB >> 16));
-            }
-#endif
         }
         int sums[SUMS];
         for (int i = 0; i < SUMS; ++i)
@@ -281,13 +276,29 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         totals[4] += sums[3] >> 16;
         for (int i = 4; i < SUMS; ++i)
             totals[i + 1] += sums[i];
-#if FW_RD > 0
-        if ((x & 1) == 0 && (y & 1) == 0) {
-            int at = (y / 2) * pc.rdStride + x / 2;
-            refRd[at] = (((refRdSum + 32768u) >> 16) & 0xFFFFu) | ((((disRdSum + 32768u) >> 16) & 0xFFFFu) << 16);
-        }
-#endif
     }
+#if FW_RD > 0
+    // The next scale's samples: even pixels of even rows, a thread each (all
+    // of a subgroup's lanes busy, where in the loop above half would wait).
+    for (uint o = local; o < uint(TW / 2 * TH); o += THREADS) {
+        const int row = int(o / uint(TW / 2)), px = 2 * int(o % uint(TW / 2));
+        const int x = x0 + px, y = y0 + row;
+        if (x >= pc.w || y >= pc.h || (y & 1) != 0)
+            continue;
+        const uint base = uint(row * TCOLS + px);
+        uint refRdSum = 0, disRdSum = 0;
+        for (int fj = OFF; fj <= FW / 2; ++fj) {
+            const uint a = base + uint(fj), b = base + uint(FW - 1 - fj);
+            const bool pair = fj < FW / 2;
+            const uint next = kVifFilter[SCALE + 1][fj - OFF];
+            const uint samplesA = gTile[4 * plane + a], samplesB = pair ? gTile[4 * plane + b] : 0u;
+            refRdSum += next * ((samplesA & 0xFFFFu) + (samplesB & 0xFFFFu));
+            disRdSum += next * ((samplesA >> 16) + (samplesB >> 16));
+        }
+        const int at = (y / 2) * pc.rdStride + x / 2;
+        refRd[at] = (((refRdSum + 32768u) >> 16) & 0xFFFFu) | ((((disRdSum + 32768u) >> 16) & 0xFFFFu) << 16);
+    }
+#endif
 
     // Each subgroup's sum of every word, added into the group's: the words'
     // sums are the values' sums, packed the same way (nothing overflows its
