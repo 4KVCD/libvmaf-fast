@@ -233,15 +233,14 @@ bool fast_gain(int sigma12, int sigma1, int sigma2, out int sv, out int64_t term
         q += d;
         rem -= d * divisor;
     }
-    for (int fix = 0; fix < 2; ++fix) {
-        if (rem < 0) {
-            q--;
-            rem += divisor;
-        } else if (rem >= divisor) {
-            q++;
-            rem -= divisor;
-        }
+    if (rem < 0) {
+        q--;
+        rem += divisor;
+    } else if (rem >= divisor) {
+        q++;
+        rem -= divisor;
     }
+    // Anything further off (never seen) goes to the exact path.
     if (rem < 0 || rem >= divisor || q < 0)
         return false;
     const float fraction = float(uint(rem)) * inv;  // R / sigma1
