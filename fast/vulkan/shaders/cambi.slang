@@ -438,7 +438,8 @@ uint window_count(int local, uint t, int pad)
     const uint words = (last >> 2) - (t >> 2);  // the last's, from the first
     uint sum = 0;
     [unroll] for (uint k = 0; k < MAX_WORDS; ++k) {
-        uint bytes = k <= words ? gCounts[base + k] : 0u;
+        uint bytes = gCounts[base + k];  // (inside gCounts also past the window: no branch)
+        if (k > words) bytes = 0;
         if (k == 0) bytes &= 0xFFFFFFFFu << ((t & 3u) * 8u);
         if (k == words) bytes &= 0xFFFFFFFFu >> ((3u - (last & 3u)) * 8u);
         sum += (bytes & 0x00FF00FFu) + ((bytes >> 8) & 0x00FF00FFu);
