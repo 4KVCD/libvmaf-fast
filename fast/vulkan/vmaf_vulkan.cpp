@@ -409,6 +409,7 @@ struct Pipeline {
     // set of push constants its passes use (constant k: word k).
     bool specialized = false;
     std::vector<std::pair<std::vector<uint32_t>, VkPipeline>> versions;
+    uint32_t readOnly = 0;  // the bindings it only reads (NonWritable), a bit each
 };
 
 enum { kMaxSlots = 16 };
@@ -542,7 +543,9 @@ struct vv_context {
     // (shaders/adm_dcm.slang), each row's masking sums in admRows until
     // adm_rows.slang rounds them: all but VMAF v1, the decouple variants and
     // pass-limited (diagnosis) runs. VV_ADM_FUSED=0 for the separate passes.
-    Buffer admRows;
+    // A buffer a scale: a scale's masking need not wait for the scale
+    // before's rounding.
+    Buffer admRows[kScales];
     bool admFused = true;
     // The GPU reads 16-bit integers from storage buffers (storageBuffer16BitAccess
     // and shaderInt16, both enabled): VIF scale 0 reads 16-bit samples so
@@ -825,13 +828,24 @@ int vv_context::make_layouts(int shader, uint32_t bindings)
 {
     Pipeline &pipeline = pipelines[shader];
     pipeline.bindings = bindings;
+    // And the bindings it only reads: variables decorated NonWritable (24)
+    // and Binding (33), by their ids.
     const uint32_t *code = kShaders[shader].code;
+    std::vector<std::pair<uint32_t, uint32_t>> bindingOf;  // id, binding
+    std::vector<uint32_t> nonWritable;
     for (size_t at = 5; at < kShaders[shader].bytes / 4;) {
         const uint32_t length = code[at] >> 16, opcode = code[at] & 0xFFFF;
         if (opcode == 71 && length == 4 && code[at + 2] == 1)
             pipeline.specialized = true;
+        if (opcode == 71 && length == 4 && code[at + 2] == 33)
+            bindingOf.emplace_back(code[at + 1], code[at + 3]);
+        if (opcode == 71 && length == 3 && code[at + 2] == 24)
+            nonWritable.push_back(code[at + 1]);
         at += length ? length : 1;
     }
+    for (const auto &[id, binding] : bindingOf)
+        if (binding < 32 && std::find(nonWritable.begin(), nonWritable.end(), id) != nonWritable.end())
+            pipeline.readOnly |= 1u << binding;
     VkShaderModuleCreateInfo module = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
     module.codeSize = kShaders[shader].bytes;
     module.pCode = kShaders[shader].code;
@@ -980,18 +994,29 @@ int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_l
     return 0;
 }
 
-// Whether two passes must not overlap: a buffer bound to both, but the
-// pictures and the division and logarithm tables, which passes only read,
-// and acc, which they only add to atomically (acc_add64).
+// Whether two passes must not overlap: a buffer bound to both that either
+// writes (binds where its shader does not mark the binding NonWritable), but
+// the pictures and the division and logarithm tables, which passes only
+// read, and acc, which they only add to atomically (acc_add64). Two passes
+// that only read a buffer overlap (ADM's CSF denominator and masking of a
+// scale).
 bool vv_context::shares(const Pass &a, const Pass &b) const
 {
+    auto writes = [&](const Pass &pass, const Buffer *buffer) {
+        for (uint32_t i = 0; i < pass.boundCount; ++i)
+            if (pass.bound[i] == buffer && !((pipelines[pass.shader].readOnly >> i) & 1u))
+                return true;
+        return false;
+    };
     for (uint32_t i = 0; i < a.boundCount; ++i) {
         const Buffer *buffer = a.bound[i];
         if (buffer == &picRef || buffer == &picDis || buffer == &divTable || buffer == &logTable || buffer == &acc)
             continue;
+        bool both = false;
         for (uint32_t j = 0; j < b.boundCount; ++j)
-            if (b.bound[j] == buffer)
-                return true;
+            both = both || b.bound[j] == buffer;
+        if (both && (writes(a, buffer) || writes(b, buffer)))
+            return true;
     }
     return false;
 }
@@ -1119,7 +1144,6 @@ int vv_context::build_passes()
     uint32_t i_rfactor[12];
     adm_rfactors(i_rfactor);
     int inW = w, inH = h, inStride = strideWords;
-    uint32_t rowSlot = 0;  // admRows' next scale's first sum
     for (int scale = 0; scale < kScales && !error && !(skip & 4); ++scale) {
         const int set = scale % 2;
         Buffer *inRef = scale == 0 ? &picRef : &bandsARef[1 - set];
@@ -1212,15 +1236,14 @@ int vv_context::build_passes()
                 const double shift = scale == 0 ? ceil(log2((double)bw) - fixed_shift[band]) : ceil(log2((double)bw));
                 constants.shiftCub[band] = shift > 0 ? (int32_t)shift : 0;
             }
-            constants.rowSlot = rowSlot;
+            constants.rowSlot = 0;  // admRows[scale]'s first
             error = add_pass(scored, scale == 0 ? kShader_adm_dcm_0 : kShader_adm_dcm,
-                             { &bandsRef[set], &bandsDis[set], &divTable, &admRows }, &constants, sizeof constants,
+                             { &bandsRef[set], &bandsDis[set], &divTable, &admRows[scale] }, &constants, sizeof constants,
                              groups(constants.endCol - start_col, kDcmTile[0]), groups(rows, kDcmTile[1]));
-            const uint32_t finish[] = { (uint32_t)rows, (uint32_t)ceil_log2(bh), rowSlot,
+            const uint32_t finish[] = { (uint32_t)rows, (uint32_t)ceil_log2(bh), 0,
                                         (uint32_t)(kSlotCm + scale * 3), (uint32_t)(kScales * 3) };
             if (!error)
-                error = add_pass(scored, kShader_adm_rows, { &admRows, &acc }, finish, sizeof finish, 6, 1);
-            rowSlot += 6 * (uint32_t)rows;
+                error = add_pass(scored, kShader_adm_rows, { &admRows[scale], &acc }, finish, sizeof finish, 6, 1);
         }
         // The enhancement gain limit: 100 (VMAF), then 1 (VMAF NEG).
         for (int limit = 0; limit < 2 && !error && !admFused; ++limit) {
@@ -1877,9 +1900,12 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         { &admRB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
         { &admAB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
         { &admFB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
-        // Six 64-bit sums a row of contrast masking at each scale: fewer than
-        // 2 * h1 + 4 rows in all.
-        { &admRows, (VkDeviceSize)(2 * h1 + 4) * 6 * 8 * (admFused ? 1 : 0) + 4 },
+        // Six 64-bit sums a row of contrast masking at each scale: at most its
+        // band images' rows.
+        { &admRows[0], (VkDeviceSize)h1 * 6 * 8 * (admFused ? 1 : 0) + 4 },
+        { &admRows[1], (VkDeviceSize)h2 * 6 * 8 * (admFused ? 1 : 0) + 4 },
+        { &admRows[2], (VkDeviceSize)((h2 + 1) / 2) * 6 * 8 * (admFused ? 1 : 0) + 4 },
+        { &admRows[3], (VkDeviceSize)((h2 + 3) / 4) * 6 * 8 * (admFused ? 1 : 0) + 4 },
     };
     for (auto &entry : sized) {
         if (int error = create_buffer(*entry.buffer, entry.bytes, false))
@@ -2109,8 +2135,10 @@ int vv_context::commit(bool score)
         }
     }
     vk.vkCmdFillBuffer(cb, acc.buffer, 0, VK_WHOLE_SIZE, 0);
-    if (admFused && score)
-        vk.vkCmdFillBuffer(cb, admRows.buffer, 0, VK_WHOLE_SIZE, 0);
+    if (admFused && score) {
+        for (const Buffer &rows : admRows)
+            vk.vkCmdFillBuffer(cb, rows.buffer, 0, VK_WHOLE_SIZE, 0);
+    }
     barrier(vk, cb, kTransfer, kCompute);
     stamp(kShaderCount);
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
