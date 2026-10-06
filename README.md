@@ -4,6 +4,8 @@ An unofficial fork of [Netflix/vmaf](https://github.com/Netflix/vmaf) (libvmaf),
 not affiliated with or endorsed by Netflix. It adds GPU code that gives
 libvmaf's own numbers:
 
+******Upcoming release will have extremely optimized VMAF v0.6.1 and v1 on Vulkan. It will be several times faster than the official CUDA VMAF v0.6.1. PSNR, SSIM, and XPSNR will also speed up several times******
+
 - **VMAF v0.6.1 and VMAF NEG on any GPU with Vulkan.** The features are
   bit-identical to libvmaf's CUDA code, which is upstream's only GPU code and
   runs on NVIDIA GPUs only. libvmaf predicts the score from them on the CPU,
