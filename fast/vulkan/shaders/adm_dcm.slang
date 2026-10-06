@@ -30,6 +30,54 @@ struct Params {
     uint rowSlot;                   // this scale's first row sum (words / 2) in rowSums
 };
 [[vk::push_constant]] Params pc;
+// The parameters as specialization constants (constant k: Params' word k):
+// the engine compiles the shader for its passes' (a pipeline for each set),
+// and the compiler folds what they decide.
+#if SCALE0
+[vk::constant_id(0)] const int kSpec_w = 0;
+#define P_w kSpec_w
+[vk::constant_id(1)] const int kSpec_h = 0;
+#define P_h kSpec_h
+[vk::constant_id(2)] const int kSpec_inStride = 0;
+#define P_inStride kSpec_inStride
+[vk::constant_id(3)] const int kSpec_startRow = 0;
+#define P_startRow kSpec_startRow
+[vk::constant_id(4)] const int kSpec_endRow = 0;
+#define P_endRow kSpec_endRow
+[vk::constant_id(5)] const int kSpec_startCol = 0;
+#define P_startCol kSpec_startCol
+[vk::constant_id(6)] const int kSpec_endCol = 0;
+#define P_endCol kSpec_endCol
+[vk::constant_id(7)] const uint kSpec_rfactor0 = 0;
+#define P_rfactor0 kSpec_rfactor0
+[vk::constant_id(8)] const uint kSpec_rfactor1 = 0;
+#define P_rfactor1 kSpec_rfactor1
+[vk::constant_id(9)] const uint kSpec_rfactor2 = 0;
+#define P_rfactor2 kSpec_rfactor2
+[vk::constant_id(10)] const int kSpec_shiftCub0 = 0;
+#define P_shiftCub0 kSpec_shiftCub0
+[vk::constant_id(11)] const int kSpec_shiftCub1 = 0;
+#define P_shiftCub1 kSpec_shiftCub1
+[vk::constant_id(12)] const int kSpec_shiftCub2 = 0;
+#define P_shiftCub2 kSpec_shiftCub2
+[vk::constant_id(13)] const uint kSpec_rowSlot = 0;
+#define P_rowSlot kSpec_rowSlot
+#else
+#define P_w pc.w
+#define P_h pc.h
+#define P_inStride pc.inStride
+#define P_startRow pc.startRow
+#define P_endRow pc.endRow
+#define P_startCol pc.startCol
+#define P_endCol pc.endCol
+#define P_rfactor0 pc.rfactor0
+#define P_rfactor1 pc.rfactor1
+#define P_rfactor2 pc.rfactor2
+#define P_shiftCub0 pc.shiftCub0
+#define P_shiftCub1 pc.shiftCub1
+#define P_shiftCub2 pc.shiftCub2
+#define P_rowSlot pc.rowSlot
+#endif
 [[vk::binding(0, 0)]] StructuredBuffer<uint> refBands;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> disBands;
 [[vk::binding(2, 0)]] StructuredBuffer<uint> divTable;
@@ -58,7 +106,7 @@ static const int kShiftSub[3] = { 10, 10, 12 }, kShiftSq[3] = { 29, 29, 30 };
 static const uint kRfactor0[3] = { 36453, 36453, 49417 };
 #define RFACTORS kRfactor0
 #else
-#define RFACTORS { pc.rfactor0, pc.rfactor1, pc.rfactor2 }
+#define RFACTORS { P_rfactor0, P_rfactor1, P_rfactor2 }
 static const int kShiftSq[3] = { 30, 30, 30 };
 #endif
 // csfF of both limits' three bands a position: 16-bit at scale 0 (three
@@ -171,7 +219,7 @@ int f_sum(uint at, int v)
 [numthreads(THREADS, 1, 1)]
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
-    const int x0 = pc.startCol + int(group.x) * TX, y0 = pc.startRow + int(group.y) * TY;
+    const int x0 = P_startCol + int(group.x) * TX, y0 = P_startRow + int(group.y) * TY;
     const int tx = int(local % uint(TX)), ty = int(local / uint(TX));
     if (local < uint(TY * 12))
         gRows[local] = 0;
@@ -180,8 +228,8 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     // band images are not; contrast masking never reads them.
     int restored[LIMITS][3], csfA[LIMITS][3], csfF[LIMITS][3];
     const int i = y0 + ty, j = x0 + tx;
-    if (i < pc.h && j < pc.w) {
-        decouple(i * pc.inStride + j, restored, csfA, csfF);
+    if (i < P_h && j < P_w) {
+        decouple(i * P_inStride + j, restored, csfA, csfF);
         store_f(uint((ty + 1) * HX + tx + 1), csfF);
     }
     for (uint e = local; e < uint(2 * HX + 2 * TY); e += THREADS) {
@@ -197,9 +245,9 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
             hy = 1 + int((e - uint(2 * HX)) % uint(TY));
         }
         const int hi = y0 - 1 + hy, hj = x0 - 1 + hx;
-        if (hi >= 0 && hi < pc.h && hj >= 0 && hj < pc.w) {
+        if (hi >= 0 && hi < P_h && hj >= 0 && hj < P_w) {
             int r[LIMITS][3], a[LIMITS][3], f[LIMITS][3];
-            decouple(hi * pc.inStride + hj, r, a, f);
+            decouple(hi * P_inStride + hj, r, a, f);
             store_f(uint(hy * HX + hx), f);
         }
     }
@@ -207,11 +255,11 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 
     // adm_cm.slang's masking of the thread's position, both limits.
     int64_t sums[LIMITS][3] = { { 0, 0, 0 }, { 0, 0, 0 } };
-    if (i < pc.endRow && j < pc.endCol) {
-        const int rows[3] = { min(abs(i - 1), pc.h - 1), i, min(i + 1, pc.h - 1) };
-        const int columns[3] = { min(abs(j - 1), pc.w - 1), j, min(j + 1, pc.w - 1) };
+    if (i < P_endRow && j < P_endCol) {
+        const int rows[3] = { min(abs(i - 1), P_h - 1), i, min(i + 1, P_h - 1) };
+        const int columns[3] = { min(abs(j - 1), P_w - 1), j, min(j + 1, P_w - 1) };
         const uint rfactor[3] = RFACTORS;
-        const int shiftCub[3] = { pc.shiftCub0, pc.shiftCub1, pc.shiftCub2 };
+        const int shiftCub[3] = { P_shiftCub0, P_shiftCub1, P_shiftCub2 };
         [ForceUnroll]
         for (int v = 0; v < LIMITS; ++v) {
             // The 3x3 neighbourhood's csfF of every band, but the centre's own,
@@ -264,7 +312,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     if (local < uint(6 * TY)) {
         const int k = int(local) % 6, row = int(local) / 6, ri = y0 + row;
         const uint64_t total = uint64_t(gRows[row * 12 + 2 * k]) | (uint64_t(gRows[row * 12 + 2 * k + 1]) << 32);
-        if (ri < pc.endRow && total != 0)
-            acc_add64(rowSums, pc.rowSlot + uint(k * (pc.endRow - pc.startRow) + ri - pc.startRow), total);
+        if (ri < P_endRow && total != 0)
+            acc_add64(rowSums, P_rowSlot + uint(k * (P_endRow - P_startRow) + ri - P_startRow), total);
     }
 }

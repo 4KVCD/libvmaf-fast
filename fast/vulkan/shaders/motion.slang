@@ -18,6 +18,21 @@ struct Params {
     uint slot;
 };
 [[vk::push_constant]] Params pc;
+// The parameters as specialization constants (constant k: Params' word k):
+// the engine compiles the shader for its passes' (a pipeline for each set),
+// and the compiler folds what they decide.
+[vk::constant_id(0)] const int kSpec_w = 0;
+#define P_w kSpec_w
+[vk::constant_id(1)] const int kSpec_h = 0;
+#define P_h kSpec_h
+[vk::constant_id(2)] const int kSpec_strideWords = 0;
+#define P_strideWords kSpec_strideWords
+[vk::constant_id(3)] const int kSpec_shiftY = 0;
+#define P_shiftY kSpec_shiftY
+[vk::constant_id(4)] const int kSpec_addY = 0;
+#define P_addY kSpec_addY
+[vk::constant_id(5)] const uint kSpec_slot = 0;
+#define P_slot kSpec_slot
 [[vk::binding(0, 0)]] StructuredBuffer<uint> src;
 [[vk::binding(1, 0)]] RWStructuredBuffer<uint> blur;
 [[vk::binding(2, 0)]] StructuredBuffer<uint> previous;
@@ -60,7 +75,7 @@ uint vertical_at(uint row, uint column)
     [loop]
     for (uint yf = 0; yf < 5; ++yf)
         sum += kFilter[yf] * ((gIn[(row + yf) * uint(IN_W / 2) + column / 2] >> ((column & 1u) * 16)) & 0xFFFFu);
-    return (sum + uint(pc.addY)) >> uint(pc.shiftY);
+    return (sum + uint(P_addY)) >> uint(P_shiftY);
 }
 
 int mirror(int idx, int sup)
@@ -72,8 +87,8 @@ int mirror(int idx, int sup)
 // The sample at (x0 - REACH + column, y), mirrored into the picture.
 uint sample_at(int x0, int y, int column)
 {
-    const int x = clamp(mirror(x0 - REACH + column, pc.w), 0, pc.w - 1);
-    return pixel(src, x, y, pc.strideWords);
+    const int x = clamp(mirror(x0 - REACH + column, P_w), 0, P_w - 1);
+    return pixel(src, x, y, P_strideWords);
 }
 
 [shader("compute")]
@@ -87,15 +102,15 @@ void main(uint3 group : SV_GroupID, uint3 lid : SV_GroupThreadID, uint local : S
         gWide = 0;  // before the first barrier below; set after it
 #if BPC16
     // The bits above the depth, in both samples of a word.
-    const uint above = ((0xFFFFu << uint(pc.shiftY)) & 0xFFFFu) * 0x10001u;
+    const uint above = ((0xFFFFu << uint(P_shiftY)) & 0xFFFFu) * 0x10001u;
     uint seen = 0;  // this thread's samples' bits above the depth
     // A tile inside the picture, its samples and those around it (columns
     // from x0 - REACH: even, a word's first sample): the picture's words as
     // they are, nothing mirrored.
-    if (x0 >= REACH && x0 + TW + REACH <= pc.w && y0 >= REACH && y0 + TH + REACH <= pc.h) {
+    if (x0 >= REACH && x0 + TW + REACH <= P_w && y0 >= REACH && y0 + TH + REACH <= P_h) {
         for (uint e = local; e < uint(IN_W / 2 * IN_H); e += uint(TW / 2 * TH)) {
             const uint row = e / uint(IN_W / 2), pair = e % uint(IN_W / 2);
-            const uint word = src[(y0 - REACH + int(row)) * pc.strideWords + (x0 - REACH) / 2 + int(pair)];
+            const uint word = src[(y0 - REACH + int(row)) * P_strideWords + (x0 - REACH) / 2 + int(pair)];
             gIn[e] = word;
             seen |= word;
         }
@@ -105,7 +120,7 @@ void main(uint3 group : SV_GroupID, uint3 lid : SV_GroupThreadID, uint local : S
         // Positions only pixels beyond the picture read are clamped into
         // it, and unused.
         const int row = int(e / uint(IN_W / 2)), pair = int(e % uint(IN_W / 2));
-        const int y = clamp(mirror(y0 - REACH + row, pc.h), 0, pc.h - 1);
+        const int y = clamp(mirror(y0 - REACH + row, P_h), 0, P_h - 1);
         const uint word = sample_at(x0, y, 2 * pair) | (sample_at(x0, y, 2 * pair + 1) << 16);
         gIn[e] = word;
 #if BPC16
@@ -126,7 +141,7 @@ void main(uint3 group : SV_GroupID, uint3 lid : SV_GroupThreadID, uint local : S
             low += kFilter[yf] * (word & 0xFFFFu);
             high += kFilter[yf] * (word >> 16);
         }
-        gVertical[e] = ((low + uint(pc.addY)) >> uint(pc.shiftY)) | (((high + uint(pc.addY)) >> uint(pc.shiftY)) << 16);
+        gVertical[e] = ((low + uint(P_addY)) >> uint(P_shiftY)) | (((high + uint(P_addY)) >> uint(P_shiftY)) << 16);
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -134,7 +149,7 @@ void main(uint3 group : SV_GroupID, uint3 lid : SV_GroupThreadID, uint local : S
     // pixels a word, rows of (w + 1) / 2 words.
     const int x = x0 + 2 * int(lid.x), y = y0 + int(lid.y);
     uint distance = 0;
-    if (x < pc.w && y < pc.h) {
+    if (x < P_w && y < P_h) {
         // Columns 2 lid.x .. 2 lid.x + 5 of the vertical sums: three words.
         const uint word = lid.y * uint(IN_W / 2) + lid.x;
         const uint w0 = gVertical[word], w1 = gVertical[word + 1], w2 = gVertical[word + 2];
@@ -152,10 +167,10 @@ void main(uint3 group : SV_GroupID, uint3 lid : SV_GroupThreadID, uint local : S
                 sum += kFilter[xf] * columns[i + xf];
             blurred[i] = (sum + 32768u) >> 16;
         }
-        const bool second = x + 1 < pc.w;
+        const bool second = x + 1 < P_w;
         if (!second)
             blurred[1] = 0;
-        const int at = y * ((pc.w + 1) / 2) + x / 2;
+        const int at = y * ((P_w + 1) / 2) + x / 2;
         const uint before = previous[at];
         blur[at] = blurred[0] | (blurred[1] << 16);
         distance = uint(abs(int(blurred[0]) - int(before & 0xFFFFu)));
@@ -176,6 +191,6 @@ void main(uint3 group : SV_GroupID, uint3 lid : SV_GroupThreadID, uint local : S
         for (uint i = 0; i < uint(TW / 2 * TH / 16); ++i)
             sum += gDistances[i * 16];
         if (sum != 0)
-            acc_add64(acc, pc.slot, uint64_t(sum));
+            acc_add64(acc, P_slot, uint64_t(sum));
     }
 }

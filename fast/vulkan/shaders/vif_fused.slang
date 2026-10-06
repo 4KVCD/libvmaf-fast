@@ -24,6 +24,19 @@ struct Params {
     uint epsLo, epsHi;   // the kernel's eps as a double (unused: no NATIVE_F64)
 };
 [[vk::push_constant]] Params pc;
+// The same parameters as specialization constants (constant k: Params' word
+// k; the engine compiles the shader for its pass's): constants to the
+// compiler, which folds what they decide (Core Ultra 9 285K's iGPU, 4K: scale
+// 0 7.78 -> 7.64 ms, 1 1.47 -> 1.44).
+[vk::constant_id(0)] const int kW = 1;
+[vk::constant_id(1)] const int kH = 1;
+[vk::constant_id(2)] const int kStride = 1;
+[vk::constant_id(3)] const uint kShiftVP = 0;
+[vk::constant_id(4)] const uint kAddVP = 0;
+[vk::constant_id(5)] const uint kShiftSq = 0;
+[vk::constant_id(6)] const uint kAddSq = 0;
+[vk::constant_id(7)] const int kRdStride = 1;
+[vk::constant_id(8)] const uint kSlot = 0;
 [[vk::binding(0, 0)]] StructuredBuffer<uint> refIn;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> disIn;
 // The next scale's images, one word a position: the reference's sample in
@@ -117,18 +130,18 @@ void vertical(int x, int y, uint at)
     const uint shift = 0, mask = 0;
 #endif
     int words[FW];
-    if (y >= FW / 2 && y + FW / 2 < pc.h) {
-        int at = (y - FW / 2) * pc.stride + column;
+    if (y >= FW / 2 && y + FW / 2 < kH) {
+        int at = (y - FW / 2) * kStride + column;
         for (int fi = 0; fi < FW; ++fi) {
             words[fi] = at;
-            at += pc.stride;
+            at += kStride;
         }
     } else {
         for (int fi = 0; fi < FW; ++fi) {
             int row = abs(y - FW / 2 + fi);
-            if (row >= pc.h)
-                row = 2 * pc.h - row - 2;
-            words[fi] = row * pc.stride + column;
+            if (row >= kH)
+                row = 2 * kH - row - 2;
+            words[fi] = row * kStride + column;
         }
     }
     const bool nextRow = (y & 1) == 0;  // the next scale's samples: even rows
@@ -159,18 +172,18 @@ void vertical(int x, int y, uint at)
 #endif
     }
     const uint plane = TH * TCOLS;
-    gTile[at] = (((mu1 + pc.addVP) >> pc.shiftVP) & 0xFFFFu) | ((((mu2 + pc.addVP) >> pc.shiftVP) & 0xFFFFu) << 16);
+    gTile[at] = (((mu1 + kAddVP) >> kShiftVP) & 0xFFFFu) | ((((mu2 + kAddVP) >> kShiftVP) & 0xFFFFu) << 16);
     for (int k = 0; k < 3; ++k) {
 #if SMALL
         gTile[(k + 1) * plane + at] = lo[k];
 #else
-        gTile[(k + 1) * plane + at] = (hi[k] << (16 - pc.shiftSq)) + ((lo[k] + pc.addSq) >> pc.shiftSq);
+        gTile[(k + 1) * plane + at] = (hi[k] << (16 - kShiftSq)) + ((lo[k] + kAddSq) >> kShiftSq);
 #endif
     }
 #if FW_RD > 0
     if (nextRow)
-        gTile[4 * plane + at] = (((refRdSum + pc.addVP) >> pc.shiftVP) & 0xFFFFu)
-                                | ((((disRdSum + pc.addVP) >> pc.shiftVP) & 0xFFFFu) << 16);
+        gTile[4 * plane + at] = (((refRdSum + kAddVP) >> kShiftVP) & 0xFFFFu)
+                                | ((((disRdSum + kAddVP) >> kShiftVP) & 0xFFFFu) << 16);
 #endif
 }
 
@@ -187,12 +200,12 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     for (uint e = local; e < uint(TH * TCOLS); e += THREADS) {
         const int row = int(e / uint(TCOLS)), column = int(e % uint(TCOLS));
         const int y = y0 + row;
-        if (y >= pc.h)
+        if (y >= kH)
             continue;
         int x = abs(x0 - FW / 2 + column);
-        if (x >= pc.w)
-            x = 2 * pc.w - x - 2;
-        vertical(clamp(x, 0, pc.w - 1), y, uint(row * TCOLS + column));
+        if (x >= kW)
+            x = 2 * kW - x - 2;
+        vertical(clamp(x, 0, kW - 1), y, uint(row * TCOLS + column));
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -203,7 +216,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     for (uint o = local; o < uint(TW * TH); o += THREADS) {
         const int row = int(o / uint(TW)), px = int(o % uint(TW));
         const int x = x0 + px, y = y0 + row;
-        if (x >= pc.w || y >= pc.h)
+        if (x >= kW || y >= kH)
             continue;
         const uint base = uint(row * TCOLS + px);
         uint mu1 = 0, mu2 = 0;
@@ -246,7 +259,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     for (uint o = local; o < uint(TW / 2 * TH); o += THREADS) {
         const int row = int(o / uint(TW / 2)), px = 2 * int(o % uint(TW / 2));
         const int x = x0 + px, y = y0 + row;
-        if (x >= pc.w || y >= pc.h || (y & 1) != 0)
+        if (x >= kW || y >= kH || (y & 1) != 0)
             continue;
         const uint base = uint(row * TCOLS + px);
         uint refRdSum = 0, disRdSum = 0;
@@ -258,7 +271,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
             refRdSum += next * ((samplesA & 0xFFFFu) + (samplesB & 0xFFFFu));
             disRdSum += next * ((samplesA >> 16) + (samplesB >> 16));
         }
-        const int at = (y / 2) * pc.rdStride + x / 2;
+        const int at = (y / 2) * kRdStride + x / 2;
         refRd[at] = (((refRdSum + 32768u) >> 16) & 0xFFFFu) | ((((disRdSum + 32768u) >> 16) & 0xFFFFu) << 16);
     }
 #endif
@@ -288,6 +301,6 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
                                    (last - x2) >> 16, gTotals[5] };
         const int64_t value = local == 3 ? int64_t(gTotals[2]) + (int64_t(gTotals[3]) << 16) : int64_t(values[local]);
         if (value != 0)
-            acc_add64(acc, pc.slot + local, uint64_t(value));
+            acc_add64(acc, kSlot + local, uint64_t(value));
     }
 }

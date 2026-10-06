@@ -24,6 +24,27 @@ struct Params {
     int aStride;       // scale 0's a: positions a row, even (two a word)
 };
 [[vk::push_constant]] Params pc;
+// The parameters as specialization constants (constant k: Params' word k):
+// the engine compiles the shader for its passes' (a pipeline for each set),
+// and the compiler folds what they decide.
+[vk::constant_id(0)] const int kSpec_w = 0;
+#define P_w kSpec_w
+[vk::constant_id(1)] const int kSpec_h = 0;
+#define P_h kSpec_h
+[vk::constant_id(2)] const int kSpec_inStride = 0;
+#define P_inStride kSpec_inStride
+[vk::constant_id(3)] const int kSpec_outStride = 0;
+#define P_outStride kSpec_outStride
+[vk::constant_id(4)] const int kSpec_shiftV = 0;
+#define P_shiftV kSpec_shiftV
+[vk::constant_id(5)] const int kSpec_addV = 0;
+#define P_addV kSpec_addV
+[vk::constant_id(6)] const int kSpec_shiftH = 0;
+#define P_shiftH kSpec_shiftH
+[vk::constant_id(7)] const int kSpec_addH = 0;
+#define P_addH kSpec_addH
+[vk::constant_id(8)] const int kSpec_aStride = 0;
+#define P_aStride kSpec_aStride
 
 #if !SCALE0
 // Scales 1-3, built one by one (DWT_SCALE 1-3) with their shifts (the
@@ -68,13 +89,13 @@ int transform(StructuredBuffer<uint> source, RWStructuredBuffer<int> bands, int4
     for (int c = 0; c < 4; ++c) {
         int sumLo = 0, sumHi = 0;
         for (int i = 0; i < 4; ++i) {
-            int sample = int(pixel(source, columns[c], rows[i], pc.inStride));
+            int sample = int(pixel(source, columns[c], rows[i], P_inStride));
             sumLo += kLo[i] * sample;
             sumHi += kHi[i] * sample;
         }
-        sumLo -= kLoSum * pc.addV;
-        lo[c] = sext16((sumLo + pc.addV) >> pc.shiftV);
-        hi[c] = sext16((sumHi + pc.addV) >> pc.shiftV);
+        sumLo -= kLoSum * P_addV;
+        lo[c] = sext16((sumLo + P_addV) >> P_shiftV);
+        hi[c] = sext16((sumHi + P_addV) >> P_shiftV);
     }
     int a = 0, v = 0, h = 0, d = 0;
     for (int c = 0; c < 4; ++c) {
@@ -83,11 +104,11 @@ int transform(StructuredBuffer<uint> source, RWStructuredBuffer<int> bands, int4
         h += kLo[c] * hi[c];
         d += kHi[c] * hi[c];
     }
-    bands[at * ADM_HVD_WORDS0] = (((h + pc.addH) >> pc.shiftH) & 0xFFFF) | (((v + pc.addH) >> pc.shiftH) << 16);
-    bands[at * ADM_HVD_WORDS0 + 1] = sext16((d + pc.addH) >> pc.shiftH);
+    bands[at * ADM_HVD_WORDS0] = (((h + P_addH) >> P_shiftH) & 0xFFFF) | (((v + P_addH) >> P_shiftH) << 16);
+    bands[at * ADM_HVD_WORDS0 + 1] = sext16((d + P_addH) >> P_shiftH);
     // In [-27411, 27410]: lo in [-32768, 32767], so a, kLo's sum, is in
     // [-1796403056, 1796356714] (no overflow), and shiftH, addH are 16, 32768.
-    return (a + pc.addH) >> pc.shiftH;
+    return (a + P_addH) >> P_shiftH;
 #else
     int lo[4], hi[4];
     for (int c = 0; c < 4; ++c) {
@@ -95,10 +116,10 @@ int transform(StructuredBuffer<uint> source, RWStructuredBuffer<int> bands, int4
         for (int i = 0; i < 4; ++i) {
 #if DWT_SCALE == 1
             // Scale 0's a, two a word (inStride positions a row, even).
-            const int position = rows[i] * pc.inStride + columns[c];
+            const int position = rows[i] * P_inStride + columns[c];
             const int64_t sample = int64_t(int(source[position >> 1] << (16 - 16 * (position & 1))) >> 16);
 #else
-            const int64_t sample = int64_t(int(source[rows[i] * pc.inStride + columns[c]]));
+            const int64_t sample = int64_t(int(source[rows[i] * P_inStride + columns[c]]));
 #endif
             sumLo += int64_t(kLo[i]) * sample;
             sumHi += int64_t(kHi[i]) * sample;
@@ -130,7 +151,7 @@ groupshared int gA[2 * 16 * 8];
 void main(uint3 id : SV_DispatchThreadID, uint local : SV_GroupIndex)
 {
     int x = int(id.x), y = int(id.y);
-    const bool inside = x < (pc.w + 1) / 2 && y < (pc.h + 1) / 2;
+    const bool inside = x < (P_w + 1) / 2 && y < (P_h + 1) / 2;
 #if SCALE0
     int aRef = 0, aDis = 0;
 #else
@@ -138,8 +159,8 @@ void main(uint3 id : SV_DispatchThreadID, uint local : SV_GroupIndex)
         return;
 #endif
     if (inside) {
-        int4 columns = indices(x, pc.w), rows = indices(y, pc.h);
-        int at = y * pc.outStride + x;
+        int4 columns = indices(x, P_w), rows = indices(y, P_h);
+        int at = y * P_outStride + x;
 #if SCALE0
         aRef = transform(refIn, refOut, columns, rows, at);
         aDis = transform(disIn, disOut, columns, rows, at);
@@ -156,7 +177,7 @@ void main(uint3 id : SV_DispatchThreadID, uint local : SV_GroupIndex)
     gA[128 + local] = aDis;
     GroupMemoryBarrierWithGroupSync();
     if (inside && (x & 1) == 0) {
-        const int word = (y * pc.aStride + x) >> 1;
+        const int word = (y * P_aStride + x) >> 1;
         refA[word] = (aRef & 0xFFFF) | (gA[local + 1] << 16);
         disA[word] = (aDis & 0xFFFF) | (gA[128 + local + 1] << 16);
     }

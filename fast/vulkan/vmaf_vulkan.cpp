@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -402,14 +403,19 @@ struct Pipeline {
     VkShaderModule module = VK_NULL_HANDLE;
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;  // a shader without specialization constants
     uint32_t bindings = 0;
+    // A shader with specialization constants (SpecId) is compiled for each
+    // set of push constants its passes use (constant k: word k).
+    bool specialized = false;
+    std::vector<std::pair<std::vector<uint32_t>, VkPipeline>> versions;
 };
 
 enum { kMaxSlots = 16 };
 
 struct Pass {
     int shader;
+    VkPipeline pipeline;  // the shader's, for this pass's push constants
     VkDescriptorSet set;
     // Passes that read the frames, where they read them from the frame
     // slots' staging buffers (vv_context::direct): a set for each slot.
@@ -563,7 +569,10 @@ struct vv_context {
     int create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported = false,
                       bool writeOnly = false);
     void destroy_last_buffer(Buffer &buffer);
-    int create_pipeline(int shader, uint32_t bindings);
+    VkPipeline find_pipeline(int shader, const std::vector<uint32_t> &words) const;
+    VkResult compile_pipeline(int shader, const std::vector<uint32_t> &words, VkPipeline *out) const;
+    int compile_pipelines();
+    int make_layouts(int shader, uint32_t bindings);
     void write_pipeline_stats(const char *name, VkPipeline pipeline);
     bool shares(const Pass &a, const Pass &b) const;
     int add_pass(std::vector<Pass> &list, int shader, std::initializer_list<Buffer *> bound,
@@ -619,6 +628,8 @@ vv_context::~vv_context()
     }
     for (Pipeline &pipeline : pipelines) {
         if (pipeline.pipeline) vk.vkDestroyPipeline(device, pipeline.pipeline, nullptr);
+        for (const auto &version : pipeline.versions)
+            vk.vkDestroyPipeline(device, version.second, nullptr);
         if (pipeline.layout) vk.vkDestroyPipelineLayout(device, pipeline.layout, nullptr);
         if (pipeline.setLayout) vk.vkDestroyDescriptorSetLayout(device, pipeline.setLayout, nullptr);
         if (pipeline.module) vk.vkDestroyShaderModule(device, pipeline.module, nullptr);
@@ -706,12 +717,113 @@ void vv_context::destroy_last_buffer(Buffer &buffer)
     buffers.pop_back();
 }
 
-int vv_context::create_pipeline(int shader, uint32_t bindings)
+// The pipeline made for `shader` and these push constants (a specialized
+// shader's for exactly these; another's for any), or none yet.
+VkPipeline vv_context::find_pipeline(int shader, const std::vector<uint32_t> &words) const
+{
+    const Pipeline &pipeline = pipelines[shader];
+    if (!pipeline.specialized)
+        return pipeline.pipeline;
+    for (const auto &version : pipeline.versions)
+        if (version.first == words)
+            return version.second;
+    return VK_NULL_HANDLE;
+}
+
+// Compiles `shader` for these push constants (its specialization constants,
+// constant k: word k, where it has any). Touches nothing of the context's:
+// called from several threads at once.
+VkResult vv_context::compile_pipeline(int shader, const std::vector<uint32_t> &words, VkPipeline *out) const
+{
+    const Pipeline &pipeline = pipelines[shader];
+    VkComputePipelineCreateInfo info = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    info.stage.module = pipeline.module;
+    info.stage.pName = "main";
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT required = {
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT };
+    if (subgroupSizeControl && subgroupSizes[shader]) {
+        required.requiredSubgroupSize = subgroupSizes[shader];
+        info.stage.pNext = &required;
+    }
+    std::vector<VkSpecializationMapEntry> entries(words.size());
+    for (uint32_t k = 0; k < (uint32_t)words.size(); ++k)
+        entries[k] = { k, 4 * k, 4 };
+    const VkSpecializationInfo specialization = { (uint32_t)words.size(), entries.data(), words.size() * 4,
+                                                  words.data() };
+    if (pipeline.specialized)
+        info.stage.pSpecializationInfo = &specialization;
+    info.layout = pipeline.layout;
+    if (!statsFile.empty())
+        info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+    return vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, out);
+}
+
+// Every pass's pipeline: those not made yet compiled at once, a thread each
+// (the driver compiles on the calling thread, and a specialized shader anew
+// for each size of picture it meets), then given to the passes.
+int vv_context::compile_pipelines()
+{
+    struct Job { int shader; std::vector<uint32_t> words; VkPipeline made = VK_NULL_HANDLE; VkResult result = VK_SUCCESS; };
+    std::vector<Job> jobs;
+    std::vector<Pass *> passes;
+    for (std::vector<Pass> *list : { &motion[0], &motion[1], &scored })
+        for (Pass &pass : *list)
+            passes.push_back(&pass);
+    auto words_of = [&](const Pass &pass) {
+        return pipelines[pass.shader].specialized
+            ? std::vector<uint32_t>(pass.constants, pass.constants + pass.constantBytes / 4) : std::vector<uint32_t>();
+    };
+    for (const Pass *pass : passes) {
+        const std::vector<uint32_t> words = words_of(*pass);
+        if (find_pipeline(pass->shader, words))
+            continue;
+        bool queued = false;
+        for (const Job &job : jobs)
+            queued = queued || (job.shader == pass->shader && job.words == words);
+        if (!queued)
+            jobs.push_back({ pass->shader, words });
+    }
+    std::vector<std::thread> threads;
+    for (Job &job : jobs)
+        threads.emplace_back([this, &job] { job.result = compile_pipeline(job.shader, job.words, &job.made); });
+    for (std::thread &thread : threads)
+        thread.join();
+    int error = 0;
+    for (Job &job : jobs) {
+        Pipeline &pipeline = pipelines[job.shader];
+        if (job.result != VK_SUCCESS) {
+            if (!error)
+                error = fail(-1, std::string("the GPU driver could not compile the shader ") + kShaders[job.shader].name);
+            continue;
+        }
+        if (pipeline.specialized)
+            pipeline.versions.emplace_back(job.words, job.made);
+        else
+            pipeline.pipeline = job.made;
+        if (!statsFile.empty())
+            write_pipeline_stats(kShaders[job.shader].name, job.made);
+    }
+    for (Pass *pass : passes)
+        pass->pipeline = find_pipeline(pass->shader, words_of(*pass));
+    return error;
+}
+
+// The shader's module and layouts, and whether it has specialization
+// constants: a SpecId decoration (OpDecorate, opcode 71, four words,
+// decoration 1) anywhere in it.
+int vv_context::make_layouts(int shader, uint32_t bindings)
 {
     Pipeline &pipeline = pipelines[shader];
-    if (pipeline.pipeline)
-        return 0;
     pipeline.bindings = bindings;
+    const uint32_t *code = kShaders[shader].code;
+    for (size_t at = 5; at < kShaders[shader].bytes / 4;) {
+        const uint32_t length = code[at] >> 16, opcode = code[at] & 0xFFFF;
+        if (opcode == 71 && length == 4 && code[at + 2] == 1)
+            pipeline.specialized = true;
+        at += length ? length : 1;
+    }
     VkShaderModuleCreateInfo module = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
     module.codeSize = kShaders[shader].bytes;
     module.pCode = kShaders[shader].code;
@@ -737,24 +849,6 @@ int vv_context::create_pipeline(int shader, uint32_t bindings)
     layout.pPushConstantRanges = &range;
     if (vk.vkCreatePipelineLayout(device, &layout, nullptr, &pipeline.layout) != VK_SUCCESS)
         return fail(-1, "vkCreatePipelineLayout failed");
-    VkComputePipelineCreateInfo info = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    info.stage.module = pipeline.module;
-    info.stage.pName = "main";
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT required = {
-        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT };
-    if (subgroupSizeControl && subgroupSizes[shader]) {
-        required.requiredSubgroupSize = subgroupSizes[shader];
-        info.stage.pNext = &required;
-    }
-    info.layout = pipeline.layout;
-    if (!statsFile.empty())
-        info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
-    if (vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline.pipeline) != VK_SUCCESS)
-        return fail(-1, std::string("the GPU driver could not compile the shader ") + kShaders[shader].name);
-    if (!statsFile.empty())
-        write_pipeline_stats(kShaders[shader].name, pipeline.pipeline);
     return 0;
 }
 
@@ -825,8 +919,10 @@ void vv_context::write_pipeline_stats(const char *name, VkPipeline pipeline)
 int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_list<Buffer *> bound,
                          const void *constants, uint32_t constantBytes, uint32_t gx, uint32_t gy)
 {
-    if (int error = create_pipeline(shader, (uint32_t)bound.size()))
-        return error;
+    if (!pipelines[shader].module) {  // its pipeline compiled by compile_pipelines, once every pass is in
+        if (int error = make_layouts(shader, (uint32_t)bound.size()))
+            return error;
+    }
     Pass pass = {};
     pass.shader = shader;
     VkDescriptorSetAllocateInfo allocate = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
@@ -1826,7 +1922,9 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
             vk.vkDeviceWaitIdle(device) != VK_SUCCESS)
             return fail(-1, "clearing the GPU buffers failed");
     }
-    return build_passes();
+    if (int error = build_passes())
+        return error;
+    return compile_pipelines();
 }
 
 int vv_context::collect(Slot &slot)
@@ -1985,7 +2083,7 @@ int vv_context::commit(bool score)
     const std::vector<Pass> *lists[2] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr };
     auto record = [&](const Pass &pass) {
         const Pipeline &pipeline = pipelines[pass.shader];
-        vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+        vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pass.pipeline);
         const VkDescriptorSet *set = pass.perSlot ? &pass.slotSets[&slot - slots.data()] : &pass.set;
         vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, set, 0, nullptr);
         vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pass.constantBytes, pass.constants);
