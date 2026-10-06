@@ -421,6 +421,18 @@ struct Pass {
     uint32_t groups[3];
     VkBuffer indirect;                // dispatched with the sizes the GPU wrote here, when set
     VkDeviceSize indirectOffset;
+    // Per slot, where the pass reads the slot's own staging buffer (VMAF v1's
+    // passes that read the pictures): the set for each slot, in place of `set`.
+    std::vector<VkDescriptorSet> slotSets;
+};
+
+// A buffer a pass binds, or part of one (at a multiple of the storage
+// buffers' offset alignment).
+struct Bound {
+    Buffer *buffer;
+    VkDeviceSize offset = 0, range = VK_WHOLE_SIZE;
+    Bound(Buffer *b) : buffer(b) {}
+    Bound(Buffer *b, VkDeviceSize o, VkDeviceSize r) : buffer(b), offset(o), range(r) {}
 };
 
 struct Slot {
@@ -670,10 +682,19 @@ struct vv_context {
 
     ~vv_context();
     int init(int deviceIndex, int width, int height, int bitDepth, int flags);
-    int create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported = false);
+    // `upload`: host memory the CPU only writes and the GPU reads (frames' planes).
+    int create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported = false, bool upload = false);
     int create_pipeline(int shader, uint32_t bindings);
-    int add_pass(std::vector<Pass> &list, int shader, std::initializer_list<Buffer *> bound,
+    int add_pass(std::vector<Pass> &list, int shader, std::initializer_list<Bound> bound,
                  const void *constants, uint32_t constantBytes, uint32_t gx, uint32_t gy);
+    VkDescriptorSet descriptor_set(int shader, const std::vector<Bound> &bound);
+    // The last pass added, given a set per slot: `bound(slot)` the slot's buffers.
+    template <typename F> int per_slot(std::vector<Pass> &list, F bound);
+    // VMAF v1: the slots' luma planes are read where they are written (no copy).
+    bool direct = false;
+    uint32_t disOffset = 0;  // the distorted plane's place in a slot's staging buffer
+    Bound slot_ref(Slot &slot) { return Bound(&slot.staging, 0, planeBytes); }
+    Bound slot_dis(Slot &slot) { return Bound(&slot.staging, disOffset, planeBytes); }
     int upload(Buffer &target, const void *data, size_t bytes);
     int build_passes();
     int submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *dis, ptrdiff_t disStride, bool score);
@@ -713,7 +734,7 @@ vv_context::~vv_context()
     vk.vkDestroyDevice(device, nullptr);
 }
 
-int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported)
+int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported, bool upload)
 {
     buffers.push_back(&buffer);
     buffer.size = (size + 3) & ~VkDeviceSize(3);
@@ -730,27 +751,23 @@ int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisibl
         return fail(-1, "vkCreateBuffer failed");
     VkMemoryRequirements requirements;
     vk.vkGetBufferMemoryRequirements(device, buffer.buffer, &requirements);
-    // Host memory: cached if there is such a type (results are read back).
+    // Host memory: cached if there is such a type (results are read back);
+    // for an upload, not cached (an APU's GPU reads cached host memory slowly,
+    // through the CPU's caches): the GPU's own if it can be mapped, else the
+    // host's. Device memory: the GPU's.
     const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    const VkMemoryPropertyFlags wanted[3] = {
-        hostVisible ? visible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        hostVisible ? visible : VkMemoryPropertyFlags(0), VkMemoryPropertyFlags(0)
-    };
-    int type = -1;
-    for (int attempt = 0; attempt < (hostVisible ? 2 : 3) && type < 0; ++attempt) {
-        for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
-            if ((requirements.memoryTypeBits & (1u << i)) &&
-                (memoryProperties.memoryTypes[i].propertyFlags & wanted[attempt]) == wanted[attempt]) {
-                type = (int)i;
-                break;
-            }
-        }
+    struct Want { VkMemoryPropertyFlags with, without; };
+    std::vector<Want> wanted;
+    if (upload) {
+        wanted = { { visible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_CACHED_BIT },
+                   { visible, VK_MEMORY_PROPERTY_HOST_CACHED_BIT }, { visible, 0 } };
+    } else if (hostVisible) {
+        wanted = { { visible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0 }, { visible, 0 } };
+    } else {
+        wanted = { { VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0 }, { 0, 0 } };
     }
-    if (type < 0)
-        return fail(-1, "no suitable GPU memory type");
     VkMemoryAllocateInfo allocate = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     allocate.allocationSize = requirements.size;
-    allocate.memoryTypeIndex = (uint32_t)type;
     // Exported: an allocation of this buffer alone, which is what the
     // importing API is told it is.
     VkExportMemoryAllocateInfo exportInfo = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
@@ -761,10 +778,30 @@ int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisibl
         exportInfo.pNext = &dedicated;
         allocate.pNext = &exportInfo;
     }
+    // The first type of the first wish that has room (a mappable heap of the
+    // GPU's own is small: 256 MB on a Radeon 780M).
+    int type = -1;
+    VkResult allocated = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    for (const Want &want : wanted) {
+        for (uint32_t i = 0; i < memoryProperties.memoryTypeCount && allocated != VK_SUCCESS; ++i) {
+            const VkMemoryPropertyFlags flags = memoryProperties.memoryTypes[i].propertyFlags;
+            if (!(requirements.memoryTypeBits & (1u << i)) || (flags & want.with) != want.with || (flags & want.without))
+                continue;
+            type = (int)i;
+            allocate.memoryTypeIndex = i;
+            allocated = vk.vkAllocateMemory(device, &allocate, nullptr, &buffer.memory);
+        }
+        if (allocated == VK_SUCCESS)
+            break;
+    }
+    if (type < 0)
+        return fail(-1, "no suitable GPU memory type");
+    if (allocated != VK_SUCCESS) {
+        buffer.memory = VK_NULL_HANDLE;
+        return fail(-2, "out of GPU memory (" + std::to_string(requirements.size >> 20) + " MB buffer)");
+    }
     buffer.allocation = requirements.size;
     buffer.memoryType = (uint32_t)type;
-    if (vk.vkAllocateMemory(device, &allocate, nullptr, &buffer.memory) != VK_SUCCESS)
-        return fail(-2, "out of GPU memory (" + std::to_string(requirements.size >> 20) + " MB buffer)");
     if (vk.vkBindBufferMemory(device, buffer.buffer, buffer.memory, 0) != VK_SUCCESS)
         return fail(-1, "vkBindBufferMemory failed");
     if (hostVisible && vk.vkMapMemory(device, buffer.memory, 0, VK_WHOLE_SIZE, 0, &buffer.mapped) != VK_SUCCESS)
@@ -814,26 +851,22 @@ int vv_context::create_pipeline(int shader, uint32_t bindings)
     return 0;
 }
 
-int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_list<Buffer *> bound,
-                         const void *constants, uint32_t constantBytes, uint32_t gx, uint32_t gy)
+VkDescriptorSet vv_context::descriptor_set(int shader, const std::vector<Bound> &bound)
 {
-    if (int error = create_pipeline(shader, (uint32_t)bound.size()))
-        return error;
-    Pass pass = {};
-    pass.shader = shader;
+    VkDescriptorSet set = VK_NULL_HANDLE;
     VkDescriptorSetAllocateInfo allocate = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
     allocate.descriptorPool = descriptorPool;
     allocate.descriptorSetCount = 1;
     allocate.pSetLayouts = &pipelines[shader].setLayout;
-    if (vk.vkAllocateDescriptorSets(device, &allocate, &pass.set) != VK_SUCCESS)
-        return fail(-1, "vkAllocateDescriptorSets failed");
+    if (vk.vkAllocateDescriptorSets(device, &allocate, &set) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
     VkDescriptorBufferInfo infos[kMaxBindings];
     VkWriteDescriptorSet writes[kMaxBindings];
     uint32_t count = 0;
-    for (Buffer *buffer : bound) {
-        infos[count] = { buffer->buffer, 0, VK_WHOLE_SIZE };
+    for (const Bound &entry : bound) {
+        infos[count] = { entry.buffer->buffer, entry.offset, entry.range };
         writes[count] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        writes[count].dstSet = pass.set;
+        writes[count].dstSet = set;
         writes[count].dstBinding = count;
         writes[count].descriptorCount = 1;
         writes[count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -841,12 +874,37 @@ int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_l
         ++count;
     }
     vk.vkUpdateDescriptorSets(device, count, writes, 0, nullptr);
+    return set;
+}
+
+int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_list<Bound> bound,
+                         const void *constants, uint32_t constantBytes, uint32_t gx, uint32_t gy)
+{
+    if (int error = create_pipeline(shader, (uint32_t)bound.size()))
+        return error;
+    Pass pass = {};
+    pass.shader = shader;
+    pass.set = descriptor_set(shader, std::vector<Bound>(bound));
+    if (!pass.set)
+        return fail(-1, "vkAllocateDescriptorSets failed");
     memcpy(pass.constants, constants, constantBytes);
     pass.constantBytes = constantBytes;
     pass.groups[0] = gx;
     pass.groups[1] = gy;
     pass.groups[2] = 1;
     list.push_back(pass);
+    return 0;
+}
+
+template <typename F> int vv_context::per_slot(std::vector<Pass> &list, F bound)
+{
+    Pass &pass = list.back();
+    for (Slot &slot : slots) {
+        VkDescriptorSet set = descriptor_set(pass.shader, bound(slot));
+        if (!set)
+            return fail(-1, "vkAllocateDescriptorSets failed");
+        pass.slotSets.push_back(set);
+    }
     return 0;
 }
 
@@ -1142,6 +1200,10 @@ int vv_context::build_passes_v1()
         Buffer *previous = &picPrev[options.fiveFrameWindow ? parity : 1 - parity];
         error = add_pass(motion[parity], deep ? kShader_motion_v1_16 : kShader_motion_v1_8,
                          { &picRef, previous, &acc }, constants, sizeof constants, groups(w, 16), groups(h, 16));
+        if (!error && direct)
+            error = per_slot(motion[parity], [&](Slot &slot) {
+                return std::vector<Bound>{ slot_ref(slot), Bound(previous), Bound(&acc) };
+            });
     }
 
     const float cos_1deg_sq = cos(1.0 * M_PI / 180.0) * cos(1.0 * M_PI / 180.0);
@@ -1192,6 +1254,11 @@ int vv_context::build_passes_v1()
             const int shader = scale == 0 ? (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8) : kShader_adm_dwt;
             error = add_pass(scored, shader, { inRef, inDis, &bandsRef[set], &bandsDis[set] }, constants,
                              sizeof constants, groups(bw, 16), groups(bh, 8));
+            if (!error && direct && scale == 0)
+                error = per_slot(scored, [&](Slot &slot) {
+                    return std::vector<Bound>{ slot_ref(slot), slot_dis(slot), Bound(&bandsRef[set]),
+                                               Bound(&bandsDis[set]) };
+                });
             if (error)
                 break;
         }
@@ -1501,12 +1568,20 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     const uint32_t sampleBytes = bpc > 8 ? 2 : 1;
     strideBytes = ((uint32_t)w * sampleBytes + 3) & ~3u;
     planeBytes = strideBytes * (uint32_t)h;
+    // The distorted plane's offset: a multiple of 256, which any storage
+    // buffer offset alignment divides (VMAF v1 binds the planes there).
+    disOffset = (planeBytes + 255) & ~255u;
+    // Read where they are, in the GPU's own memory, when a decoder writes them
+    // (shared); host memory, which the GPU reads more slowly than its own
+    // (measured on a Radeon 780M: by the passes reading the pictures, more
+    // than the copy costs), is copied first.
+    direct = v1 && shared;
     const VkDeviceSize pixels = (VkDeviceSize)w * h;
     const int w1 = (w + 1) / 2, h1 = (h + 1) / 2, w2 = (w1 + 1) / 2, h2 = (h1 + 1) / 2;
     const int rw1 = (w / 2 + 1) / 2, rh1 = (h / 2 + 1) / 2;
     const VkDeviceSize v0 = v1 ? 0 : 1, only1 = v1 ? 1 : 0;  // buffers one of the two uses hold 4 bytes in the other
     struct { Buffer *buffer; VkDeviceSize bytes; } sized[] = {
-        { &picRef, planeBytes }, { &picDis, planeBytes },
+        { &picRef, direct ? 4 : planeBytes }, { &picDis, direct ? 4 : planeBytes },
         { &blur[0], pixels * 4 * v0 + 4 }, { &blur[1], pixels * 4 * v0 + 4 }, { &vifTmp, pixels * 32 * v0 + 4 },
         { &rdRef[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 }, { &rdDis[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 },
         { &rdRef[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 }, { &rdDis[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 },
@@ -1538,7 +1613,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         if (vk.vkCreateFence(device, &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS)
             return fail(-1, "vkCreateFence failed");
-        if (int error = create_buffer(slot.staging, (VkDeviceSize)planeBytes * 2, !shared, shared))
+        if (int error = create_buffer(slot.staging, (VkDeviceSize)disOffset + planeBytes, !shared, shared, !shared))
             return error;
         if (int error = create_buffer(slot.result, kSlots * 8, true))
             return error;
@@ -1668,6 +1743,11 @@ int vv_context::enable_cambi(const double *values)
         error = add_pass(scored, bpc > 8 ? kShader_cambi_front_16 : kShader_cambi_front_8,
                          { &picDis, c.speedup ? &cambiRaw[0] : &cambiImage, c.speedup ? &cambiMask[0] : &cambiMaskFull,
                            &acc }, constants, sizeof constants, groups((int)outW, 16), groups((int)outH, 16));
+        if (!error && direct)
+            error = per_slot(scored, [&](Slot &slot) {
+                return std::vector<Bound>{ slot_dis(slot), Bound(c.speedup ? &cambiRaw[0] : &cambiImage),
+                                           Bound(c.speedup ? &cambiMask[0] : &cambiMaskFull), Bound(&acc) };
+            });
     }
     Buffer *image = &cambiImage, *mask = &cambiMaskFull;
     int inW = w;
@@ -1823,7 +1903,7 @@ int vv_context::enable_speed(const double *values)
     uint32_t inverseBits;
     memcpy(&inverseBits, &inverse, sizeof inverseBits);
     for (Slot &slot : slots) {
-        if (int error = create_buffer(slot.speedChroma, (VkDeviceSize)chromaPlaneBytes * 4, true))
+        if (int error = create_buffer(slot.speedChroma, (VkDeviceSize)chromaPlaneBytes * 4, true, false, true))
             return error;
         if (int error = create_buffer(slot.speedKeep, operating * 4 * sizeof(float), true))
             return error;
@@ -1953,7 +2033,7 @@ int vv_context::staging(uint8_t **ref, uint8_t **dis)
         return error;
     pending = &slot;
     *ref = (uint8_t *)slot.staging.mapped;
-    *dis = (uint8_t *)slot.staging.mapped + planeBytes;
+    *dis = (uint8_t *)slot.staging.mapped + disOffset;
     return 0;
 }
 
@@ -2066,11 +2146,13 @@ int vv_context::commit(bool score)
         vk.vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, queryBase);
     }
     barrier(vk, cb, kCompute | kTransfer, kTransfer);
-    VkBufferCopy copy = { 0, 0, planeBytes };
-    vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
-    if (score) {
-        copy.srcOffset = planeBytes;
-        vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picDis.buffer, 1, &copy);
+    if (!direct) {
+        VkBufferCopy copy = { 0, 0, planeBytes };
+        vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
+        if (score) {
+            copy.srcOffset = disOffset;
+            vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picDis.buffer, 1, &copy);
+        }
     }
     vk.vkCmdFillBuffer(cb, acc.buffer, 0, VK_WHOLE_SIZE, 0);
     barrier(vk, cb, kTransfer, kCompute | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
@@ -2090,7 +2172,8 @@ int vv_context::commit(bool score)
                 continue;
             const Pipeline &pipeline = pipelines[pass.shader];
             vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
-            vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &pass.set, 0, nullptr);
+            const VkDescriptorSet set = pass.slotSets.empty() ? pass.set : pass.slotSets[slotIndex];
+            vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &set, 0, nullptr);
             vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pass.constantBytes, pass.constants);
             if (pass.indirect)
                 vk.vkCmdDispatchIndirect(cb, pass.indirect, pass.indirectOffset);
@@ -2103,7 +2186,7 @@ int vv_context::commit(bool score)
     if (v1) {
         barrier(vk, cb, kCompute, kTransfer);
         VkBufferCopy keep = { 0, 0, planeBytes };
-        vk.vkCmdCopyBuffer(cb, picRef.buffer, picPrev[index % 2].buffer, 1, &keep);
+        vk.vkCmdCopyBuffer(cb, direct ? slot.staging.buffer : picRef.buffer, picPrev[index % 2].buffer, 1, &keep);
     }
     VkBufferCopy back = { 0, 0, kSlots * 8 };
     vk.vkCmdCopyBuffer(cb, acc.buffer, slot.result.buffer, 1, &back);
@@ -2232,7 +2315,7 @@ VV_EXPORT int vv_shared_next(vv_context *context, int *slot, uint32_t *stride, u
         return error;
     *slot = (int)context->nextSlot;
     *stride = context->strideBytes;
-    *planeBytes = context->planeBytes;
+    *planeBytes = context->disOffset;  // where the distorted plane starts
     return (int)context->slots.size();
 }
 
@@ -2338,6 +2421,20 @@ VV_EXPORT int vv_v1_cambi_scores(vv_context *context, double *out, unsigned fram
         out[i] = v1_cambi_score(scores, c.pixels_in_window, context->cambiOptions.max_val);
     }
     return (int)sums.size();
+}
+
+// For tests and benchmarks of a context made with flag bit 19 (frames from
+// GPU memory): a slot's staging buffer filled with these two luma planes
+// (rows of the context's stride, as vv_shared_next describes them), as a
+// decoder would write them.
+VV_EXPORT int vv_test_fill_slot(vv_context *context, int slot, const uint8_t *reference, const uint8_t *distorted)
+{
+    if (!context->shared || slot < 0 || slot >= (int)context->slots.size())
+        return fail(-3, "no such shared buffer");
+    std::vector<uint8_t> planes((size_t)context->disOffset + context->planeBytes);
+    memcpy(planes.data(), reference, context->planeBytes);
+    memcpy(planes.data() + context->disOffset, distorted, context->planeBytes);
+    return context->upload(context->slots[(size_t)slot].staging, planes.data(), planes.size());
 }
 
 // VMAF v1's SpEED chroma on the GPU (and libvmaf's est_params on the CPU,
