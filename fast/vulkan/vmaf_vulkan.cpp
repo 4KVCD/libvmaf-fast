@@ -1613,7 +1613,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         { &picPrev[0], planeBytes * only1 + 4 }, { &picPrev[1], planeBytes * only1 + 4 },
         { &admAdditive, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 }, { &admCsfR, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 },
         { &admCsfRF, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 },
-        { &logTable, 32768 * 4 }, { &divTable, 65536 * 4 },
+        { &logTable, 16384 * 4 }, { &divTable, 65536 * 4 },
         // Scales 0 and 2: two words a position at scale 0; 1 and 3: three.
         { &bandsRef[0], (VkDeviceSize)w1 * h1 * 8 }, { &bandsDis[0], (VkDeviceSize)w1 * h1 * 8 },
         { &bandsRef[1], (VkDeviceSize)w2 * h2 * 12 }, { &bandsDis[1], (VkDeviceSize)w2 * h2 * 12 },
@@ -1669,8 +1669,11 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // the previous blur (as the CUDA code's memset) and the band images.
     std::vector<uint32_t> table(65536);
     for (uint32_t i = 0; i < 32768; ++i)
-        table[i] = cuda_log_generate(32768 + i);
-    if (int error = upload(logTable, table.data(), 32768 * 4))
+        table[i] = cuda_log_generate(32768 + i);  // 30720..32768
+    // Two entries a word (vif_stats.slang's log_generate).
+    for (uint32_t i = 0; i < 16384; ++i)
+        table[i] = table[2 * i] | (table[2 * i + 1] << 16);
+    if (int error = upload(logTable, table.data(), 16384 * 4))
         return error;
     const float div_Q_factor = 1073741824;  // 2^30
     for (int i = -32768; i < 32768; ++i) {
@@ -2186,7 +2189,7 @@ VV_EXPORT const char *vv_device_name(vv_context *context) { return context->devi
 
 // A device buffer's first `bytes` bytes, after vv_flush; for tests. `which`:
 // 0 admR, 1 admA, 2 admF, 3 bandsRef[0], 4 bandsDis[0], 5 bandsRef[1], 6 bandsDis[1], 7 vifTmp,
-// 8 the division table, 9 the logarithm table, 10 admRB, 11 admAB, 12 admFB (VMAF NEG's, BOTH),
+// 8 the division table, 9 the logarithm table (two entries a word), 10 admRB, 11 admAB, 12 admFB (VMAF NEG's, BOTH),
 // 13 bandsARef[0], 14 bandsADis[0], 15 bandsARef[1], 16 bandsADis[1]. 3-6 hold h, v, d (adm_hvd).
 VV_EXPORT int vv_read_buffer(vv_context *context, int which, void *out, uint64_t bytes)
 {

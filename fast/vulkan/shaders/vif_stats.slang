@@ -9,7 +9,14 @@
 // include it after declaring pc (gainA, gainB, epsLo, epsHi), logTable and
 // SUMS.
 
-uint log_generate(uint v) { return logTable[v & 0x7FFFu]; }
+// log_generate(32768 + i) for i = v & 0x7FFF: two 16-bit entries a word (the
+// values are 30720..32768), half the table a word each would take in the
+// caches.
+uint log_generate(uint v)
+{
+    const uint i = v & 0x7FFFu;
+    return (logTable[i >> 1] >> ((i & 1u) * 16)) & 0xFFFFu;
+}
 
 // get_best16_from64
 uint best16(uint64_t v, out int x)
