@@ -74,7 +74,9 @@
     X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkResetCommandBuffer) \
     X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdDispatchIndirect) \
     X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCreateFence) X(vkDestroyFence) \
-    X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) X(vkDeviceWaitIdle)
+    X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) X(vkDeviceWaitIdle) \
+    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) \
+    X(vkGetQueryPoolResults)
 
 namespace {
 
@@ -512,6 +514,21 @@ struct vv_context {
     std::vector<float> speedPlanes;  // a frame's filtered planes, out of the slot's buffer
     int enable_speed(const double *values);
 
+    // Profiling (vv_profile, for the speed work): the GPU's time per pass,
+    // summed by shader, from timestamps around each, and the CPU's per step.
+    bool profile = false;
+    VkQueryPool queryPool = VK_NULL_HANDLE;
+    double timestampNs = 1.0;
+    enum { kQueriesPerSlot = 1024, kProfileUpload = kShaderCount, kProfileCopies, kProfileLabels };
+    std::vector<std::vector<int>> slotLabels;  // per slot: what each interval between its timestamps was
+    double gpuNs[kProfileLabels] = {};
+    uint64_t gpuCount[kProfileLabels] = {};
+    enum { kCpuCopy, kCpuRecord, kCpuWait, kCpuSpeed, kCpuCambiPool, kCpuSteps };
+    double cpuNs[kCpuSteps] = {};
+    uint64_t cpuCount[kCpuSteps] = {};
+    double now_ns() const;
+    int enable_profile();
+
     std::vector<Slot> slots;
     unsigned nextSlot = 0;
     unsigned frames = 0;
@@ -541,6 +558,8 @@ vv_context::~vv_context()
     if (!device)
         return;
     vk.vkDeviceWaitIdle(device);
+    if (queryPool)
+        vk.vkDestroyQueryPool(device, queryPool, nullptr);
     for (Slot &slot : slots) {
         if (slot.fence)
             vk.vkDestroyFence(device, slot.fence, nullptr);
@@ -1691,11 +1710,51 @@ int vv_context::enable_speed(const double *values)
     return 0;
 }
 
+double vv_context::now_ns() const
+{
+    static const double period = [] {
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        return 1e9 / (double)frequency.QuadPart;
+    }();
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart * period;
+}
+
+int vv_context::enable_profile()
+{
+    if (frames || profile)
+        return fail(-3, "profiling is started before the first frame");
+    VkPhysicalDeviceProperties properties;
+    api->vkGetPhysicalDeviceProperties(physical, &properties);
+    uint32_t familyCount = 0;
+    api->vkGetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, nullptr);
+    std::vector<VkQueueFamilyProperties> families(familyCount);
+    api->vkGetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, families.data());
+    if (!families[queueFamily].timestampValidBits || properties.limits.timestampPeriod <= 0.0f)
+        return fail(-4, deviceName + " has no timestamps on its compute queue");
+    timestampNs = properties.limits.timestampPeriod;
+    VkQueryPoolCreateInfo info = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+    info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    info.queryCount = (uint32_t)(kQueriesPerSlot * slots.size());
+    if (vk.vkCreateQueryPool(device, &info, nullptr, &queryPool) != VK_SUCCESS)
+        return fail(-1, "vkCreateQueryPool failed");
+    slotLabels.assign(slots.size(), {});
+    profile = true;
+    return 0;
+}
+
 int vv_context::collect(Slot &slot)
 {
     if (!slot.busy)
         return 0;
+    const double waitStart = profile ? now_ns() : 0.0;
     VkResult result = vk.vkWaitForFences(device, 1, &slot.fence, VK_TRUE, 60ull * 1000 * 1000 * 1000);
+    if (profile) {
+        cpuNs[kCpuWait] += now_ns() - waitStart;
+        ++cpuCount[kCpuWait];
+    }
     slot.busy = false;
     if (result != VK_SUCCESS) {
         failed = true;
@@ -1703,11 +1762,25 @@ int vv_context::collect(Slot &slot)
                                              : "the GPU failed (" + std::to_string(result) + ")");
     }
     vk.vkResetFences(device, 1, &slot.fence);
+    if (profile) {
+        const size_t s = (size_t)(&slot - slots.data());
+        const std::vector<int> &labels = slotLabels[s];
+        std::vector<uint64_t> stamps(labels.size() + 1);
+        if (!labels.empty() &&
+            vk.vkGetQueryPoolResults(device, queryPool, (uint32_t)(s * kQueriesPerSlot), (uint32_t)stamps.size(),
+                                     stamps.size() * 8, stamps.data(), 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            for (size_t i = 0; i < labels.size(); ++i) {
+                gpuNs[labels[i]] += (double)(stamps[i + 1] - stamps[i]) * timestampNs;
+                ++gpuCount[labels[i]];
+            }
+        }
+    }
     FrameSums &frame = sums[slot.index];
     frame.scored = slot.scored;
     const uint32_t *words = (const uint32_t *)slot.result.mapped;
     for (int i = 0; i < kSlots; ++i)
         frame.slots[i] = (uint64_t)words[2 * i] | ((uint64_t)words[2 * i + 1] << 32);
+    const double tailStart = profile ? now_ns() : 0.0;
     if (cambi && slot.scored) {
         const float *kept = (const float *)slot.cambiKeep.mapped;
         for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
@@ -1719,12 +1792,21 @@ int vv_context::collect(Slot &slot)
             frame.cambiPooledScales |= 1u << scale;
         }
     }
+    const double speedStart = profile ? now_ns() : 0.0;
+    if (profile) {
+        cpuNs[kCpuCambiPool] += speedStart - tailStart;
+        ++cpuCount[kCpuCambiPool];
+    }
     if (speed && slot.scored) {
         // Out of the slot's buffer first: est_params reads each value hundreds of times.
         memcpy(speedPlanes.data(), slot.speedKeep.mapped, speedPlanes.size() * sizeof(float));
         const size_t n = speedPlanes.size() / 4;
         float *planes[4] = { &speedPlanes[0], &speedPlanes[2 * n], &speedPlanes[n], &speedPlanes[3 * n] };  // ref U, dis U, ref V, dis V
         v1_speed_chroma(speedState, planes, frame.speed);
+        if (profile) {
+            cpuNs[kCpuSpeed] += now_ns() - speedStart;
+            ++cpuCount[kCpuSpeed];
+        }
     }
     return 0;
 }
@@ -1753,6 +1835,7 @@ int vv_context::submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *d
         return fail(-3, "this context takes its frames from GPU memory");
     if (int error = staging(&targets[0], &targets[1]))
         return error;
+    const double copyStart = profile ? now_ns() : 0.0;
     const size_t rowBytes = (size_t)w * (bpc > 8 ? 2 : 1);
     const uint8_t *planes[2] = { ref, score ? dis : nullptr };
     const ptrdiff_t strides[2] = { refStride, disStride };
@@ -1766,6 +1849,10 @@ int vv_context::submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *d
             for (int y = 0; y < h; ++y)
                 memcpy(to + (size_t)y * strideBytes, planes[plane] + (ptrdiff_t)y * strides[plane], rowBytes);
         }
+    }
+    if (profile) {
+        cpuNs[kCpuCopy] += now_ns() - copyStart;
+        ++cpuCount[kCpuCopy];
     }
     return commit(score);
 }
@@ -1787,6 +1874,7 @@ int vv_context::submit_v1(const uint8_t *const planes[6], const ptrdiff_t stride
     uint8_t *targets[2];
     if (int error = staging(&targets[0], &targets[1]))
         return error;
+    const double copyStart = profile ? now_ns() : 0.0;
     auto copy = [](uint8_t *to, uint32_t toStride, const uint8_t *from, ptrdiff_t fromStride, size_t rowBytes,
                    uint32_t rows) {
         if (fromStride == (ptrdiff_t)toStride) {
@@ -1807,6 +1895,10 @@ int vv_context::submit_v1(const uint8_t *const planes[6], const ptrdiff_t stride
             copy(chroma + (size_t)i * chromaPlaneBytes, chromaStrideBytes, planes[order[i]], strides[order[i]],
                  chromaW * sampleBytes, chromaH);
     }
+    if (profile) {
+        cpuNs[kCpuCopy] += now_ns() - copyStart;
+        ++cpuCount[kCpuCopy];
+    }
     return commit(score);
 }
 
@@ -1817,6 +1909,9 @@ int vv_context::commit(bool score)
     Slot &slot = *pending;
     pending = nullptr;
     nextSlot = (nextSlot + 1) % (unsigned)slots.size();
+    const double recordStart = profile ? now_ns() : 0.0;
+    const size_t slotIndex = (size_t)(&slot - slots.data());
+    const uint32_t queryBase = (uint32_t)(slotIndex * kQueriesPerSlot);
 
     const unsigned index = frames++;
     sums.emplace_back();
@@ -1828,6 +1923,19 @@ int vv_context::commit(bool score)
     VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk.vkBeginCommandBuffer(cb, &begin);
+    std::vector<int> *labels = profile ? &slotLabels[slotIndex] : nullptr;
+    auto stamp = [&](int label) {
+        if (labels && labels->size() + 1 < kQueriesPerSlot) {
+            vk.vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool,
+                                   queryBase + (uint32_t)labels->size() + 1);
+            labels->push_back(label);
+        }
+    };
+    if (labels) {
+        labels->clear();
+        vk.vkCmdResetQueryPool(cb, queryPool, queryBase, kQueriesPerSlot);
+        vk.vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, queryBase);
+    }
     barrier(vk, cb, kCompute | kTransfer, kTransfer);
     VkBufferCopy copy = { 0, 0, planeBytes };
     vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
@@ -1837,6 +1945,7 @@ int vv_context::commit(bool score)
     }
     vk.vkCmdFillBuffer(cb, acc.buffer, 0, VK_WHOLE_SIZE, 0);
     barrier(vk, cb, kTransfer, kCompute | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
+    stamp(kProfileUpload);
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
     const std::vector<Pass> *lists[4] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
                                           score && cambi ? &slot.cambiKeepPasses : nullptr,
@@ -1859,6 +1968,7 @@ int vv_context::commit(bool score)
             else
                 vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], pass.groups[2]);
             barrier(vk, cb, kCompute, kCompute | kTransfer | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
+            stamp(pass.shader);
         }
     }
     if (v1) {
@@ -1868,6 +1978,7 @@ int vv_context::commit(bool score)
     }
     VkBufferCopy back = { 0, 0, kSlots * 8 };
     vk.vkCmdCopyBuffer(cb, acc.buffer, slot.result.buffer, 1, &back);
+    stamp(kProfileCopies);
     // What the shaders and the copy wrote into host-visible buffers, visible
     // to the host once the fence is signalled.
     VkMemoryBarrier toHost = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
@@ -1885,6 +1996,10 @@ int vv_context::commit(bool score)
         return fail(-5, "vkQueueSubmit failed (" + std::to_string(result) + ")");
     }
     slot.busy = true;
+    if (profile) {
+        cpuNs[kCpuRecord] += now_ns() - recordStart;
+        ++cpuCount[kCpuRecord];
+    }
     return 0;
 }
 
@@ -2144,6 +2259,38 @@ VV_EXPORT int vv_v1_speed_scores(vv_context *context, double *out, unsigned fram
     for (unsigned i = 0; i < n; ++i)
         memcpy(out + 3 * (size_t)i, sums[i].speed, sizeof sums[i].speed);
     return (int)sums.size();
+}
+
+// Profiling, for the speed work: started before the first frame, it times
+// every pass on the GPU (timestamps; the passes run one after the other) and
+// the CPU's steps. vv_profile_text writes what was summed so far, a line
+// each: the name, the milliseconds in all, how many times.
+VV_EXPORT int vv_profile(vv_context *context) { return context->enable_profile(); }
+
+VV_EXPORT int vv_profile_text(vv_context *context, char *out, int bytes)
+{
+    std::string text;
+    char line[160];
+    for (int i = 0; i < vv_context::kProfileLabels; ++i) {
+        if (!context->gpuCount[i])
+            continue;
+        const char *name = i == vv_context::kProfileUpload ? "(upload)"
+                         : i == vv_context::kProfileCopies ? "(copies)" : kShaders[i].name;
+        snprintf(line, sizeof line, "gpu %s %.3f %llu\n", name, context->gpuNs[i] / 1e6,
+                 (unsigned long long)context->gpuCount[i]);
+        text += line;
+    }
+    static const char *const steps[vv_context::kCpuSteps] = { "copy", "record", "wait", "speed", "cambi_pool" };
+    for (int i = 0; i < vv_context::kCpuSteps; ++i) {
+        snprintf(line, sizeof line, "cpu %s %.3f %llu\n", steps[i], context->cpuNs[i] / 1e6,
+                 (unsigned long long)context->cpuCount[i]);
+        text += line;
+    }
+    if (out && bytes > 0) {
+        strncpy(out, text.c_str(), (size_t)bytes - 1);
+        out[bytes - 1] = 0;
+    }
+    return (int)text.size() + 1;
 }
 
 // A frame's features (kFeatures doubles), after vv_flush. Returns 1 when
