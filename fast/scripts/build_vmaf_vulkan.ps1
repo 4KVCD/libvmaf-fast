@@ -42,6 +42,8 @@ $shaders = [ordered]@{
     'vif_hori_native_3' = 'vif_hori', 'NATIVE_F64=1', 'BPC16=0', 'SCALE=3', 'FW=3', 'FW_RD=0'
     'adm_dwt_0_8'       = 'adm_dwt', 'SCALE0=1', 'BPC16=0'
     'adm_dwt_0_16'      = 'adm_dwt', 'SCALE0=1', 'BPC16=1'
+    'adm_dwt_0_8a'      = 'adm_dwt', 'SCALE0=1', 'BPC16=0', 'A16=1'
+    'adm_dwt_0_16a'     = 'adm_dwt', 'SCALE0=1', 'BPC16=1', 'A16=1'
     'adm_dwt_1'         = 'adm_dwt', 'SCALE0=0', 'BPC16=0', 'DWT_SCALE=1'
     'adm_dwt_2'         = 'adm_dwt', 'SCALE0=0', 'BPC16=0', 'DWT_SCALE=2'
     'adm_dwt_3'         = 'adm_dwt', 'SCALE0=0', 'BPC16=0', 'DWT_SCALE=3'

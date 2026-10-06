@@ -543,7 +543,8 @@ struct vv_context {
     bool admFused = true;
     // The GPU reads 16-bit integers from storage buffers (storageBuffer16BitAccess
     // and shaderInt16, both enabled): VIF scale 0 reads 16-bit samples so
-    // (vif_fused_0_16s; Core Ultra 9 285K's iGPU, 4K: 7.63 -> 7.46 ms).
+    // (vif_fused_0_16s; Core Ultra 9 285K's iGPU, 4K: 7.63 -> 7.46 ms), and
+    // ADM scale 0's transform stores a so (adm_dwt_0_8a, _16a).
     bool samples16 = false;
 
     std::vector<Pass> motion[2];  // by frame parity
@@ -1129,9 +1130,11 @@ int vv_context::build_passes()
             const int32_t constants[] = { inW, inH, inStride, bandStride,
                                           scale == 0 ? bpc : kV[scale][0], scale == 0 ? 1 << (bpc - 1) : kV[scale][1],
                                           kH[scale][0], kH[scale][1], aStride0 };
-            // Scales 1-3: a shader each, with these shifts (kV, kH) built in.
-            const int shader = scale == 0 ? (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8)
-                                          : kShader_adm_dwt_1 + (scale - 1);
+            // Scales 1-3: a shader each, with these shifts (kV, kH) built in. Scale 0
+            // stores a as 16-bit values where the GPU can (samples16).
+            const int shader = scale != 0 ? kShader_adm_dwt_1 + (scale - 1)
+                               : samples16 ? (deep ? kShader_adm_dwt_0_16a : kShader_adm_dwt_0_8a)
+                                           : (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8);
             error = add_pass(scored, shader, { inRef, inDis, &bandsRef[set], &bandsDis[set], &bandsARef[set],
                                                &bandsADis[set] }, constants,
                              sizeof constants, groups(bw, 16), groups(bh, 8));

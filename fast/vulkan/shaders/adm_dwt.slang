@@ -61,8 +61,20 @@ static const int kShiftH[4] = { 16, 15, 16, 15 }, kAddH[4] = { 32768, 16384, 327
 [[vk::binding(1, 0)]] StructuredBuffer<uint> disIn;
 [[vk::binding(2, 0)]] RWStructuredBuffer<int> refOut;  // h, v, d
 [[vk::binding(3, 0)]] RWStructuredBuffer<int> disOut;
+#ifndef A16
+#define A16 0
+#endif
+#if A16
+// Scale 0's a stored a 16-bit value at a time (where the GPU can: the
+// engine's samples16), two a word as below: no pairing in group memory.
+[[vk::binding(4, 0)]] RWStructuredBuffer<int16_t> refA;
+[[vk::binding(5, 0)]] RWStructuredBuffer<int16_t> disA;
+#else
 [[vk::binding(4, 0)]] RWStructuredBuffer<int> refA;    // a
 [[vk::binding(5, 0)]] RWStructuredBuffer<int> disA;
+#endif
+// Scale 0's a paired into words by the group's even columns' threads.
+#define PAIR_A (SCALE0 && !A16)
 
 static const int kLo[4] = { 15826, 27411, 7345, -4240 };
 static const int kHi[4] = { -4240, -7345, 27411, -15826 };
@@ -81,15 +93,52 @@ int4 indices(int n, int limit)
     return at;
 }
 
-// Writes h, v, d and returns a.
-int transform(StructuredBuffer<uint> source, RWStructuredBuffer<int> bands, int4 columns, int4 rows, int at)
+#if SCALE0
+// Row y's samples at columns 2x - 1 .. 2x + 2, all inside the picture: from
+// the words holding them (16-bit: three; 8-bit: two), where a load a sample
+// was four.
+int4 row_samples(StructuredBuffer<uint> source, int x, int y)
+{
+    const int first = y * P_inStride;
+#if BPC16
+    const uint w0 = source[first + x - 1], w1 = source[first + x], w2 = source[first + x + 1];
+    return int4(int(w0 >> 16), int(w1 & 0xFFFFu), int(w1 >> 16), int(w2 & 0xFFFFu));
+#else
+    // Bytes 3 of word x/2 - 1 and 0..2 of word x/2 (x even), or 1..3 of word
+    // (x - 1)/2 and 0 of the next (x odd).
+    const int word = (2 * x - 1) >> 2;
+    const uint a = source[first + word], b = source[first + word + 1];
+    const uint shift = uint((2 * x - 1) & 3) * 8;  // 24 or 8
+    const uint four = (a >> shift) | (b << (32u - shift));
+    return int4(int(four & 0xFFu), int((four >> 8) & 0xFFu), int((four >> 16) & 0xFFu), int(four >> 24));
+#endif
+}
+#endif
+
+// Writes position (x, y)'s h, v, d and returns its a.
+int transform(StructuredBuffer<uint> source, RWStructuredBuffer<int> bands, int4 columns, int4 rows, int x, int y,
+              int at)
 {
 #if SCALE0
+    // Positions away from the picture's edges (their 4 x 4 samples all
+    // inside it) read them a row at a time.
+    int samples[4][4];  // [row][column]
+    if (x >= 1 && 2 * x + 2 < P_w && y >= 1 && 2 * y + 2 < P_h) {
+        for (int i = 0; i < 4; ++i) {
+            const int4 four = row_samples(source, x, rows[i]);
+            for (int c = 0; c < 4; ++c)
+                samples[i][c] = four[c];
+        }
+    } else {
+        for (int i = 0; i < 4; ++i)
+            for (int c = 0; c < 4; ++c)
+                samples[i][c] = int(pixel(source, columns[c], rows[i], P_inStride));
+    }
     int lo[4], hi[4];
     for (int c = 0; c < 4; ++c) {
         int sumLo = 0, sumHi = 0;
         for (int i = 0; i < 4; ++i) {
-            int sample = int(pixel(source, columns[c], rows[i], P_inStride));
+            int sample = samples[i][c];
             sumLo += kLo[i] * sample;
             sumHi += kHi[i] * sample;
         }
@@ -141,7 +190,7 @@ int transform(StructuredBuffer<uint> source, RWStructuredBuffer<int> bands, int4
 #endif
 }
 
-#if SCALE0
+#if PAIR_A
 // The group's a, ref's then dis's, for the even columns' threads to pair.
 groupshared int gA[2 * 16 * 8];
 #endif
@@ -152,7 +201,7 @@ void main(uint3 id : SV_DispatchThreadID, uint local : SV_GroupIndex)
 {
     int x = int(id.x), y = int(id.y);
     const bool inside = x < (P_w + 1) / 2 && y < (P_h + 1) / 2;
-#if SCALE0
+#if PAIR_A
     int aRef = 0, aDis = 0;
 #else
     if (!inside)
@@ -161,15 +210,19 @@ void main(uint3 id : SV_DispatchThreadID, uint local : SV_GroupIndex)
     if (inside) {
         int4 columns = indices(x, P_w), rows = indices(y, P_h);
         int at = y * P_outStride + x;
-#if SCALE0
-        aRef = transform(refIn, refOut, columns, rows, at);
-        aDis = transform(disIn, disOut, columns, rows, at);
+#if PAIR_A
+        aRef = transform(refIn, refOut, columns, rows, x, y, at);
+        aDis = transform(disIn, disOut, columns, rows, x, y, at);
+#elif A16
+        // In [-27411, 27410] (transform): 16-bit, two a word.
+        refA[y * P_aStride + x] = int16_t(transform(refIn, refOut, columns, rows, x, y, at));
+        disA[y * P_aStride + x] = int16_t(transform(disIn, disOut, columns, rows, x, y, at));
 #else
-        refA[at] = transform(refIn, refOut, columns, rows, at);
-        disA[at] = transform(disIn, disOut, columns, rows, at);
+        refA[at] = transform(refIn, refOut, columns, rows, x, y, at);
+        disA[at] = transform(disIn, disOut, columns, rows, x, y, at);
 #endif
     }
-#if SCALE0
+#if PAIR_A
     // a two a word, the even column's low half, written by its thread (the
     // group 16 columns wide from an even one: x + 1 is local + 1). Past the
     // last column, 0.
