@@ -1210,9 +1210,11 @@ int vv_context::build_passes_v1()
         Buffer *previous = &picPrev[options.fiveFrameWindow ? parity : 1 - parity];
         error = add_pass(motion[parity], deep ? kShader_motion_v1_16 : kShader_motion_v1_8,
                          { &picRef, previous, &acc }, constants, sizeof constants, groups(w, 16), groups(h, 16));
-        if (!error && direct)
+        if (!error && direct)  // the frame before's (or the one before it) reference where it is: its slot
             error = per_slot(motion[parity], [&](Slot &slot) {
-                return std::vector<Bound>{ slot_ref(slot), Bound(previous), Bound(&acc) };
+                const size_t count = slots.size(), lag = options.fiveFrameWindow ? 2 : 1;
+                Slot &before = slots[((size_t)(&slot - slots.data()) + count - lag) % count];
+                return std::vector<Bound>{ slot_ref(slot), slot_ref(before), Bound(&acc) };
             });
     }
 
@@ -1634,7 +1636,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         { &blur[0], pixels * 4 * v0 + 4 }, { &blur[1], pixels * 4 * v0 + 4 }, { &vifTmp, pixels * 32 * v0 + 4 },
         { &rdRef[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 }, { &rdDis[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 },
         { &rdRef[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 }, { &rdDis[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 },
-        { &picPrev[0], planeBytes * only1 + 4 }, { &picPrev[1], planeBytes * only1 + 4 },
+        { &picPrev[0], planeBytes * only1 * (direct ? 0 : 1) + 4 }, { &picPrev[1], planeBytes * only1 * (direct ? 0 : 1) + 4 },
         { &logTable, 32768 * 4 }, { &divTable, 65536 * 4 },
         { &bandsRef[0], (VkDeviceSize)w1 * h1 * 16 }, { &bandsDis[0], (VkDeviceSize)w1 * h1 * 16 },
         { &bandsRef[1], (VkDeviceSize)w2 * h2 * 16 }, { &bandsDis[1], (VkDeviceSize)w2 * h2 * 16 },
@@ -1649,6 +1651,11 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
 
     const int depth = std::clamp((flags >> 8) & 0xFF, 1, 16);
     slots.resize((size_t)(((flags >> 8) & 0xFF) ? depth : 3));
+    // Read where they are, the slots' pictures stay as long as the frames
+    // after read them as their previous (staging()): a slot or two more, for
+    // as many frames in flight.
+    if (direct)
+        slots.resize(std::min<size_t>(16, slots.size() + (options.fiveFrameWindow ? 2 : 1)));
     std::vector<VkCommandBuffer> commands(slots.size());
     VkCommandBufferAllocateInfo allocate = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     allocate.commandPool = commandPool;
@@ -2091,6 +2098,15 @@ int vv_context::staging(uint8_t **ref, uint8_t **dis)
     Slot &slot = slots[nextSlot];
     if (int error = collect(slot))
         return error;
+    if (direct) {
+        // The frames after the slot's last read its reference as their
+        // previous one (motion): they are done too before it is written again.
+        const size_t lag = options.fiveFrameWindow ? 2 : 1;
+        for (size_t k = 1; k <= lag; ++k) {
+            if (int error = collect(slots[(nextSlot + k) % slots.size()]))
+                return error;
+        }
+    }
     pending = &slot;
     *ref = (uint8_t *)slot.staging.mapped;
     *dis = (uint8_t *)slot.staging.mapped + disOffset;
@@ -2246,10 +2262,10 @@ int vv_context::commit(bool score)
             stamp(pass.shader);
         }
     }
-    if (v1) {
+    if (v1 && !direct) {  // read from its slot otherwise (staging())
         barrier(vk, cb, kCompute, kTransfer);
         VkBufferCopy keep = { 0, 0, planeBytes };
-        vk.vkCmdCopyBuffer(cb, direct ? slot.staging.buffer : picRef.buffer, picPrev[index % 2].buffer, 1, &keep);
+        vk.vkCmdCopyBuffer(cb, picRef.buffer, picPrev[index % 2].buffer, 1, &keep);
     }
     VkBufferCopy back = { 0, 0, kSlots * 8 };
     vk.vkCmdCopyBuffer(cb, acc.buffer, slot.result.buffer, 1, &back);

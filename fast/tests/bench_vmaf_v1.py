@@ -75,9 +75,10 @@ def main() -> int:
         if arguments.shared:
             lib.vv_test_fill_slot.restype = ctypes.c_int
             lib.vv_test_fill_slot.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p]
-            for slot in range(3):  # V1Scorer's frames in flight
-                check(lib, lib.vv_test_fill_slot(scorer._gpu, slot, bytes(reference[slot % count][:luma]),
-                                                 bytes(distorted[slot % count][:luma])), "filling a slot")
+            for slot in range(16):  # every slot the context has (an error past the last)
+                if lib.vv_test_fill_slot(scorer._gpu, slot, bytes(reference[slot % count][:luma]),
+                                         bytes(distorted[slot % count][:luma])) != 0:
+                    break
         started = time.perf_counter()
         for index in range(warm, warm + arguments.count):
             if arguments.shared:
