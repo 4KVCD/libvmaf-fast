@@ -82,11 +82,32 @@ void main(uint3 id : SV_DispatchThreadID)
 // pc: w, h, strideWords, bpc, antiDither, errorSlot, maskIndex, step, outW, outH
 #define TILE 16
 #define MAX_SPAN (TILE * 2 + 8)  // the pixels a tile reads across, at STEP 2
-#define LOADS ((((TILE * STEP + 8) * (TILE * STEP + 8)) + 255) / 256)  // each thread's samples
+#if BPC16
+#define PER_WORD 2
+#else
+#define PER_WORD 4
+#endif
+#define ROW_WORDS ((TILE * STEP + 8 + 1 + PER_WORD - 1) / PER_WORD)  // a row's words, from the sample before its first
+#define LOADS ((ROW_WORDS * (TILE * STEP + 8) + 255) / 256)  // each thread's words
 
 groupshared uint gTen[MAX_SPAN * MAX_SPAN];   // to10 of the picture; outside it, unused
-groupshared uint gPre[MAX_SPAN * MAX_SPAN];   // PRE's value
-groupshared uint gZero[MAX_SPAN * MAX_SPAN];  // DERIV's flag, 0 outside the picture
+groupshared uint gZeroWords[MAX_SPAN * 2];  // DERIV's flags, a bit per pixel, two words a row (0 outside the picture)
+
+// PRE (anti_dithering_filter, if pc[4]) at local (lx, ly), picture (x, y):
+// from its sample v and those right (r), below (d) and diagonally (rd).
+uint pre_of(uint v, uint r, uint d, uint rd, int lx, int ly, int x, int y)
+{
+    const int w = int(pc[0]), h = int(pc[1]), span = TILE * STEP + 8;
+    if (pc[4] != 0 && lx + 1 < span && ly + 1 < span && x >= 0 && x < w && y >= 0 && y < h) {
+        if (x < w - 1 && y < h - 1)
+            return (v + r + d + rd) >> 2;
+        if (y < h - 1)
+            return (v + d) >> 1;
+        if (x < w - 1)
+            return (v + r) >> 1;
+    }
+    return v;
+}
 
 uint to10_of(uint v)
 {
@@ -108,66 +129,85 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     const int u0 = int(group.x) * core, v0 = int(group.y) * core;
     const int ox = u0 - 3, oy = v0 - 3;
     const uint bpc = pc[3];
-    // Every sample's load first, then their conversion: the loads wait for
-    // memory together (STEP is fixed, so the loop unrolls).
+    // The samples a word (2 or 4) at a time, from ox - 1 (on a word: u0 is a
+    // multiple of 16): every load first, then their conversion, so the loads
+    // wait for memory together (STEP is fixed, so the loops unroll).
+    const int firstWord = (ox - 1) / PER_WORD;  // (negative at the left edge: those words are not read)
+    if (local < MAX_SPAN * 2) gZeroWords[local] = 0;
     uint raws[LOADS];
     [unroll] for (int k = 0; k < LOADS; ++k) {
-        const int i = int(local) + k * 256, x = ox + i % span, y = oy + i / span;
-        raws[k] = i < span * span && x >= 0 && x < w && y >= 0 && y < h ? pixel(picture, x, y, int(pc[2])) : 0u;
+        const int i = int(local) + k * 256, lw = i % ROW_WORDS, ly = i / ROW_WORDS;
+        const int x = ox - 1 + lw * PER_WORD, y = oy + ly;  // the word's first sample
+        raws[k] = ly < span && x + PER_WORD > 0 && x < w && y >= 0 && y < h
+            ? picture[y * int(pc[2]) + firstWord + lw] : 0u;
     }
     [unroll] for (int k = 0; k < LOADS; ++k) {
-        const int i = int(local) + k * 256, x = ox + i % span, y = oy + i / span;
-        if (i >= span * span)
+        const int i = int(local) + k * 256, lw = i % ROW_WORDS, ly = i / ROW_WORDS;
+        if (ly >= span)
             break;
-        uint ten = 0;
-        if (x >= 0 && x < w && y >= 0 && y < h) {
-            const uint raw = raws[k];
-            if (bpc > 8 && bpc < 16 && x >= u0 && x < u0 + core && y >= v0 && y < v0 + core && raw > (1u << bpc) - 1u)
-                InterlockedOr(acc[2 * pc[5]], 1u);
-            ten = to10_of(raw);
+        const int y = oy + ly;
+        [unroll] for (int b = 0; b < PER_WORD; ++b) {
+            const int lx = lw * PER_WORD + b - 1, x = ox + lx;
+            if (lx < 0 || lx >= span)
+                continue;
+            uint ten = 0;
+            if (x >= 0 && x < w && y >= 0 && y < h) {
+#if BPC16
+                const uint raw = (raws[k] >> (b * 16)) & 0xFFFFu;
+#else
+                const uint raw = (raws[k] >> (b * 8)) & 0xFFu;
+#endif
+                if (bpc > 8 && bpc < 16 && x >= u0 && x < u0 + core && y >= v0 && y < v0 + core && raw > (1u << bpc) - 1u)
+                    InterlockedOr(acc[2 * pc[5]], 1u);
+                ten = to10_of(raw);
+            }
+            gTen[ly * span + lx] = ten;
         }
-        gTen[i] = ten;
     }
     GroupMemoryBarrierWithGroupSync();
-    // PRE: anti_dithering_filter of the converted picture, which it reads ahead of what it wrote.
-    for (int i = int(local); i < span * span; i += 256) {
-        const int lx = i % span, ly = i / span, x = ox + lx, y = oy + ly;
-        uint v = gTen[i];
-        if (pc[4] != 0 && lx + 1 < span && ly + 1 < span && x >= 0 && x < w && y >= 0 && y < h) {
-            if (x < w - 1 && y < h - 1)
-                v = (v + gTen[i + 1] + gTen[i + span] + gTen[i + span + 1]) >> 2;
-            else if (y < h - 1)
-                v = (v + gTen[i + span]) >> 1;
-            else if (x < w - 1)
-                v = (v + gTen[i + 1]) >> 1;
+    // DERIV of PRE (anti_dithering_filter of the converted picture): equal to
+    // its right and lower neighbours (the last column and row: always). A
+    // thread takes 8 pixels of a row, their flags a byte of the row's bits, and
+    // calculates the PRE values they compare from the 3 x 10 converted
+    // samples they read.
+    for (int task = int(local); task < span * (span / 8); task += 256) {
+        const int ly = task / (span / 8), lx0 = (task % (span / 8)) * 8, y = oy + ly;
+        uint t[3][10];
+        [unroll] for (int r = 0; r < 3; ++r)
+            [unroll] for (int c = 0; c < 10; ++c)
+                t[r][c] = lx0 + c < span && ly + r < span ? gTen[(ly + r) * span + lx0 + c] : 0u;
+        uint p[2][9];
+        [unroll] for (int r = 0; r < 2; ++r)
+            [unroll] for (int c = 0; c < 9; ++c)
+                p[r][c] = pre_of(t[r][c], t[r][c + 1], t[r + 1][c], t[r + 1][c + 1], lx0 + c, ly + r, ox + lx0 + c, y + r);
+        uint bits = 0;
+        [unroll] for (int k = 0; k < 8; ++k) {
+            const int lx = lx0 + k, x = ox + lx;
+            if (x >= 0 && x < w && y >= 0 && y < h && lx + 1 < span && ly + 1 < span) {
+                const bool across = x == w - 1 || p[0][k] == p[0][k + 1];
+                const bool down = y == h - 1 || p[0][k] == p[1][k];
+                if (across && down) bits |= 1u << uint(k);
+            }
         }
-        gPre[i] = v;
+        if (bits != 0)
+            InterlockedOr(gZeroWords[ly * 2 + lx0 / 32], bits << uint(lx0 % 32));
     }
     GroupMemoryBarrierWithGroupSync();
-    // DERIV: equal to its right and lower neighbours (the last column and row: always).
-    for (int i = int(local); i < span * span; i += 256) {
-        const int lx = i % span, ly = i / span, x = ox + lx, y = oy + ly;
-        uint zero = 0;
-        if (x >= 0 && x < w && y >= 0 && y < h && lx + 1 < span && ly + 1 < span) {
-            const uint v = gPre[i];
-            const bool across = x == w - 1 || v == gPre[i + 1];
-            const bool down = y == h - 1 || v == gPre[i + span];
-            zero = (across && down) ? 1u : 0u;
-        }
-        gZero[i] = zero;
-    }
-    GroupMemoryBarrierWithGroupSync();
-    // MASK at the outputs' pixels: more than maskIndex zero derivatives in the 7 x 7 square.
+    // MASK at the outputs' pixels: more than maskIndex zero derivatives in the
+    // 7 x 7 square, its rows' 7 bits counted.
     const int tx = int(local) % TILE, ty = int(local) / TILE;
     const int outX = int(group.x) * TILE + tx, outY = int(group.y) * TILE + ty;
     if (outX >= int(pc[8]) || outY >= int(pc[9])) return;
     const int lx = 3 + tx * step, ly = 3 + ty * step;  // the output's picture pixel, in shared memory
     uint sum = 0;
-    for (int r = -3; r <= 3; ++r)
-        for (int c = -3; c <= 3; ++c)
-            sum += gZero[(ly + r) * span + lx + c];
+    [unroll] for (int r = -3; r <= 3; ++r) {
+        const uint64_t row = uint64_t(gZeroWords[(ly + r) * 2]) | (uint64_t(gZeroWords[(ly + r) * 2 + 1]) << 32);
+        sum += countbits(uint(row >> uint(lx - 3)) & 0x7Fu);
+    }
     const uint at = uint(outY) * pc[8] + uint(outX);
-    imageOut[at] = gPre[ly * span + lx];
+    const int i = ly * span + lx;
+    imageOut[at] = pre_of(gTen[i], gTen[i + 1], gTen[i + span], gTen[i + span + 1], lx, ly,
+                          ox + lx, oy + ly);
     maskOut[at] = sum > pc[6] ? 1u : 0u;
 }
 
