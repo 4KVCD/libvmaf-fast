@@ -619,7 +619,8 @@ struct vv_context {
     float rfactorV1[kScales][3] = {};
     int build_passes_v1();
     // adm_fused.slang's parameters per scale (kAdmParams words each).
-    enum { kAdmParams = 52, kAdmBandRows = 32, kAdmOwnColumns = 126 };  // adm_fused.slang's BAND and OWN
+    // adm_fused.slang's BAND (scale 0's; 16 at the others, which are small) and OWN.
+    enum { kAdmParams = 52, kAdmBandRows = 32, kAdmBandRowsSmall = 8, kAdmOwnColumns = 126 };
     Buffer admParams, admPartial;
     VkDeviceSize admPartialWords = 0;  // its int64s: every row's sums per workgroup, of the largest scale
     std::vector<int32_t> admParamValues;
@@ -1387,7 +1388,7 @@ int vv_context::build_passes_v1()
                     });
             } else {
                 error = add_pass(scored, kShader_adm_fused, { &bandsRef[set], &bandsDis[set], &divTable, &admParams, &acc,
-                                 &admPartial }, constants, sizeof constants, chunks, groups(rows, kAdmBandRows));
+                                 &admPartial }, constants, sizeof constants, chunks, groups(rows, kAdmBandRowsSmall));
             }
             if (!error)
                 error = add_pass(scored, kShader_adm_rowsum, { &bandsRef[set], &bandsDis[set], &divTable, &admParams, &acc,

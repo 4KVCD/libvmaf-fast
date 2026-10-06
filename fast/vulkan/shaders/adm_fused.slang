@@ -296,7 +296,9 @@ bool in_cm_decouple(int i, int j)  // decoupled for the masking: its region and 
 // threshold sums is kept, a ring of three in shared memory. Each row's sums
 // of the workgroup's columns go to `partial`; ROWSUM adds each row's columns
 // and rounds the row as the CPU code does.
+#ifndef BAND
 #define BAND 32
+#endif
 #define OWN (GROUP - 2)
 groupshared int gRingF[3 * GROUP];
 groupshared int gRingRF[3 * GROUP];
