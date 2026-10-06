@@ -82,6 +82,7 @@ void main(uint3 id : SV_DispatchThreadID)
 // pc: w, h, strideWords, bpc, antiDither, errorSlot, maskIndex, step, outW, outH
 #define TILE 16
 #define MAX_SPAN (TILE * 2 + 8)  // the pixels a tile reads across, at STEP 2
+#define LOADS ((((TILE * STEP + 8) * (TILE * STEP + 8)) + 255) / 256)  // each thread's samples
 
 groupshared uint gTen[MAX_SPAN * MAX_SPAN];   // to10 of the picture; outside it, unused
 groupshared uint gPre[MAX_SPAN * MAX_SPAN];   // PRE's value
@@ -101,17 +102,26 @@ uint to10_of(uint v)
 [numthreads(256, 1, 1)]
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
-    const int w = int(pc[0]), h = int(pc[1]), step = int(pc[7]);
+    const int w = int(pc[0]), h = int(pc[1]), step = STEP;
     const int core = TILE * step, span = core + 8;
     // The tile's picture pixels start at (u0, v0); shared memory at (u0 - 3, v0 - 3).
     const int u0 = int(group.x) * core, v0 = int(group.y) * core;
     const int ox = u0 - 3, oy = v0 - 3;
     const uint bpc = pc[3];
-    for (int i = int(local); i < span * span; i += 256) {
-        const int x = ox + i % span, y = oy + i / span;
+    // Every sample's load first, then their conversion: the loads wait for
+    // memory together (STEP is fixed, so the loop unrolls).
+    uint raws[LOADS];
+    [unroll] for (int k = 0; k < LOADS; ++k) {
+        const int i = int(local) + k * 256, x = ox + i % span, y = oy + i / span;
+        raws[k] = i < span * span && x >= 0 && x < w && y >= 0 && y < h ? pixel(picture, x, y, int(pc[2])) : 0u;
+    }
+    [unroll] for (int k = 0; k < LOADS; ++k) {
+        const int i = int(local) + k * 256, x = ox + i % span, y = oy + i / span;
+        if (i >= span * span)
+            break;
         uint ten = 0;
         if (x >= 0 && x < w && y >= 0 && y < h) {
-            const uint raw = pixel(picture, x, y, int(pc[2]));
+            const uint raw = raws[k];
             if (bpc > 8 && bpc < 16 && x >= u0 && x < u0 + core && y >= v0 && y < v0 + core && raw > (1u << bpc) - 1u)
                 InterlockedOr(acc[2 * pc[5]], 1u);
             ten = to10_of(raw);

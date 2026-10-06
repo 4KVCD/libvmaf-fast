@@ -83,8 +83,10 @@ $shaders = [ordered]@{
     'cambi_args'        = 'cambi', 'STAGE=11', 'BPC16=0'
     'cambi_keep'        = 'cambi', 'STAGE=12', 'BPC16=0'
     'cambi_cvalues_slide' = 'cambi', 'STAGE=13', 'BPC16=0'
-    'cambi_front_8'     = 'cambi', 'STAGE=14', 'BPC16=0'
-    'cambi_front_16'    = 'cambi', 'STAGE=14', 'BPC16=1'
+    'cambi_front_8'     = 'cambi', 'STAGE=14', 'BPC16=0', 'STEP=2'
+    'cambi_front_16'    = 'cambi', 'STAGE=14', 'BPC16=1', 'STEP=2'
+    'cambi_front_8_1'   = 'cambi', 'STAGE=14', 'BPC16=0', 'STEP=1'
+    'cambi_front_16_1'  = 'cambi', 'STAGE=14', 'BPC16=1', 'STEP=1'
     # VMAF v1's ADM after the wavelet transform, one pass per scale (shaders/adm_fused.slang).
     'adm_fused_0_8'     = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=0', 'SLIDE=1'
     'adm_fused_0_16'    = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=1', 'SLIDE=1'

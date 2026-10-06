@@ -1796,7 +1796,9 @@ int vv_context::enable_cambi(const double *values)
         const uint32_t constants[] = { (uint32_t)w, (uint32_t)h, strideBytes / 4, (uint32_t)bpc,
                                        bpc < 10 ? 1u : 0u, (uint32_t)kSlotCambiInvalid, (uint32_t)c.mask_index,
                                        step, outW, outH };
-        error = add_pass(scored, bpc > 8 ? kShader_cambi_front_16 : kShader_cambi_front_8,
+        const int front = c.speedup ? (bpc > 8 ? kShader_cambi_front_16 : kShader_cambi_front_8)
+                                    : (bpc > 8 ? kShader_cambi_front_16_1 : kShader_cambi_front_8_1);
+        error = add_pass(scored, front,
                          { &picDis, c.speedup ? &cambiRaw[0] : &cambiImage, c.speedup ? &cambiMask[0] : &cambiMaskFull,
                            &acc }, constants, sizeof constants, groups((int)outW, 16), groups((int)outH, 16));
         if (!error && direct)
