@@ -73,7 +73,6 @@ $shaders = [ordered]@{
     'cambi_pre_16'      = 'cambi', 'STAGE=1', 'BPC16=1'
     'cambi_deriv'       = 'cambi', 'STAGE=2', 'BPC16=0'
     'cambi_mask'        = 'cambi', 'STAGE=3', 'BPC16=0'
-    'cambi_decimate'    = 'cambi', 'STAGE=4', 'BPC16=0'
     'cambi_mode'        = 'cambi', 'STAGE=5', 'BPC16=0'
     'cambi_cvalues'     = 'cambi', 'STAGE=6', 'BPC16=0'
     'cambi_clear'       = 'cambi', 'STAGE=7', 'BPC16=0'

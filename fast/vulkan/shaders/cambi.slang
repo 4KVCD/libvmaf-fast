@@ -10,9 +10,10 @@
 //   DERIV     zero derivative: equal to its right and lower neighbours
 //   MASK      the spatial mask: more than mask_index zero derivatives in
 //             the 7x7 square around (zeros outside the picture)
-//   DECIMATE  every other row and column, of the picture and of the mask
 //   MODE      filter_mode: the mode of 3, across then down; the first and
-//             last rows as they were
+//             last rows as they were -- of the scale before's filtered
+//             picture decimated (every other row and column, as is its
+//             mask, which it writes too)
 //   CVALUES   calculate_c_values: each masked pixel's histogram of its
 //             (window x window) square counted directly -- what the CPU's
 //             sliding histograms hold for it -- and c_value_pixel, with the
@@ -246,28 +247,17 @@ void main(uint3 id : SV_DispatchThreadID)
     mask[y * w + x] = sum > pc[2] ? 1u : 0u;
 }
 
-#elif STAGE == 4  // DECIMATE
-[[vk::binding(0, 0)]] StructuredBuffer<uint> imageIn;
-[[vk::binding(1, 0)]] StructuredBuffer<uint> maskIn;
-[[vk::binding(2, 0)]] RWStructuredBuffer<uint> imageOut;
-[[vk::binding(3, 0)]] RWStructuredBuffer<uint> maskOut;
-// pc: w, h (the decimated size), inW
-
-[shader("compute")]
-[numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID)
-{
-    const int w = int(pc[0]), h = int(pc[1]), x = int(id.x), y = int(id.y);
-    if (x >= w || y >= h) return;
-    const int from = (2 * y) * int(pc[2]) + 2 * x;
-    imageOut[y * w + x] = imageIn[from];
-    maskOut[y * w + x] = maskIn[from];
-}
-
-#elif STAGE == 5  // MODE
-[[vk::binding(0, 0)]] StructuredBuffer<uint> imageIn;
-[[vk::binding(1, 0)]] RWStructuredBuffer<uint> imageOut;
-// pc: w, h
+#elif STAGE == 5  // MODE, and DECIMATE
+// A scale's image and mask are the scale before's filtered image and mask
+// DECIMATEd (the pixel at twice its coordinates): read here every `step`-th
+// pixel of every step-th row (step 2; 1 at scale 0, whose image and mask
+// FRONT wrote), and the mode filter done in shared memory on a 16 x 16 tile
+// and the pixel around it; the scale's mask is written too (step > 1).
+[[vk::binding(0, 0)]] StructuredBuffer<uint> imageIn;   // the scale before's, filtered (scale 0: its own)
+[[vk::binding(1, 0)]] RWStructuredBuffer<uint> imageOut;  // the scale's, filtered
+[[vk::binding(2, 0)]] StructuredBuffer<uint> maskIn;    // the scale before's (scale 0: its own)
+[[vk::binding(3, 0)]] RWStructuredBuffer<uint> maskOut;   // the scale's (step > 1)
+// pc: w, h (the scale's), imageIn's width, step
 
 uint min3(uint a, uint b, uint c)
 {
@@ -283,10 +273,16 @@ uint mode3(uint a, uint b, uint c)
     return min3(a, b, c);
 }
 
+// The scale's pixel (x, y): imageIn's at every step-th column and row.
+uint at(int x, int y)
+{
+    return imageIn[(y * int(pc[3])) * int(pc[2]) + x * int(pc[3])];
+}
+
 uint across(int x, int y, int w)
 {
-    if (x == 0 || x == w - 1) return imageIn[y * w + x];
-    return mode3(imageIn[y * w + x - 1], imageIn[y * w + x], imageIn[y * w + x + 1]);
+    if (x == 0 || x == w - 1) return at(x, y);
+    return mode3(at(x - 1, y), at(x, y), at(x + 1, y));
 }
 
 [shader("compute")]
@@ -295,8 +291,11 @@ void main(uint3 id : SV_DispatchThreadID)
 {
     const int w = int(pc[0]), h = int(pc[1]), x = int(id.x), y = int(id.y);
     if (x >= w || y >= h) return;
+    const int step = int(pc[3]);
+    if (step > 1)
+        maskOut[y * w + x] = maskIn[(y * step) * int(pc[2]) + x * step];
     if (y == 0 || y == h - 1)
-        imageOut[y * w + x] = imageIn[y * w + x];
+        imageOut[y * w + x] = at(x, y);
     else
         imageOut[y * w + x] = mode3(across(x, y - 1, w), across(x, y, w), across(x, y + 1, w));
 }

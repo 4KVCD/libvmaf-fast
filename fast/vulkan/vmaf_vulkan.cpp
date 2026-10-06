@@ -1857,9 +1857,11 @@ int vv_context::enable_cambi(const double *values)
             return error;
         if (int error = create_buffer(cambiC[scale], n * 4, false))
             return error;
-        if (decimated) {
+        if (scale == 0 && c.speedup) {  // FRONT's (the other scales' are read from it)
             if (int error = create_buffer(cambiRaw[scale], n * 4, false))
                 return error;
+        }
+        if (decimated) {
             if (int error = create_buffer(cambiMask[scale], n * 4, false))
                 return error;
         }
@@ -1903,28 +1905,24 @@ int vv_context::enable_cambi(const double *values)
                                            Bound(c.speedup ? &cambiMask[0] : &cambiMaskFull), Bound(&acc) };
             });
     }
-    Buffer *image = &cambiImage, *mask = &cambiMaskFull;
-    int inW = w;
+    // Each scale's image is the one before's filtered one decimated, its mask
+    // the one before's decimated: MODE reads them every other pixel and row.
+    Buffer *image = c.speedup ? &cambiRaw[0] : &cambiImage;
+    Buffer *mask = c.speedup ? &cambiMask[0] : &cambiMaskFull;
+    int inW = c.scale_w[0];
     // The scales' c-values (each from its filtered image and mask) after all
     // of those, together: the small scales' few workgroups, one row after
     // another, took about as long as scale 0's, the GPU mostly idle.
     std::vector<Pass> cvalues;
     for (int scale = 0; scale < V1_CAMBI_SCALES && !error; ++scale) {
         const int sw = c.scale_w[scale], sh = c.scale_h[scale];
-        if (scale == 0 && c.speedup) {  // FRONT wrote them
-            image = &cambiRaw[scale];
-            mask = &cambiMask[scale];
-        } else if (scale > 0) {
-            const uint32_t constants[] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)inW };
-            error = add_pass(scored, kShader_cambi_decimate, { image, mask, &cambiRaw[scale], &cambiMask[scale] },
+        {
+            Buffer *const maskIn = mask;
+            if (scale > 0)
+                mask = &cambiMask[scale];  // MODE decimates it
+            const uint32_t constants[] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)inW, scale > 0 ? 2u : 1u };
+            error = add_pass(scored, kShader_cambi_mode, { image, &cambiFiltered[scale], maskIn, mask },
                              constants, sizeof constants, groups(sw, 16), groups(sh, 16));
-            image = &cambiRaw[scale];
-            mask = &cambiMask[scale];
-        }
-        if (!error) {
-            const uint32_t constants[] = { (uint32_t)sw, (uint32_t)sh };
-            error = add_pass(scored, kShader_cambi_mode, { image, &cambiFiltered[scale] }, constants, sizeof constants,
-                             groups(sw, 16), groups(sh, 16));
         }
         if (!error) {
             // The sliding counts (CVALUES_SLIDE) for windows of at most 65.
@@ -1943,8 +1941,8 @@ int vv_context::enable_cambi(const double *values)
                           : add_pass(cvalues, kShader_cambi_cvalues, { &cambiFiltered[scale], mask, &cambiC[scale],
                                      &cambiReciprocal }, constants, sizeof constants, groups(sw, 16), groups(sh, 16));
         }
-        inW = sw;
         image = &cambiFiltered[scale];
+        inW = sw;
     }
     for (size_t i = 0; i < cvalues.size(); ++i) {
         cvalues[i].overlapNext = i + 1 < cvalues.size();
