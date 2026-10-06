@@ -405,26 +405,30 @@ groupshared uint gCounts[VALUES * WORDS];  // [value - the window's first][colum
 groupshared uint gWindows;                 // the windows the tile's pixels are in (bits)
 groupshared uint gRowWindows[MAX_ROWS];   // and each row's
 
+// A pixel not counted (above every window's values: one compare tells).
+#define NONE 0x10000
+
 // Row r's pixel in local column lc: its value less the band's base if it is
-// masked and in the band (counted), else -1. Read ahead of its use: the
+// masked and in the band (counted), else NONE. Read ahead of its use: the
 // loads are what a row's step waits for.
 int pixel_compact(int r, int x0, int pad, uint lc)
 {
     const int w = int(pc[0]), h = int(pc[1]);
     const int col = x0 - pad + int(lc);
-    if (r < 0 || r >= h || col < 0 || col >= w || int(lc) >= S + 2 * pad) return -1;
+    if (r < 0 || r >= h || col < 0 || col >= w || int(lc) >= S + 2 * pad) return NONE;
     const int compact = int(image[r * w + col]) - int(pc[4]);
-    return mask[r * w + col] != 0 && compact >= 0 && compact < int(pc[5]) ? compact : -1;
+    return mask[r * w + col] != 0 && compact >= 0 && compact < int(pc[5]) ? compact : NONE;
 }
 
 // A counted pixel of local column lc added (or taken away), if its value is
 // in the window that starts at `first`.
 void count_pixel(int compact, uint lc, int first, bool remove)
 {
-    const int local = compact - first;
-    if (compact < 0 || local < 0 || local >= VALUES) return;
+    const uint local = uint(compact - first);  // (NONE and values below the window: past VALUES too)
+    if (local >= VALUES) return;
     const uint one = 1u << ((lc & 3u) * 8u);
-    InterlockedAdd(gCounts[uint(local) * WORDS + (lc >> 2)], remove ? 0u - one : one);
+    // (local below 64: masked so, the compiler multiplies in 24 bits)
+    InterlockedAdd(gCounts[(local & 63u) * WORDS + (lc >> 2)], remove ? 0u - one : one);
 }
 
 #define MAX_WORDS ((2 * MAX_PAD + 3) / 4 + 1)  // the words a window's 2 * pad + 1 columns are in, at most
@@ -434,7 +438,7 @@ void count_pixel(int compact, uint lc, int first, bool remove)
 // left out), so that their reads are made together.
 uint window_count(int local, uint t, int pad)
 {
-    const uint base = uint(local) * WORDS + (t >> 2), last = t + uint(2 * pad);
+    const uint base = (uint(local) & 63u) * WORDS + (t >> 2), last = t + uint(2 * pad);  // (local 0 .. 63: in 24 bits)
     const uint words = (last >> 2) - (t >> 2);  // the last's, from the first
     uint sum = 0;
     [unroll] for (uint k = 0; k < MAX_WORDS; ++k) {
@@ -498,8 +502,8 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex)
         for (int r0 = ys - pad; r0 < ys + pad; r0 += 8) {
             int v[16];
             [unroll] for (int j = 0; j < 8; ++j) {
-                v[j] = r0 + j < ys + pad ? pixel_compact(r0 + j, x0, pad, t) : -1;
-                v[8 + j] = r0 + j < ys + pad ? pixel_compact(r0 + j, x0, pad, t + 64) : -1;
+                v[j] = r0 + j < ys + pad ? pixel_compact(r0 + j, x0, pad, t) : NONE;
+                v[8 + j] = r0 + j < ys + pad ? pixel_compact(r0 + j, x0, pad, t + 64) : NONE;
             }
             [unroll] for (int j = 0; j < 8; ++j) {
                 count_pixel(v[j], t, first, false);
@@ -509,8 +513,8 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex)
         // Each row's step: its entering and leaving rows' pixels, and its own
         // (the tile's column), read one step ahead.
         int add0 = pixel_compact(ys + pad, x0, pad, t), add1 = pixel_compact(ys + pad, x0, pad, t + 64);
-        int remove0 = -1, remove1 = -1;
-        int own = x < w ? pixel_compact(ys, x0, pad, t + uint(pad)) : -1;
+        int remove0 = NONE, remove1 = NONE;
+        int own = x < w ? pixel_compact(ys, x0, pad, t + uint(pad)) : NONE;
         for (int y = ys; y <= ye; ++y) {
             const int a0 = add0, a1 = add1, r0 = remove0, r1 = remove1, o = own;
             if (y < ye) {
@@ -518,7 +522,7 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex)
                 add1 = pixel_compact(y + 1 + pad, x0, pad, t + 64);
                 remove0 = pixel_compact(y - pad, x0, pad, t);
                 remove1 = pixel_compact(y - pad, x0, pad, t + 64);
-                own = x < w ? pixel_compact(y + 1, x0, pad, t + uint(pad)) : -1;
+                own = x < w ? pixel_compact(y + 1, x0, pad, t + uint(pad)) : NONE;
             }
             count_pixel(a0, t, first, false);
             count_pixel(a1, t + 64, first, false);
@@ -526,7 +530,7 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex)
             count_pixel(r1, t + 64, first, true);
             if ((gRowWindows[y - y0] & bit) == 0) continue;  // nothing to read: no barrier
             GroupMemoryBarrierWithGroupSync();
-            if (o >= 0 && o / CORE == k) {
+            if (o != NONE && o / CORE == k) {
                 const int compact = o, I = o + bandBase;
                 float c = 0.0;
                 const int local = compact - first;  // 4 .. 59: its value +- 4 are in the window
