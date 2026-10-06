@@ -183,18 +183,17 @@ static const int kShiftSq[3] = { 30, 30, 30 };
 #define F_WORDS 6
 #endif
 groupshared uint gF[HX * HY * F_WORDS];
-// Each of the tile's rows' sums, [row][limit * 3 + band][copy], 64-bit as
-// two words: zeroed at the start, added to after the first barrier. A
-// thread adds into copy tx % ROW_COPIES: the row's 16 threads' atomic adds
-// to the same words wait on each other. At scales 1-3, four copies (Core
-// Ultra 9 285K's iGPU, 4K: 0.973 -> 0.935 ms); at scale 0 they gained
-// nothing.
-#if SCALE0
-#define ROW_COPIES 1
-#else
+// Scales 1-3: each of the tile's rows' sums, [row][limit * 3 + band][copy],
+// 64-bit as two words: zeroed at the start, added to after the first
+// barrier. A thread adds into copy tx % ROW_COPIES: the row's 16 threads'
+// atomic adds to the same words wait on each other (Core Ultra 9 285K's
+// iGPU, 4K: 0.973 -> 0.935 ms with four). Scale 0's threads add their sums
+// to rowSums themselves, no group memory and no barrier (1.081 -> 1.048
+// ms; at scales 1-3, 0.935 -> 0.991).
+#if !SCALE0
 #define ROW_COPIES 4
-#endif
 groupshared uint gRows[TY * 12 * ROW_COPIES];
+#endif
 
 // adm_decouple.slang's main (BOTH, VARIANT 0) for the position at `from`:
 // both limits' restored, csfA and csfF of its three bands.
@@ -319,8 +318,10 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
     const int x0 = P_startCol + int(group.x) * TX, y0 = P_startRow + int(group.y) * TY;
     const int tx = int(local % uint(TX)), ty = int(local / uint(TX));
+#if !SCALE0
     for (uint z = local; z < uint(TY * 12 * ROW_COPIES); z += THREADS)
         gRows[z] = 0;
+#endif
     // The thread's own position first (its restored and csfA kept), then the
     // positions around the tile, each decoupled once. Positions outside the
     // band images are not; contrast masking never reads them.
@@ -397,8 +398,18 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
             }
         }
     }
-    // Each row's part of the tile: added up in group memory (common.slang's
-    // acc_add64, there), then into rowSums.
+    // Each row's part of the tile: scale 0's added to rowSums by each thread;
+    // the other scales' added up in group memory (common.slang's acc_add64,
+    // there), then into rowSums.
+#if SCALE0
+    if (i < P_endRow) {
+        for (int k = 0; k < 6; ++k) {
+            const uint64_t value = uint64_t(sums[k / 3][k % 3]);
+            if (value != 0)
+                acc_add64(rowSums, P_rowSlot + uint(k * (P_endRow - P_startRow) + i - P_startRow), value);
+        }
+    }
+#else
     for (int k = 0; k < 6; ++k) {
         const uint64_t value = uint64_t(sums[k / 3][k % 3]);
         if (value != 0) {
@@ -421,4 +432,5 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         if (ri < P_endRow && total != 0)
             acc_add64(rowSums, P_rowSlot + uint(k * (P_endRow - P_startRow) + ri - P_startRow), total);
     }
+#endif
 }
