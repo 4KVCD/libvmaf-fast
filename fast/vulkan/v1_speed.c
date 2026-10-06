@@ -5,7 +5,9 @@
 // License; see LICENSE at the root of this repository.
 //
 // VMAF v1's SpEED chroma after the GPU's filter_and_downscale (v1_speed.h).
-// The sections marked "as written" are libvmaf's lines unchanged; the
+// The sections marked "as written" are libvmaf's lines unchanged (but for
+// matrix_mul and solve_triangular_system's loop, marked NOT as written: the
+// same arithmetic, four elements at a time); the
 // covariance kernels are libvmaf's x86/speed_avx2.c and speed_avx512.c,
 // compiled with /arch:AVX2 and /arch:AVX512 as libvmaf's meson.build compiles
 // them, and chosen as speed_init chooses (libvmaf is built with HAVE_AVX512).
@@ -169,16 +171,42 @@ static void matrix_copy(Matrix *dst, const Matrix *src)
     }
 }
 
+// NOT as written: speed.c's matrix_mul, the same sums in the same order --
+// dst[i][j] from 0, plus x[i][k] * y[k][j] for k from 0 up, each product and
+// each sum rounded to float (SSE's mulps and addps, as the loop as written
+// compiles to) -- four of a row's elements at a time in registers. The loop
+// as written goes through dst in memory for every product (dst might alias x
+// or y, which none of speed.c's calls do): most of est_params' time.
 static void matrix_mul(Matrix *dst, const Matrix *x, const Matrix *y)
 {
     assert(x->cols == y->rows);
-    matrix_zero(dst);
-    for (int i = 0; i < x->rows; i++) {
-        for (int k = 0; k < x->cols; k++) {
-            for (int j = 0; j < y->cols; j++) {
-                dst->data[i * dst->cols + j] +=
-                    x->data[i * x->cols + k] * y->data[k * y->cols + j];
+    const int rows = x->rows, inner = x->cols, cols = y->cols;
+    for (int i = 0; i < rows; i++) {
+        const float *xi = x->data + (size_t)i * x->cols;
+        float *di = dst->data + (size_t)i * dst->cols;
+        int j = 0;
+        for (; j + 8 <= cols; j += 8) {
+            __m128 a = _mm_setzero_ps(), b = _mm_setzero_ps();
+            for (int k = 0; k < inner; k++) {
+                const __m128 xk = _mm_set1_ps(xi[k]);
+                const float *yk = y->data + (size_t)k * cols + j;
+                a = _mm_add_ps(a, _mm_mul_ps(xk, _mm_loadu_ps(yk)));
+                b = _mm_add_ps(b, _mm_mul_ps(xk, _mm_loadu_ps(yk + 4)));
             }
+            _mm_storeu_ps(di + j, a);
+            _mm_storeu_ps(di + j + 4, b);
+        }
+        for (; j + 4 <= cols; j += 4) {
+            __m128 a = _mm_setzero_ps();
+            for (int k = 0; k < inner; k++)
+                a = _mm_add_ps(a, _mm_mul_ps(_mm_set1_ps(xi[k]), _mm_loadu_ps(y->data + (size_t)k * cols + j)));
+            _mm_storeu_ps(di + j, a);
+        }
+        for (; j < cols; j++) {
+            __m128 a = _mm_setzero_ps();
+            for (int k = 0; k < inner; k++)
+                a = _mm_add_ss(a, _mm_mul_ss(_mm_set_ss(xi[k]), _mm_set_ss(y->data[(size_t)k * cols + j])));
+            di[j] = _mm_cvtss_f32(a);
         }
     }
 }
@@ -616,7 +644,21 @@ static int solve_triangular_system(const Matrix *R, Matrix *X, const Matrix *B)
         if (fabsf(denominator) < EIGENVALUE_EPS) {
             return -EINVAL;
         }
-        for (int j = 0; j < X->cols; j++) {
+        // NOT as written: the same steps, four columns at a time (see
+        // matrix_mul): from B, less X[k][j] * R[i][k] for k up from i + 1,
+        // then divided, each rounded to float.
+        const int cols = X->cols;
+        const __m128 divisor = _mm_set1_ps(denominator);
+        int j = 0;
+        for (; j + 4 <= cols; j += 4) {
+            __m128 independent_term = _mm_loadu_ps(B->data + (size_t)i * B->cols + j);
+            for (int k = i + 1; k < R->rows; k++) {
+                independent_term = _mm_sub_ps(independent_term,
+                    _mm_mul_ps(_mm_loadu_ps(X->data + (size_t)k * cols + j), _mm_set1_ps(R->data[i * R->cols + k])));
+            }
+            _mm_storeu_ps(X->data + (size_t)i * cols + j, _mm_div_ps(independent_term, divisor));
+        }
+        for (; j < cols; j++) {
             float independent_term = B->data[i * B->cols + j];
             for (int k = i + 1; k < R->rows; k++) {
                 independent_term -=
