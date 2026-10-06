@@ -77,12 +77,15 @@ groupshared int gTotals[WORDS];
 
 
 // A tap's samples, the reference's and the distorted's, at a row.
-uint2 samples_at(int x, int row)
+// A tap's samples, the reference's and the distorted's, from the word at
+// `at` (its row's first word plus the column's): `shift` and `mask` pick the
+// column's sample out of it (pictures of 8 or 16 bits a sample).
+uint2 samples_at(int at, uint shift, uint mask)
 {
 #if SRC_PICTURE
-    return uint2(pixel(refIn, x, row, pc.stride), pixel(disIn, x, row, pc.stride));
+    return uint2((refIn[at] >> shift) & mask, (disIn[at] >> shift) & mask);
 #else
-    const uint word = refIn[row * pc.stride + x];
+    const uint word = refIn[at];
     return uint2(word & 0xFFFFu, word >> 16);
 #endif
 }
@@ -101,16 +104,31 @@ uint2 samples_at(int x, int row)
 // below 2^32.
 void vertical(int x, int y, uint at)
 {
-    int rows[FW];
+    // Each tap's word: its row's first (rows inside the picture a stride
+    // apart, the others mirrored) plus the column's.
+#if SRC_PICTURE && BPC16
+    const int column = x >> 1;
+    const uint shift = uint(x & 1) * 16, mask = 0xFFFFu;
+#elif SRC_PICTURE
+    const int column = x >> 2;
+    const uint shift = uint(x & 3) * 8, mask = 0xFFu;
+#else
+    const int column = x;
+    const uint shift = 0, mask = 0;
+#endif
+    int words[FW];
     if (y >= FW / 2 && y + FW / 2 < pc.h) {
-        for (int fi = 0; fi < FW; ++fi)
-            rows[fi] = y - FW / 2 + fi;
+        int at = (y - FW / 2) * pc.stride + column;
+        for (int fi = 0; fi < FW; ++fi) {
+            words[fi] = at;
+            at += pc.stride;
+        }
     } else {
         for (int fi = 0; fi < FW; ++fi) {
             int row = abs(y - FW / 2 + fi);
             if (row >= pc.h)
                 row = 2 * pc.h - row - 2;
-            rows[fi] = row;
+            words[fi] = row * pc.stride + column;
         }
     }
     const bool nextRow = (y & 1) == 0;  // the next scale's samples: even rows
@@ -119,7 +137,7 @@ void vertical(int x, int y, uint at)
     for (int fi = 0; fi <= FW / 2; ++fi) {
         const int fj = FW - 1 - fi;
         const bool pair = fi < fj;
-        const uint2 a = samples_at(x, rows[fi]), b = pair ? samples_at(x, rows[fj]) : uint2(0, 0);
+        const uint2 a = samples_at(words[fi], shift, mask), b = pair ? samples_at(words[fj], shift, mask) : uint2(0, 0);
         const uint coefficient = kVifFilter[SCALE][fi];
         mu1 += coefficient * (a.x + b.x);
         mu2 += coefficient * (a.y + b.y);
