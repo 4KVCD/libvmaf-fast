@@ -132,16 +132,22 @@ void main(uint3 group : SV_GroupID, uint3 lid : SV_GroupThreadID, uint local : S
     if ((seen & above) != 0)
         gWide = 1;
 #endif
-    // Two columns' vertical sums a word.
-    for (uint e = local; e < uint(TH * IN_W / 2); e += uint(TW / 2 * TH)) {
-        const uint row = e / uint(IN_W / 2), pair = e % uint(IN_W / 2);
-        uint low = 0, high = 0;
-        for (uint yf = 0; yf < 5; ++yf) {
-            const uint word = gIn[(row + yf) * uint(IN_W / 2) + pair];
-            low += kFilter[yf] * (word & 0xFFFFu);
-            high += kFilter[yf] * (word >> 16);
+    // Two columns' vertical sums a word, two rows a thread: the six words
+    // they read read once, and one round of the group's threads.
+    for (uint e = local; e < uint(TH / 2 * IN_W / 2); e += uint(TW / 2 * TH)) {
+        const uint row = 2 * (e / uint(IN_W / 2)), pair = e % uint(IN_W / 2);
+        uint words[6];
+        for (uint k = 0; k < 6; ++k)
+            words[k] = gIn[(row + k) * uint(IN_W / 2) + pair];
+        for (uint r = 0; r < 2; ++r) {
+            uint low = 0, high = 0;
+            for (uint yf = 0; yf < 5; ++yf) {
+                low += kFilter[yf] * (words[r + yf] & 0xFFFFu);
+                high += kFilter[yf] * (words[r + yf] >> 16);
+            }
+            gVertical[(row + r) * uint(IN_W / 2) + pair] = ((low + uint(P_addY)) >> uint(P_shiftY))
+                                                           | (((high + uint(P_addY)) >> uint(P_shiftY)) << 16);
         }
-        gVertical[e] = ((low + uint(P_addY)) >> uint(P_shiftY)) | (((high + uint(P_addY)) >> uint(P_shiftY)) << 16);
     }
     GroupMemoryBarrierWithGroupSync();
 
