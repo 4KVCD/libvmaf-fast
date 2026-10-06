@@ -215,15 +215,21 @@ bool fast_gain(int sigma12, int sigma1, int sigma2, out int sv, out int64_t term
     const uint64_t S = uint64_t(uint(sigma12)) * uint(sigma12);
     const int64_t divisor = int64_t(sigma1);
     const float inv = 1.0 / float(uint(sigma1));
-    const float estimate = float(S) * inv;
+    // The estimates below need not be exact (the remainder's checks decide):
+    // 64-bit integers made floats from their 32-bit words, and the
+    // corrections, within 2^26, made 32-bit integers, cheaper than 64-bit
+    // conversions on GPUs without 64-bit integer units.
+    const float estimate = (float(uint(S >> 32)) * 4294967296.0 + float(uint(S))) * inv;
     if (!(estimate < 70368744177664.0))  // 2^46
         return false;
     // Q = S / sigma1 exactly: the estimate (within 2^25), two corrections
     // from the remainder (each within 2^-21 of it), then the last unit.
-    int64_t q = int64_t(estimate);
+    const uint high = uint(estimate * 2.3283064e-10);  // estimate < 2^46: q in two words
+    int64_t q = int64_t((uint64_t(high) << 32) | uint(estimate - float(high) * 4294967296.0));
     int64_t rem = int64_t(S) - q * divisor;
     for (int round = 0; round < 2; ++round) {
-        const int64_t d = int64_t(floor(float(rem) * inv));
+        const float remainder = float(int(rem >> 32)) * 4294967296.0 + float(uint(rem));
+        const int64_t d = int64_t(int(floor(remainder * inv)));
         q += d;
         rem -= d * divisor;
     }
@@ -247,7 +253,8 @@ bool fast_gain(int sigma12, int sigma1, int sigma2, out int sv, out int64_t term
     const float whole = floor(phi);
     if (phi - whole < Er || whole + 1.0 - phi < Er)
         return false;
-    const int64_t residual = int64_t(sigma2) - q + int64_t(whole);
+    // whole and part (below) are within 2^13: c < 2^46 6.5536e-6 2^-17 < 2^12.
+    const int64_t residual = int64_t(sigma2) - q + int64_t(int(whole));
     sv = residual > 0 ? int(residual) : 0;  // residual <= sigma2
     // The gain terms, g capped at each limit.
     if (uint64_t(uint(sigma12)) > uint64_t(VIF_GAIN_A) * uint(sigma1)) {
@@ -258,7 +265,7 @@ bool fast_gain(int sigma12, int sigma1, int sigma2, out int sv, out int64_t term
         const float part = floor(psi);
         if (psi - part < Et || part + 1.0 - psi < Et)
             return false;
-        terms[0] = q + int64_t(part);
+        terms[0] = q + int64_t(int(part));
     }
     terms[1] = VIF_GAIN_B == VIF_GAIN_A || uint64_t(uint(sigma12)) <= uint64_t(VIF_GAIN_B) * uint(sigma1)
         ? terms[0] : int64_t(uint64_t(VIF_GAIN_B) * VIF_GAIN_B * uint64_t(sigma1));
