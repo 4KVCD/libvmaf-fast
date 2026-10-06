@@ -123,18 +123,16 @@ groupshared uint gZeroWords[MAX_SPAN * 2];  // DERIV's flags, a bit per pixel, t
 
 // PRE (anti_dithering_filter, if pc[4]) at local (lx, ly), picture (x, y):
 // from its sample v and those right (r), below (d) and diagonally (rd).
+// (Each case's value calculated and one chosen: no branches but the dispatch's.)
 uint pre_of(uint v, uint r, uint d, uint rd, int lx, int ly, int x, int y)
 {
+    if (pc[4] == 0) return v;  // (no anti-dithering: the same for the whole dispatch)
     const int w = int(pc[0]), h = int(pc[1]), span = TILE * STEP + 8;
-    if (pc[4] != 0 && lx + 1 < span && ly + 1 < span && x >= 0 && x < w && y >= 0 && y < h) {
-        if (x < w - 1 && y < h - 1)
-            return (v + r + d + rd) >> 2;
-        if (y < h - 1)
-            return (v + d) >> 1;
-        if (x < w - 1)
-            return (v + r) >> 1;
-    }
-    return v;
+    const bool on = lx + 1 < span && ly + 1 < span && uint(x) < uint(w) && uint(y) < uint(h);
+    const bool right = x < w - 1, down = y < h - 1;
+    const uint both = (v + r + d + rd) >> 2, onlyDown = (v + d) >> 1, onlyRight = (v + r) >> 1;
+    const uint filtered = right ? (down ? both : onlyRight) : (down ? onlyDown : v);
+    return on ? filtered : v;
 }
 
 uint to10_of(uint v)
