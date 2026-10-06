@@ -297,6 +297,16 @@ int cm_neighbour(int n, int size)
     return n == -1 ? 1 : (n == size ? size - 1 : n);
 }
 
+// A sum over the subgroup's lanes: in 32 bits when every lane's value is
+// small enough for the sum to fit (nearly always), else in 64. Exact either way.
+int64_t wave_sum64(int64_t v)
+{
+    const int64_t limit = int64_t(0x80000000u / WaveGetLaneCount());
+    if (WaveActiveAllTrue(v >= 0 && v < limit))
+        return int64_t(WaveActiveSum(uint(v)));
+    return WaveActiveSum(v);
+}
+
 #if SLIDE
 // The workgroups slide down the band: 128 threads, a column each -- 126 of
 // the workgroup's own and one either side, which the masking reads -- over
@@ -404,11 +414,12 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         }
         // The row's sums of these columns, wave by wave, then the waves, to `partial`.
         [unroll] for (int s = 0; s < 6; ++s) {
-            const int64_t total = WaveActiveSum(cm[s]);
+            const int64_t total = wave_sum64(cm[s]);
             if (WaveIsFirstLane()) gRow[wave * 9 + uint(s)] = total;
         }
         [unroll] for (int b = 0; b < 3; ++b) {
-            const int64_t total = int64_t(WaveActiveSum(ownColumn ? den[b] : 0ull));
+            // (den's terms are below 2^63: as int64_t, never negative.)
+            const int64_t total = wave_sum64(ownColumn ? int64_t(den[b]) : 0);
             if (WaveIsFirstLane()) gRow[wave * 9 + 6 + uint(b)] = total;
         }
         GroupMemoryBarrierWithGroupSync();

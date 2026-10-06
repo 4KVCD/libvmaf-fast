@@ -626,7 +626,11 @@ struct vv_context {
     std::vector<int32_t> admParamValues;
     int skip = 0;  // timing tests: 1 = no motion, 2 = no VIF, 4 = no ADM
     int passLimit = 0;  // timing tests: only the first N scored passes
-    int decoupleVariant = 0;  // adm_decouple_0's VARIANT (shaders/adm_decouple.slang)
+    int decoupleVariant = 0;
+    // Subgroups of 32 lanes for the shaders that are faster in them (on an AMD
+    // GPU, whose driver gives compute shaders 64 lanes unless asked): 32 if the
+    // GPU takes a required size (VK_EXT_subgroup_size_control), else 0.
+    uint32_t narrowSubgroup = 0;  // adm_decouple_0's VARIANT (shaders/adm_decouple.slang)
     uint32_t strideBytes = 0, planeBytes = 0;
     // The frames' luma planes come from another API on this GPU (a decoder's
     // CUDA, or its own Vulkan device), which writes them into the slots'
@@ -861,6 +865,16 @@ int vv_context::create_pipeline(int shader, uint32_t bindings)
     info.stage.module = pipeline.module;
     info.stage.pName = "main";
     info.layout = pipeline.layout;
+    // The shaders faster in subgroups of 32 lanes on a Radeon 780M: CAMBI's
+    // sliding c-values and VMAF v1's fused ADM (the others are as fast or
+    // faster in its default 64).
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT size = {
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT };
+    size.requiredSubgroupSize = narrowSubgroup;
+    const bool narrow = shader == kShader_cambi_cvalues_slide_16 || shader == kShader_cambi_cvalues_slide
+                        || shader == kShader_adm_fused_0_8 || shader == kShader_adm_fused_0_16 || shader == kShader_adm_fused;
+    if (narrowSubgroup && narrow)
+        info.stage.pNext = &size;
     if (vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline.pipeline) != VK_SUCCESS)
         return fail(-1, std::string("the GPU driver could not compile the shader ") + kShaders[shader].name);
     return 0;
@@ -1533,7 +1547,30 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     skip = (flags >> 16) & 7;
     passLimit = (flags >> 20) & 0xFF;
     shared = (flags >> 19) & 1;
-    const char *extensions[] = { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME };
+    const char *extensions[2] = { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME, nullptr };
+    uint32_t extensionCount = shared ? 1 : 0;
+    {   // Subgroups of 32 lanes where they are faster (narrowSubgroup).
+        uint32_t count = 0;
+        api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> listed(count);
+        if (count)
+            api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, listed.data());
+        bool found = false;
+        for (uint32_t i = 0; i < count; ++i)
+            found = found || !strcmp(listed[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+        if (found) {
+            VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sizes = {
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT };
+            VkPhysicalDeviceProperties2 properties2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+            properties2.pNext = &sizes;
+            api->vkGetPhysicalDeviceProperties2(physical, &properties2);
+            if (sizes.minSubgroupSize <= 32 && sizes.maxSubgroupSize >= 32 && sizes.maxSubgroupSize > 32
+                && (sizes.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
+                narrowSubgroup = 32;
+                extensions[extensionCount++] = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME;
+            }
+        }
+    }
     if (shared) {
         uint32_t count = 0;
         api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr);
@@ -1584,10 +1621,13 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
     deviceInfo.pEnabledFeatures = &enabled;
-    if (shared) {
-        deviceInfo.enabledExtensionCount = 1;
-        deviceInfo.ppEnabledExtensionNames = extensions;
-    }
+    deviceInfo.enabledExtensionCount = extensionCount;
+    deviceInfo.ppEnabledExtensionNames = extensionCount ? extensions : nullptr;
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sizeControl = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT };
+    sizeControl.subgroupSizeControl = VK_TRUE;
+    if (narrowSubgroup)
+        deviceInfo.pNext = &sizeControl;
     VkResult result = api->vkCreateDevice(physical, &deviceInfo, nullptr, &device);
     if (result != VK_SUCCESS) {
         device = VK_NULL_HANDLE;
