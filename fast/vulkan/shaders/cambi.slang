@@ -43,6 +43,21 @@
 #define STATE_INEXACT 26
 #define STATE_DONE 31
 
+// filter_mode's mode of 3 (the smallest when all differ).
+uint min3(uint a, uint b, uint c)
+{
+    if (a <= b && a <= c) return a;
+    if (b <= c) return b;
+    return c;
+}
+
+uint mode3(uint a, uint b, uint c)
+{
+    if (a == b || a == c) return a;
+    if (b == c) return b;
+    return min3(a, b, c);
+}
+
 #if STAGE == 1  // PRE
 [[vk::binding(0, 0)]] StructuredBuffer<uint> picture;
 [[vk::binding(1, 0)]] RWStructuredBuffer<uint> image;
@@ -82,7 +97,7 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 
 #elif STAGE == 14  // FRONT
-// PRE, DERIV and MASK in one pass, and DECIMATE's choice of pixels (STEP 2:
+// PRE, DERIV, MASK and scale 0's MODE in one pass, and DECIMATE's choice of pixels (STEP 2:
 // every other row and column, for cambi_high_res_speedup; 1: all): a
 // workgroup takes 16 x 16 of the outputs, their 16 STEP x 16 STEP pixels of
 // the picture, and works in shared memory on those and the 3 + 1 + 1 pixels
@@ -218,9 +233,21 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         sum += countbits(uint(row >> uint(lx - 3)) & 0x7Fu);
     }
     const uint at = uint(outY) * pc[8] + uint(outX);
-    const int i = ly * span + lx;
-    imageOut[at] = pre_of(gTen[i], gTen[i + 1], gTen[i + span], gTen[i + span + 1], lx, ly,
-                          ox + lx, oy + ly);
+    // MODE of scale 0 too: filter_mode of the outputs' PRE values, the 3 x 3
+    // around it STEP pixels apart (the outputs' picture pixels), across then
+    // down; the first and last rows and columns of the outputs as they are.
+    uint pre[3][3];
+    [unroll] for (int dy = 0; dy < 3; ++dy) {
+        [unroll] for (int dx = 0; dx < 3; ++dx) {
+            const int px = lx + (dx - 1) * step, py = ly + (dy - 1) * step, i = py * span + px;
+            pre[dy][dx] = pre_of(gTen[i], gTen[i + 1], gTen[i + span], gTen[i + span + 1], px, py, ox + px, oy + py);
+        }
+    }
+    const int outW = int(pc[8]), outH = int(pc[9]);
+    uint across[3];
+    [unroll] for (int dy = 0; dy < 3; ++dy)
+        across[dy] = outX == 0 || outX == outW - 1 ? pre[dy][1] : mode3(pre[dy][0], pre[dy][1], pre[dy][2]);
+    imageOut[at] = outY == 0 || outY == outH - 1 ? pre[1][1] : mode3(across[0], across[1], across[2]);
     maskOut[at] = sum > pc[6] ? 1u : 0u;
 }
 
@@ -270,20 +297,6 @@ void main(uint3 id : SV_DispatchThreadID)
 [[vk::binding(2, 0)]] StructuredBuffer<uint> maskIn;    // the scale before's (scale 0: its own)
 [[vk::binding(3, 0)]] RWStructuredBuffer<uint> maskOut;   // the scale's (step > 1)
 // pc: w, h (the scale's), imageIn's width, step
-
-uint min3(uint a, uint b, uint c)
-{
-    if (a <= b && a <= c) return a;
-    if (b <= c) return b;
-    return c;
-}
-
-uint mode3(uint a, uint b, uint c)
-{
-    if (a == b || a == c) return a;
-    if (b == c) return b;
-    return min3(a, b, c);
-}
 
 // The scale's pixel (x, y): imageIn's at every step-th column and row.
 uint at(int x, int y)

@@ -667,8 +667,8 @@ struct vv_context {
     VkDeviceSize cambiKeepOffset[V1_CAMBI_SCALES] = {};  // each scale's place in a slot's cambiKeep (words)
     V1CambiOptions cambiOptions = {};
     V1CambiConstants cambiConst = {};
-    Buffer cambiImage, cambiMaskFull, cambiReciprocal, cambiHist, cambiState;
-    Buffer cambiRaw[V1_CAMBI_SCALES], cambiFiltered[V1_CAMBI_SCALES], cambiMask[V1_CAMBI_SCALES],
+    Buffer cambiMaskFull, cambiReciprocal, cambiHist, cambiState;
+    Buffer cambiFiltered[V1_CAMBI_SCALES], cambiMask[V1_CAMBI_SCALES],
         cambiC[V1_CAMBI_SCALES];
     int enable_cambi(const double *values);
 
@@ -1840,11 +1840,11 @@ int vv_context::enable_cambi(const double *values)
 
     const VkDeviceSize pixels = (VkDeviceSize)w * h;
     const int histWords = V1_CAMBI_SCALES * 3 * 4096;
-    // The full picture's image and mask only where scale 0 is the full picture
-    // (no speedup): FRONT writes scale 0's decimated ones otherwise.
+    // The full picture's mask only where scale 0 is the full picture (no
+    // speedup): FRONT writes scale 0's decimated one otherwise.
     const VkDeviceSize full = c.speedup ? 1 : pixels;
     struct { Buffer *buffer; VkDeviceSize bytes; } sized[] = {
-        { &cambiImage, full * 4 }, { &cambiMaskFull, full * 4 },
+        { &cambiMaskFull, full * 4 },
         { &cambiReciprocal, sizeof kCambiReciprocal }, { &cambiHist, (VkDeviceSize)histWords * 4 },
         { &cambiState, 36 * 4 },  // shaders/cambi.slang's state (STATE_*)
     };
@@ -1859,10 +1859,6 @@ int vv_context::enable_cambi(const double *values)
             return error;
         if (int error = create_buffer(cambiC[scale], n * 4, false))
             return error;
-        if (scale == 0 && c.speedup) {  // FRONT's (the other scales' are read from it)
-            if (int error = create_buffer(cambiRaw[scale], n * 4, false))
-                return error;
-        }
         if (decimated) {
             if (int error = create_buffer(cambiMask[scale], n * 4, false))
                 return error;
@@ -1903,18 +1899,19 @@ int vv_context::enable_cambi(const double *values)
                                        step, outW, outH };
         const int front = c.speedup ? (bpc > 8 ? kShader_cambi_front_16 : kShader_cambi_front_8)
                                     : (bpc > 8 ? kShader_cambi_front_16_1 : kShader_cambi_front_8_1);
+        // (scale 0's MODE too: it writes scale 0's filtered image)
         error = add_pass(scored, front,
-                         { &picDis, c.speedup ? &cambiRaw[0] : &cambiImage, c.speedup ? &cambiMask[0] : &cambiMaskFull,
+                         { &picDis, &cambiFiltered[0], c.speedup ? &cambiMask[0] : &cambiMaskFull,
                            &acc }, constants, sizeof constants, groups((int)outW, 16), groups((int)outH, 16));
         if (!error && direct)
             error = per_slot(scored, [&](Slot &slot) {
-                return std::vector<Bound>{ slot_dis(slot), Bound(c.speedup ? &cambiRaw[0] : &cambiImage),
+                return std::vector<Bound>{ slot_dis(slot), Bound(&cambiFiltered[0]),
                                            Bound(c.speedup ? &cambiMask[0] : &cambiMaskFull), Bound(&acc) };
             });
     }
     // Each scale's image is the one before's filtered one decimated, its mask
     // the one before's decimated: MODE reads them every other pixel and row.
-    Buffer *image = c.speedup ? &cambiRaw[0] : &cambiImage;
+    Buffer *image = &cambiFiltered[0];  // (FRONT's)
     Buffer *mask = c.speedup ? &cambiMask[0] : &cambiMaskFull;
     int inW = c.scale_w[0];
     // The scales' c-values (each from its filtered image and mask) after all
@@ -1923,7 +1920,7 @@ int vv_context::enable_cambi(const double *values)
     std::vector<Pass> cvalues;
     for (int scale = 0; scale < V1_CAMBI_SCALES && !error; ++scale) {
         const int sw = c.scale_w[scale], sh = c.scale_h[scale];
-        {
+        if (scale > 0) {  // (scale 0's: FRONT's)
             Buffer *const maskIn = mask;
             if (scale > 0)
                 mask = &cambiMask[scale];  // MODE decimates it
