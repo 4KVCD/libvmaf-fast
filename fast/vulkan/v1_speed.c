@@ -599,9 +599,61 @@ static void compute_eigenvalues(float *A_immutable, float *eigenvalues,
     compute_eigenvalues_tridiagonal(d, sd, eigenvalues, size);
 }
 
+// NOT as written: matrix_mul's sums (see it) for dst's rows from `row` and
+// columns from `col` only, of x[i][m] * y[m][j] for m from `first` (those
+// before it left out).
+static void matrix_mul_trailing(float *dst, const float *x, const float *y, int size, int row, int col,
+                                int first)
+{
+    for (int i = row; i < size; i++) {
+        const float *xi = x + (size_t)i * size;
+        float *di = dst + (size_t)i * size;
+        int j = col;
+        for (; j + 8 <= size; j += 8) {
+            __m128 a = _mm_setzero_ps(), b = _mm_setzero_ps();
+            for (int k = first; k < size; k++) {
+                const __m128 xk = _mm_set1_ps(xi[k]);
+                const float *yk = y + (size_t)k * size + j;
+                a = _mm_add_ps(a, _mm_mul_ps(xk, _mm_loadu_ps(yk)));
+                b = _mm_add_ps(b, _mm_mul_ps(xk, _mm_loadu_ps(yk + 4)));
+            }
+            _mm_storeu_ps(di + j, a);
+            _mm_storeu_ps(di + j + 4, b);
+        }
+        for (; j + 4 <= size; j += 4) {
+            __m128 a = _mm_setzero_ps();
+            for (int k = first; k < size; k++)
+                a = _mm_add_ps(a, _mm_mul_ps(_mm_set1_ps(xi[k]), _mm_loadu_ps(y + (size_t)k * size + j)));
+            _mm_storeu_ps(di + j, a);
+        }
+        for (; j < size; j++) {
+            __m128 a = _mm_setzero_ps();
+            for (int k = first; k < size; k++)
+                a = _mm_add_ss(a, _mm_mul_ss(_mm_set_ss(xi[k]), _mm_set_ss(y[(size_t)k * size + j])));
+            di[j] = _mm_cvtss_f32(a);
+        }
+    }
+}
+
 // Implementation of the QR decomposition algorithm with Householder
 // reflections for an arbitrary square matrix
 // https://www.cs.utexas.edu/users/flame/Notes/NotesOnHouseholderQR.pdf
+//
+// NOT as written: the two products of a step leave out what is 0. At step
+// k, vec[m] is +0 for m < k (tmp_z's column k above k, matrix_minor's 0s,
+// divided by the norm), so tmp_q's columns m < k are +-0 (-2 * vec[i] *
+// +0) and its rows i < k are +-0 but for the 1 on the diagonal; tmp_z's
+// rows m < k are 0 off the diagonal. A product that is +-0 leaves a sum
+// unchanged (each sum starts at +0 and adds products in order, so it is +0
+// or a nonzero value, never -0), so:
+//  - tmp_q tmp_z: of it, only the rows and columns past k are used (the
+//    next matrix_minor puts back the rest), and their sums' products for m
+//    < k are +-0 (tmp_q[i][m] * tmp_z[m][j], j > m): the sums from m = k;
+//  - tmp_q Q: its rows i >= k likewise, the sums from m = k; its rows i < k
+//    are Q's (1 * Q[i][j], all else +-0; Q has no -0, which the sum would
+//    make +0: its entries are sums or matrix_identity's).
+// That holds while vec is finite (+-0 times finite); if it is not, the
+// step's products are the whole ones.
 static void matrix_qr_decomposition(Matrix *A, Matrix *Q, Matrix *R,
                                     Matrix *tmp_q, Matrix *tmp_z)
 {
@@ -629,12 +681,25 @@ static void matrix_qr_decomposition(Matrix *A, Matrix *Q, Matrix *R,
         vec[k] += sign * norm;
 
         vector_div(vec, vector_norm(vec, size), vec, size);
+        bool finite = true;
+        for (int i = 0; i < size; i++)
+            finite = finite && isfinite(vec[i]);
         matrix_identity_minus_v_vt(tmp_q, vec);
 
-        matrix_mul(tmp_mul, tmp_q, tmp_z);
-        matrix_copy(tmp_z, tmp_mul);
-        matrix_mul(tmp_mul, tmp_q, Q);
-        matrix_copy(Q, tmp_mul);
+        if (!finite) {
+            matrix_mul(tmp_mul, tmp_q, tmp_z);
+            matrix_copy(tmp_z, tmp_mul);
+            matrix_mul(tmp_mul, tmp_q, Q);
+            matrix_copy(Q, tmp_mul);
+            continue;
+        }
+        matrix_mul_trailing(tmp_mul->data, tmp_q->data, tmp_z->data, size, k + 1, k + 1, k);
+        for (int i = k + 1; i < size; i++)
+            memcpy(tmp_z->data + (size_t)i * size + k + 1, tmp_mul->data + (size_t)i * size + k + 1,
+                   (size_t)(size - k - 1) * sizeof(float));
+        matrix_mul_trailing(tmp_mul->data, tmp_q->data, Q->data, size, k, 0, k);
+        memcpy(Q->data + (size_t)k * size, tmp_mul->data + (size_t)k * size,
+               (size_t)(size - k) * size * sizeof(float));
     }
 
     matrix_mul(R, Q, A);
