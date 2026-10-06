@@ -639,6 +639,15 @@ struct vv_context {
     // driver (vv_shared_device).
     bool shared = false;
     PFN_vkGetMemoryWin32HandleKHR getMemoryHandle = nullptr;
+    // A decoder's timeline semaphore (vv_import_timeline): its GPU copies into
+    // the slots signal it, and a frame's submission waits for the value of its
+    // own (vv_commit_after), so that the decoder need not wait for its copies.
+    bool timelines = false;  // the device takes timeline semaphores from other APIs
+    VkSemaphore copied = VK_NULL_HANDLE;
+    uint64_t copiedValue = 0;  // the next commit's, 0: none
+    PFN_vkImportSemaphoreWin32HandleKHR importSemaphore = nullptr;
+    PFN_vkCreateSemaphore createSemaphore = nullptr;
+    PFN_vkDestroySemaphore destroySemaphore = nullptr;
     uint8_t deviceUuid[VK_UUID_SIZE] = {}, driverUuid[VK_UUID_SIZE] = {};
 
     Pipeline pipelines[kShaderCount];
@@ -730,6 +739,8 @@ vv_context::~vv_context()
     if (!device)
         return;
     vk.vkDeviceWaitIdle(device);
+    if (copied)
+        destroySemaphore(device, copied, nullptr);
     if (queryPool)
         vk.vkDestroyQueryPool(device, queryPool, nullptr);
     for (Slot &slot : slots) {
@@ -1547,7 +1558,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     skip = (flags >> 16) & 7;
     passLimit = (flags >> 20) & 0xFF;
     shared = (flags >> 19) & 1;
-    const char *extensions[2] = { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME, nullptr };
+    const char *extensions[4] = { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME, nullptr, nullptr, nullptr };
     uint32_t extensionCount = shared ? 1 : 0;
     {   // Subgroups of 32 lanes where they are faster (narrowSubgroup).
         uint32_t count = 0;
@@ -1577,11 +1588,29 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         std::vector<VkExtensionProperties> listed(count);
         if (count)
             api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, listed.data());
-        bool found = false;
-        for (uint32_t i = 0; i < count; ++i)
+        bool found = false, timeline = false, semaphores = false;
+        for (uint32_t i = 0; i < count; ++i) {
             found = found || !strcmp(listed[i].extensionName, extensions[0]);
+            timeline = timeline || !strcmp(listed[i].extensionName, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+            semaphores = semaphores || !strcmp(listed[i].extensionName, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+        }
         if (!found)
             return fail(-4, deviceName + " cannot share its memory with a decoder");
+        if (timeline && semaphores) {  // (else the decoder waits for its copies itself)
+            VkPhysicalDeviceTimelineSemaphoreFeatures has = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES };
+            VkPhysicalDeviceFeatures2 features2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+            features2.pNext = &has;
+            auto getFeatures2 = (PFN_vkGetPhysicalDeviceFeatures2)api->vkGetInstanceProcAddr(
+                api->instance, "vkGetPhysicalDeviceFeatures2");
+            if (getFeatures2) {
+                getFeatures2(physical, &features2);
+                timelines = has.timelineSemaphore == VK_TRUE;
+            }
+            if (timelines) {
+                extensions[extensionCount++] = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
+                extensions[extensionCount++] = VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME;
+            }
+        }
     }
     if (shared) {
         VkPhysicalDeviceIDProperties ids = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
@@ -1633,6 +1662,13 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     sizeControl.subgroupSizeControl = VK_TRUE;
     if (narrowSubgroup)
         deviceInfo.pNext = &sizeControl;
+    VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeature = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES };
+    timelineFeature.timelineSemaphore = VK_TRUE;
+    if (timelines) {
+        timelineFeature.pNext = (void *)deviceInfo.pNext;
+        deviceInfo.pNext = &timelineFeature;
+    }
     VkResult result = api->vkCreateDevice(physical, &deviceInfo, nullptr, &device);
     if (result != VK_SUCCESS) {
         device = VK_NULL_HANDLE;
@@ -1641,6 +1677,13 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
 #define X(name) vk.name = (PFN_##name)api->vkGetDeviceProcAddr(device, #name);
     VK_DEVICE_FUNCTIONS(X)
 #undef X
+    if (timelines) {
+        importSemaphore = (PFN_vkImportSemaphoreWin32HandleKHR)api->vkGetDeviceProcAddr(device,
+                                                                                        "vkImportSemaphoreWin32HandleKHR");
+        createSemaphore = (PFN_vkCreateSemaphore)api->vkGetDeviceProcAddr(device, "vkCreateSemaphore");
+        destroySemaphore = (PFN_vkDestroySemaphore)api->vkGetDeviceProcAddr(device, "vkDestroySemaphore");
+        timelines = importSemaphore && createSemaphore && destroySemaphore;
+    }
     vk.vkGetDeviceQueue(device, queueFamily, 0, &queue);
     if (shared) {
         getMemoryHandle = (PFN_vkGetMemoryWin32HandleKHR)api->vkGetDeviceProcAddr(device, "vkGetMemoryWin32HandleKHR");
@@ -2348,6 +2391,19 @@ int vv_context::commit(bool score)
     VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cb;
+    // After the decoder's copies of the frame into its slot (vv_commit_after).
+    VkTimelineSemaphoreSubmitInfo after = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+    const VkPipelineStageFlags afterStages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    const uint64_t afterValue = copiedValue;
+    if (copied && afterValue) {
+        after.waitSemaphoreValueCount = 1;
+        after.pWaitSemaphoreValues = &afterValue;
+        submitInfo.pNext = &after;
+        submitInfo.waitSemaphoreCount = 1;
+        submitInfo.pWaitSemaphores = &copied;
+        submitInfo.pWaitDstStageMask = &afterStages;
+    }
+    copiedValue = 0;
     VkResult result = vk.vkQueueSubmit(queue, 1, &submitInfo, slot.fence);
     if (result != VK_SUCCESS) {
         failed = true;
@@ -2445,6 +2501,47 @@ VV_EXPORT int vv_staging(vv_context *context, uint8_t **reference, uint8_t **dis
 }
 
 VV_EXPORT int vv_commit(vv_context *context, int score) { return context->commit(score != 0); }
+
+// For a context made with flag bit 19: a decoder's timeline semaphore (an
+// opaque Win32 handle of a VkSemaphore of the same GPU and driver, exported
+// by Vulkan), which its copies into the slots signal. The caller closes the
+// handle. 0, or negative (-4: the device takes no timeline semaphores; the
+// decoder then waits for its copies before vv_commit, as without).
+VV_EXPORT int vv_import_timeline(vv_context *context, void *handle)
+{
+    if (!context->shared || !context->timelines)
+        return fail(-4, "this GPU's Vulkan takes no timeline semaphores from other APIs");
+    if (context->copied)
+        return fail(-3, "a timeline semaphore is already imported");
+    VkSemaphoreTypeCreateInfo type = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    info.pNext = &type;
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    if (context->createSemaphore(context->device, &info, nullptr, &semaphore) != VK_SUCCESS)
+        return fail(-1, "vkCreateSemaphore failed");
+    VkImportSemaphoreWin32HandleInfoKHR import = { VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
+    import.semaphore = semaphore;
+    import.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+    import.handle = handle;
+    if (context->importSemaphore(context->device, &import) != VK_SUCCESS) {
+        context->destroySemaphore(context->device, semaphore, nullptr);
+        return fail(-4, "Vulkan cannot take the decoder's timeline semaphore");
+    }
+    context->copied = semaphore;
+    return 0;
+}
+
+// The next vv_commit's frame is in its slot once the imported timeline
+// semaphore reaches `value` (the decoder's last copy of it): its work on the
+// GPU waits for that, and the caller need not.
+VV_EXPORT int vv_commit_after(vv_context *context, uint64_t value)
+{
+    if (!context->copied)
+        return fail(-3, "no timeline semaphore is imported");
+    context->copiedValue = value;
+    return 0;
+}
 
 // For a context made with flag bit 19 (frames from GPU memory): the staging
 // buffer the next pair's luma planes are to be written into by the API that
