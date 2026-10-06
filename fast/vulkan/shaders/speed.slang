@@ -74,27 +74,42 @@ float value(uint plane, int x, int y)
     return sum;
 }
 
+// A thread per output and column of its square (64 / taps outputs a
+// workgroup): each column's vertical sum, then the output's thread adds the
+// columns across in order -- the same sums as one thread doing all of them,
+// with more threads to wait on the samples.
+groupshared float gColumn[64];
+
 [shader("compute")]
-[numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID)
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex)
 {
-    const int ox = int(id.x), oy = int(id.y), w = int(pc[0]), h = int(pc[1]);
+    const int w = int(pc[0]), h = int(pc[1]);
     const int ow = int(pc[4]), oh = int(pc[5]), taps = int(pc[6]), r = taps / 2;
-    const uint plane = id.z;
-    if (ox >= ow || oy >= oh) return;
+    const uint per = 64u / uint(taps), o = t / uint(taps), c = t % uint(taps);
+    const uint n = uint(ow * oh), out = group.x * per + o;
+    const bool active = o < per && out < 4 * n;
+    const uint plane = out / n, at = out % n;
+    const int ox = int(at % uint(ow)), oy = int(at / uint(ow));
     const int cx = ox * 16, cy = oy * 16;
-    precise float sum = 0.0;
-    for (int fj = 0; fj < taps; ++fj) {
-        const int x = mirror(cx - r + fj, w);
+    if (active) {
+        const int x = mirror(cx - r + int(c), w);
         precise float column = 0.0;
         for (int fi = 0; fi < taps; ++fi) {
             precise float product = filters[fi] * value(plane, x, mirror(cy - r + fi, h));
             column = column + product;
         }
-        precise float product = filters[fj] * column;
-        sum = sum + product;
+        gColumn[t] = column;
     }
-    operating[plane * uint(ow * oh) + uint(oy * ow + ox)] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    if (active && c == 0) {
+        precise float sum = 0.0;
+        for (int fj = 0; fj < taps; ++fj) {
+            precise float product = filters[fj] * gColumn[o * uint(taps) + uint(fj)];
+            sum = sum + product;
+        }
+        operating[plane * n + at] = sum;
+    }
 }
 
 #elif STAGE == 2  // BLUR

@@ -1927,11 +1927,11 @@ int vv_context::enable_speed(const double *values)
         const uint32_t dec[] = { (uint32_t)f.scaled_w, (uint32_t)f.scaled_h, chromaStrideBytes / 4,
                                  chromaPlaneBytes / 4, (uint32_t)f.operating_w, (uint32_t)f.operating_h,
                                  (uint32_t)f.antialias_taps, (uint32_t)bpc, inverseBits, f.scaled ? 1u : 0u };
+        const int perGroup = 64 / f.antialias_taps;  // outputs a workgroup (a thread per column of each)
         if (int error = add_pass(slot.speedPasses, kShader_speed_dec, { &slot.speedChroma, &speedFilterTaps,
-                                 &speedOperating, &speedScaling }, dec, sizeof dec, groups(f.operating_w, 16),
-                                 groups(f.operating_h, 16)))
+                                 &speedOperating, &speedScaling }, dec, sizeof dec,
+                                 groups(f.operating_w * f.operating_h * 4, perGroup), 1))
             return error;
-        slot.speedPasses.back().groups[2] = 4;
         const uint32_t blur[] = { (uint32_t)f.operating_w, (uint32_t)f.operating_h, (uint32_t)f.antialias_taps,
                                   (uint32_t)f.blur_taps };
         if (int error = add_pass(slot.speedPasses, kShader_speed_blur, { &speedOperating, &speedFilterTaps,
