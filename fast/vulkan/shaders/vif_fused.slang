@@ -42,7 +42,7 @@ struct Params {
 // The tile: TW pixels along a row, TH rows, a thread a pixel. Timed on the
 // Core Ultra 9 285K's iGPU (1080p VIF scale 0): of 20 shapes, two rows of 80
 // or 96 were the fastest once the group's sums were subgroup sums; with the
-// sums packed and the sums of squares narrow, one row of 160 (2.85 ms,
+// sums packed and the sums of squares in 32-bit words, one row of 160 (2.85 ms,
 // against 2.91 for 80 x 2, 2.90 for 192 x 1, 2.94 for 128 x 1, 2.98 for
 // 64 x 2, 3.01 for 112 x 2, 3.43 for 240 x 1). Rows share no vertical work;
 // a wider tile computes fewer columns beyond its pixels (16 of 176 here).
@@ -73,142 +73,79 @@ groupshared int gTotals[WORDS];
 #include "vif_stats.slang"
 
 
-// vif_vert.slang's Sum48.
-struct Sum48 { uint high, low, carries; };
-
-void add48(inout Sum48 sum, uint a, uint b)
+// A tap's samples, the reference's and the distorted's, at a row.
+uint2 samples_at(int x, int row)
 {
-    sum.high += (a >> 16) * b;
-    uint low = (a & 0xFFFFu) * b;
-    sum.low += low;
-    sum.carries += sum.low < low ? 1u : 0u;
-}
-
-uint64_t total48(Sum48 sum)
-{
-    return (uint64_t(sum.high) << 16) + (uint64_t(sum.carries) << 32) + uint64_t(sum.low);
-}
-
-#ifndef NARROW
-#define NARROW 0
-#endif
-#if NARROW
-// Pictures of 9 to 12 bits (shiftSq 2..8): the sums of squares and
-// products kept as high and low parts split at bit 8, without vif_vert's
-// carries. Each product a * b is a coefficient times a sample (a below
-// 2^29) times a sample: the low parts, (a & 255) * b, add up to under 2^29
-// over the 17 taps, and the high parts, (a >> 8) * b, are kept modulo 2^32,
-// which keeps their total, high * 2^8 + low, right modulo 2^40. Only bits
-// shiftSq .. shiftSq + 31 of it are kept (the result is a 32-bit word), all
-// below 2^40: the same word as the 48-bit sum's, whatever the samples. (At
-// 10 bits nothing wraps at all: the high parts add up to under 2^28.)
-#define add48(sum, a, b) { sum.high += ((a) >> 8) * (b); sum.low += ((a) & 0xFFu) * (b); }
-// That word, (high 2^8 + low + addSq) >> shiftSq modulo 2^32, made in 32
-// bits: high 2^8 is a multiple of 2^shiftSq (shiftSq <= 8), so it is
-// high 2^(8 - shiftSq) + ((low + addSq) >> shiftSq), and low + addSq is
-// below 2^29 + 2^7.
-#define shifted48(sum) ((sum.high << (8 - pc.shiftSq)) + ((sum.low + pc.addSq) >> pc.shiftSq))
+#if SRC_PICTURE
+    return uint2(pixel(refIn, x, row, pc.stride), pixel(disIn, x, row, pc.stride));
 #else
-#define shifted48(sum) uint((total48(sum) + pc.addSq) >> pc.shiftSq)
+    const uint word = refIn[row * pc.stride + x];
+    return uint2(word & 0xFFFFu, word >> 16);
 #endif
+}
 
-// vif_vert.slang's main for one pixel, into the tile at `at`.
+// vif_vert.slang's main for one pixel, into the tile at `at`: the same
+// integers made another way. The filter is symmetric: taps fi and FW - 1 - fi
+// add their samples, or their products, before their one coefficient
+// multiplies them (the next scale's filter too). The products p of two
+// samples (r r, d d, r d): with 8-bit samples below 2^16, and their sums,
+// at most 65025 times the coefficients' sum, 65536, below 2^32 (shiftSq 0:
+// kept as they are); with 16-bit samples, any value, below 2^32, and split
+// at bit 16: hi = sum c (p >> 16) and lo = sum c (p & 0xFFFF) are each at
+// most 65535 * 65536, so hi 2^16 + lo is vif_vert's 48-bit sum exactly. The
+// word kept, bits shiftSq.. of the sum + addSq (shiftSq <= 16), is
+// hi 2^(16 - shiftSq) + ((lo + addSq) >> shiftSq) modulo 2^32, lo + addSq
+// below 2^32.
 void vertical(int x, int y, uint at)
 {
-    uint mu1 = 0, mu2 = 0, refRdSum = 0, disRdSum = 0;
-    // The next scale's samples come from even rows only.
-    const bool nextRow = (y & 1) == 0;
-#if SMALL
-    uint refSq = 0, disSq = 0, refDis = 0;
-#else
-    Sum48 refSq = { 0, 0, 0 }, disSq = { 0, 0, 0 }, refDis = { 0, 0, 0 };
-#endif
-    // Rows inside the picture (all but a few groups' at the top and bottom):
-    // a word index stepped a row at a time, no mirroring. The samples and
-    // what is done with them are the same either way.
+    int rows[FW];
     if (y >= FW / 2 && y + FW / 2 < pc.h) {
-#if SRC_PICTURE
-#if BPC16
-        int index = (y - FW / 2) * pc.stride + (x >> 1);
-        const uint shift = uint(x & 1) * 16, mask = 0xFFFFu;
-#else
-        int index = (y - FW / 2) * pc.stride + (x >> 2);
-        const uint shift = uint(x & 3) * 8, mask = 0xFFu;
-#endif
-#else
-        int index = (y - FW / 2) * pc.stride + x;
-#endif
-        for (int fi = 0; fi < FW; ++fi) {
-#if SRC_PICTURE
-            const uint r = (refIn[index] >> shift) & mask, d = (disIn[index] >> shift) & mask;
-#else
-            const uint samples = refIn[index], r = samples & 0xFFFFu, d = samples >> 16;
-#endif
-            index += pc.stride;
-            uint coefficient = kVifFilter[SCALE][fi];
-            uint cr = coefficient * r, cd = coefficient * d;
-            mu1 += cr;
-            mu2 += cd;
-#if SMALL
-            refSq += cr * r;
-            disSq += cd * d;
-            refDis += cr * d;
-#else
-            add48(refSq, cr, r);
-            add48(disSq, cd, d);
-            add48(refDis, cr, d);
-#endif
-#if FW_RD > 0
-            if (nextRow && fi >= OFF && fi < FW - OFF) {
-                uint next = kVifFilter[SCALE + 1][fi - OFF];
-                refRdSum += next * r;
-                disRdSum += next * d;
-            }
-#endif
-        }
+        for (int fi = 0; fi < FW; ++fi)
+            rows[fi] = y - FW / 2 + fi;
     } else {
         for (int fi = 0; fi < FW; ++fi) {
             int row = abs(y - FW / 2 + fi);
             if (row >= pc.h)
                 row = 2 * pc.h - row - 2;
-#if SRC_PICTURE
-            uint r = pixel(refIn, x, row, pc.stride), d = pixel(disIn, x, row, pc.stride);
-#else
-            const uint samples = refIn[row * pc.stride + x], r = samples & 0xFFFFu, d = samples >> 16;
-#endif
-            uint coefficient = kVifFilter[SCALE][fi];
-            uint cr = coefficient * r, cd = coefficient * d;
-            mu1 += cr;
-            mu2 += cd;
+            rows[fi] = row;
+        }
+    }
+    const bool nextRow = (y & 1) == 0;  // the next scale's samples: even rows
+    uint mu1 = 0, mu2 = 0, refRdSum = 0, disRdSum = 0;
+    uint hi[3] = { 0, 0, 0 }, lo[3] = { 0, 0, 0 };
+    for (int fi = 0; fi <= FW / 2; ++fi) {
+        const int fj = FW - 1 - fi;
+        const bool pair = fi < fj;
+        const uint2 a = samples_at(x, rows[fi]), b = pair ? samples_at(x, rows[fj]) : uint2(0, 0);
+        const uint coefficient = kVifFilter[SCALE][fi];
+        mu1 += coefficient * (a.x + b.x);
+        mu2 += coefficient * (a.y + b.y);
+        const uint pa[3] = { a.x * a.x, a.y * a.y, a.x * a.y }, pb[3] = { b.x * b.x, b.y * b.y, b.x * b.y };
+        for (int k = 0; k < 3; ++k) {
 #if SMALL
-            refSq += cr * r;
-            disSq += cd * d;
-            refDis += cr * d;
+            lo[k] += coefficient * (pa[k] + pb[k]);
 #else
-            add48(refSq, cr, r);
-            add48(disSq, cd, d);
-            add48(refDis, cr, d);
-#endif
-#if FW_RD > 0
-            if (nextRow && fi >= OFF && fi < FW - OFF) {
-                uint next = kVifFilter[SCALE + 1][fi - OFF];
-                refRdSum += next * r;
-                disRdSum += next * d;
-            }
+            hi[k] += coefficient * ((pa[k] >> 16) + (pb[k] >> 16));
+            lo[k] += coefficient * ((pa[k] & 0xFFFFu) + (pb[k] & 0xFFFFu));
 #endif
         }
+#if FW_RD > 0
+        if (nextRow && fi >= OFF) {
+            const uint next = kVifFilter[SCALE + 1][fi - OFF];
+            refRdSum += next * (a.x + b.x);
+            disRdSum += next * (a.y + b.y);
+        }
+#endif
     }
     const uint plane = TH * TCOLS;
     gTile[at] = (((mu1 + pc.addVP) >> pc.shiftVP) & 0xFFFFu) | ((((mu2 + pc.addVP) >> pc.shiftVP) & 0xFFFFu) << 16);
+    for (int k = 0; k < 3; ++k) {
 #if SMALL
-    gTile[plane + at] = refSq;
-    gTile[2 * plane + at] = disSq;
-    gTile[3 * plane + at] = refDis;
+        gTile[(k + 1) * plane + at] = lo[k];
 #else
-    gTile[plane + at] = shifted48(refSq);
-    gTile[2 * plane + at] = shifted48(disSq);
-    gTile[3 * plane + at] = shifted48(refDis);
+        gTile[(k + 1) * plane + at] = (hi[k] << (16 - pc.shiftSq)) + ((lo[k] + pc.addSq) >> pc.shiftSq);
 #endif
+    }
 #if FW_RD > 0
     if (nextRow)
         gTile[4 * plane + at] = (((refRdSum + pc.addVP) >> pc.shiftVP) & 0xFFFFu)

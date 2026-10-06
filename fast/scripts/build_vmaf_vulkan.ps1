@@ -77,7 +77,6 @@ $shaders = [ordered]@{
     'vif_fused_3'       = 'vif_fused', 'SRC_PICTURE=0', 'BPC16=0', 'SCALE=3', 'FW=3', 'FW_RD=0'
     'adm_decouple_0_both' = 'adm_decouple', 'SCALE0=1', 'BPC16=0', 'V1=0', 'VARIANT=0', 'BOTH=1'
     'adm_decouple_both' = 'adm_decouple', 'SCALE0=0', 'BPC16=0', 'V1=0', 'VARIANT=0', 'BOTH=1'
-    'vif_fused_0_12'    = 'vif_fused', 'SRC_PICTURE=1', 'BPC16=1', 'NARROW=1', 'SCALE=0', 'FW=17', 'FW_RD=9'
     'adm_dcm_0'         = 'adm_dcm', 'SCALE0=1'
     'adm_dcm'           = 'adm_dcm', 'SCALE0=0'
     'adm_rows'          = 'adm_rows', 'ROWS=1'
