@@ -288,6 +288,15 @@ bool in_cm_decouple(int i, int j)  // decoupled for the masking: its region and 
     return i >= CM_TOP - 1 && i <= CM_BOTTOM && j >= CM_LEFT - 1 && j <= CM_RIGHT;
 }
 
+// Where the masking's neighbour at row (or column) n is, at the band's edges
+// (which its region reaches when the border is 0, in small pictures): as the
+// CPU code's ADM_CM_THRESH_S_0_J, _H_M_1_J, _I_0 and _I_W_M_1, the one before
+// the first is the second, the one past the last is the last.
+int cm_neighbour(int n, int size)
+{
+    return n == -1 ? 1 : (n == size ? size - 1 : n);
+}
+
 #if SLIDE
 // The workgroups slide down the band: 128 threads, a column each -- 126 of
 // the workgroup's own and one either side, which the masking reads -- over
@@ -312,11 +321,13 @@ void slide_row(int i, int j, uint local, bool own, inout int restored[3], inout 
     int sumF = 0, sumRF = 0;
     const bool inDen = own && i >= DEN_TOP && i < DEN_BOTTOM && j >= DEN_LEFT && j < DEN_RIGHT;
     for (int b = 0; b < 3; ++b) den[b] = 0;
+    // Outside the band (a neighbour only): the pixel the masking reads instead.
+    const int ci = cm_neighbour(i, BH), cj = cm_neighbour(j, BW);
 #if FROM_PICTURE
     const bool approx = own && i >= 0 && i < BH && j >= 0 && j < BW;
     int o[3], t[3];
-    if (approx || inDen || in_cm_decouple(i, j)) {
-        const int aRef = transform(refPicture, i, j, o), aDis = transform(disPicture, i, j, t);
+    if (approx || inDen || in_cm_decouple(ci, cj)) {
+        const int aRef = transform(refPicture, ci, cj, o), aDis = transform(disPicture, ci, cj, t);
         if (approx) {
             refApprox[i * APPROX_STRIDE + j] = aRef;
             disApprox[i * APPROX_STRIDE + j] = aDis;
@@ -333,11 +344,11 @@ void slide_row(int i, int j, uint local, bool own, inout int restored[3], inout 
             den[b] = den_term(int(refBands[from + 1 + b]));
     }
 #endif
-    if (in_cm_decouple(i, j)) {
+    if (in_cm_decouple(ci, cj)) {
 #if FROM_PICTURE
         const Decoupled d = decouple_bands(o, t);
 #else
-        const Decoupled d = decouple(i, j);
+        const Decoupled d = decouple(ci, cj);
 #endif
         sumF = d.csfF[0] + d.csfF[1] + d.csfF[2];
         sumRF = d.csfRF[0] + d.csfRF[1] + d.csfRF[2];

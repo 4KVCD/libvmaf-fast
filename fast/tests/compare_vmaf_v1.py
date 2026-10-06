@@ -94,6 +94,12 @@ def matrix(device: int | None) -> bool:
             same &= compare("synthetic", model, width, height, bits,
                             *frames_of.synthetic(width, height, bits, count, width + index), 1, device)
     model = model_path("3d0h")
+    # Small pictures, where ADM's border at its coarsest scale is 0, so its
+    # masking takes in the band's edges. (With the models that downscale for
+    # SpEED, libvmaf's CPU code refuses them.)
+    for width, height, bits in ((290, 170, 8), (160, 400, 12)):
+        same &= compare("synthetic", model, width, height, bits, *frames_of.synthetic(width, height, bits, 5, width), 1,
+                        device)
     for kind in ("black", "white", "black-white", "identical", "noise", "extremes", "still", "sharpened", "inverted"):
         for bits in (8, 10):
             same &= compare(kind, model, 640, 360, bits, *frames_of.special(kind, 640, 360, bits, 6), 1, device)

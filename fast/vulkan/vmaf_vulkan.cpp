@@ -1333,10 +1333,13 @@ int vv_context::build_passes_v1()
             for (int band = 0; band < 3; ++band)
                 p[4 + band] = (int32_t)i_rfactor[band];
             p[7] = (int32_t)cosMantissa;
-            p[8] = start_row;
-            p[9] = end_row;
-            p[10] = start_col;
-            p[11] = end_col;
+            // The region adm_cm / i4_adm_cm sum: with a border of 0 (small
+            // pictures), also the first and last rows and columns, which they
+            // sum apart (each of the two rows rounded as one).
+            p[8] = top <= 0 ? 0 : start_row;
+            p[9] = bottom > bh - 1 ? bh : end_row;
+            p[10] = left <= 0 ? 0 : start_col;
+            p[11] = right > bw - 1 ? bw : end_col;
             static const int shift_sub[3] = { 10, 10, 12 }, fixed_shift[3] = { 4, 4, 3 };
             static const int shift_xsq[3] = { 29, 29, 30 };
             for (int band = 0; band < 3; ++band) {
@@ -1353,8 +1356,8 @@ int vv_context::build_passes_v1()
             p[32] = (int32_t)(uint32_t)pow(2, ((double)shift_inner_accum - 1));
             p[39] = kSlotCm + scale * 3;
             p[40] = kSlotCm + kScales * 3 + scale * 3;
-            p[42] = std::min(start_row, p[12]);
-            p[43] = std::max(end_row, p[13]);
+            p[42] = std::min(p[8], p[12]);
+            p[43] = std::max(p[9], p[13]);
         }
         if (scale == 0) {  // the transform from the pictures, and all of the band image (its a)
             p[42] = 0;
