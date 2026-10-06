@@ -103,35 +103,80 @@ void vertical(int x, int y, uint at)
 #else
     Sum48 refSq = { 0, 0, 0 }, disSq = { 0, 0, 0 }, refDis = { 0, 0, 0 };
 #endif
-    for (int fi = 0; fi < FW; ++fi) {
-        int row = abs(y - FW / 2 + fi);
-        if (row >= pc.h)
-            row = 2 * pc.h - row - 2;
+    // Rows inside the picture (all but a few groups' at the top and bottom):
+    // a word index stepped a row at a time, no mirroring. The samples and
+    // what is done with them are the same either way.
+    if (y >= FW / 2 && y + FW / 2 < pc.h) {
 #if SRC_PICTURE
-        uint r = pixel(refIn, x, row, pc.stride), d = pixel(disIn, x, row, pc.stride);
+#if BPC16
+        int index = (y - FW / 2) * pc.stride + (x >> 1);
+        const uint shift = uint(x & 1) * 16, mask = 0xFFFFu;
 #else
-        uint r = refIn[row * pc.stride + x], d = disIn[row * pc.stride + x];
+        int index = (y - FW / 2) * pc.stride + (x >> 2);
+        const uint shift = uint(x & 3) * 8, mask = 0xFFu;
 #endif
-        uint coefficient = kVifFilter[SCALE][fi];
-        uint cr = coefficient * r, cd = coefficient * d;
-        mu1 += cr;
-        mu2 += cd;
-#if SMALL
-        refSq += cr * r;
-        disSq += cd * d;
-        refDis += cr * d;
 #else
-        add48(refSq, cr, r);
-        add48(disSq, cd, d);
-        add48(refDis, cr, d);
+        int index = (y - FW / 2) * pc.stride + x;
+#endif
+        for (int fi = 0; fi < FW; ++fi) {
+#if SRC_PICTURE
+            const uint r = (refIn[index] >> shift) & mask, d = (disIn[index] >> shift) & mask;
+#else
+            const uint r = refIn[index], d = disIn[index];
+#endif
+            index += pc.stride;
+            uint coefficient = kVifFilter[SCALE][fi];
+            uint cr = coefficient * r, cd = coefficient * d;
+            mu1 += cr;
+            mu2 += cd;
+#if SMALL
+            refSq += cr * r;
+            disSq += cd * d;
+            refDis += cr * d;
+#else
+            add48(refSq, cr, r);
+            add48(disSq, cd, d);
+            add48(refDis, cr, d);
 #endif
 #if FW_RD > 0
-        if (fi >= OFF && fi < FW - OFF) {
-            uint next = kVifFilter[SCALE + 1][fi - OFF];
-            refRdSum += next * r;
-            disRdSum += next * d;
-        }
+            if (fi >= OFF && fi < FW - OFF) {
+                uint next = kVifFilter[SCALE + 1][fi - OFF];
+                refRdSum += next * r;
+                disRdSum += next * d;
+            }
 #endif
+        }
+    } else {
+        for (int fi = 0; fi < FW; ++fi) {
+            int row = abs(y - FW / 2 + fi);
+            if (row >= pc.h)
+                row = 2 * pc.h - row - 2;
+#if SRC_PICTURE
+            uint r = pixel(refIn, x, row, pc.stride), d = pixel(disIn, x, row, pc.stride);
+#else
+            uint r = refIn[row * pc.stride + x], d = disIn[row * pc.stride + x];
+#endif
+            uint coefficient = kVifFilter[SCALE][fi];
+            uint cr = coefficient * r, cd = coefficient * d;
+            mu1 += cr;
+            mu2 += cd;
+#if SMALL
+            refSq += cr * r;
+            disSq += cd * d;
+            refDis += cr * d;
+#else
+            add48(refSq, cr, r);
+            add48(disSq, cd, d);
+            add48(refDis, cr, d);
+#endif
+#if FW_RD > 0
+            if (fi >= OFF && fi < FW - OFF) {
+                uint next = kVifFilter[SCALE + 1][fi - OFF];
+                refRdSum += next * r;
+                disRdSum += next * d;
+            }
+#endif
+        }
     }
     const uint plane = TH * TCOLS;
     gTile[at] = (((mu1 + pc.addVP) >> pc.shiftVP) & 0xFFFFu) | ((((mu2 + pc.addVP) >> pc.shiftVP) & 0xFFFFu) << 16);
