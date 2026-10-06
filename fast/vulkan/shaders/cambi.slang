@@ -403,15 +403,20 @@ void count_pixel(int compact, uint lc, int first, bool remove)
     InterlockedAdd(gCounts[uint(local) * WORDS + (lc >> 2)], remove ? 0u - one : one);
 }
 
-// The pixels of value first + local in the window of the tile's column t.
+#define MAX_WORDS ((2 * MAX_PAD + 3) / 4 + 1)  // the words a window's 2 * pad + 1 columns are in, at most
+
+// The pixels of value first + local in the window of the tile's column t: a
+// fixed number of words read (those past the window's last, inside gCounts,
+// left out), so that their reads are made together.
 uint window_count(int local, uint t, int pad)
 {
-    const uint base = uint(local) * WORDS, last = t + uint(2 * pad);
+    const uint base = uint(local) * WORDS + (t >> 2), last = t + uint(2 * pad);
+    const uint words = (last >> 2) - (t >> 2);  // the last's, from the first
     uint sum = 0;
-    for (uint word = t >> 2; word <= (last >> 2); ++word) {
-        uint bytes = gCounts[base + word];
-        if (word == (t >> 2)) bytes &= 0xFFFFFFFFu << ((t & 3u) * 8u);
-        if (word == (last >> 2)) bytes &= 0xFFFFFFFFu >> ((3u - (last & 3u)) * 8u);
+    [unroll] for (uint k = 0; k < MAX_WORDS; ++k) {
+        uint bytes = k <= words ? gCounts[base + k] : 0u;
+        if (k == 0) bytes &= 0xFFFFFFFFu << ((t & 3u) * 8u);
+        if (k == words) bytes &= 0xFFFFFFFFu >> ((3u - (last & 3u)) * 8u);
         sum += (bytes & 0x00FF00FFu) + ((bytes >> 8) & 0x00FF00FFu);
     }
     return (sum & 0xFFFFu) + (sum >> 16);
@@ -499,14 +504,18 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex)
             if (o >= 0 && o / CORE == k) {
                 const int compact = o, I = o + bandBase;
                 float c = 0.0;
-                const int local = compact - first;
-                const uint p0 = window_count(local, t, pad);
+                const int local = compact - first;  // 4 .. 59: its value +- 4 are in the window
+                // The counts of its value and its value +- 1 .. 4, all read together.
+                uint counts[2 * NUM_DIFFS + 1];
+                [unroll] for (int m = 0; m < 2 * NUM_DIFFS + 1; ++m)
+                    counts[m] = window_count(local + m - NUM_DIFFS, t, pad);
+                const uint p0 = counts[NUM_DIFFS];
                 const int value = I + NUM_DIFFS;
-                for (int d = 0; d < NUM_DIFFS; ++d) {
+                [unroll] for (int d = 0; d < NUM_DIFFS; ++d) {
                     if (value <= int(pc[6 + d]) && value + d + 1 > int(pc[3])) {
                         // (The gate keeps compact + d + 1 inside the band, as on the CPU.)
-                        const uint p1 = compact + d + 1 < bandSize ? window_count(local + d + 1, t, pad) : 0u;
-                        const uint p2 = compact - d - 1 >= 0 ? window_count(local - d - 1, t, pad) : 0u;
+                        const uint p1 = compact + d + 1 < bandSize ? counts[NUM_DIFFS + d + 1] : 0u;
+                        const uint p2 = compact - d - 1 >= 0 ? counts[NUM_DIFFS - d - 1] : 0u;
                         const uint pm = p1 > p2 ? p1 : p2;
                         const float val = float(int(pc[10 + d]) * int(p0) * int(pm)) * reciprocal[pm + p0];
                         if (val > c) c = val;
