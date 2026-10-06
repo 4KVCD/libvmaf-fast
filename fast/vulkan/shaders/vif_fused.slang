@@ -27,6 +27,10 @@ struct Params {
 [[vk::push_constant]] Params pc;
 [[vk::binding(0, 0)]] StructuredBuffer<uint> refIn;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> disIn;
+// The next scale's images, one word a position: the reference's sample in
+// the low 16 bits, the distorted's in the high (scales 1-3 read refIn so;
+// disIn and disRd are not used). Two words, one per picture, were twice the
+// writes here and the loads there.
 [[vk::binding(2, 0)]] RWStructuredBuffer<uint> refRd;
 [[vk::binding(3, 0)]] RWStructuredBuffer<uint> disRd;
 [[vk::binding(4, 0)]] RWStructuredBuffer<uint> acc;
@@ -122,7 +126,7 @@ void vertical(int x, int y, uint at)
 #if SRC_PICTURE
             const uint r = (refIn[index] >> shift) & mask, d = (disIn[index] >> shift) & mask;
 #else
-            const uint r = refIn[index], d = disIn[index];
+            const uint samples = refIn[index], r = samples & 0xFFFFu, d = samples >> 16;
 #endif
             index += pc.stride;
             uint coefficient = kVifFilter[SCALE][fi];
@@ -154,7 +158,7 @@ void vertical(int x, int y, uint at)
 #if SRC_PICTURE
             uint r = pixel(refIn, x, row, pc.stride), d = pixel(disIn, x, row, pc.stride);
 #else
-            uint r = refIn[row * pc.stride + x], d = disIn[row * pc.stride + x];
+            const uint samples = refIn[row * pc.stride + x], r = samples & 0xFFFFu, d = samples >> 16;
 #endif
             uint coefficient = kVifFilter[SCALE][fi];
             uint cr = coefficient * r, cd = coefficient * d;
@@ -271,8 +275,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 #if FW_RD > 0
         if ((x & 1) == 0 && (y & 1) == 0) {
             int at = (y / 2) * pc.rdStride + x / 2;
-            refRd[at] = ((refRdSum + 32768u) >> 16) & 0xFFFFu;
-            disRd[at] = ((disRdSum + 32768u) >> 16) & 0xFFFFu;
+            refRd[at] = (((refRdSum + 32768u) >> 16) & 0xFFFFu) | ((((disRdSum + 32768u) >> 16) & 0xFFFFu) << 16);
         }
 #endif
     }

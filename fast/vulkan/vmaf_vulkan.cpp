@@ -1607,8 +1607,9 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         // Motion's blur, 16-bit: two pixels a word.
         { &blur[0], (VkDeviceSize)(w + 1) / 2 * h * 4 * v0 + 4 }, { &blur[1], (VkDeviceSize)(w + 1) / 2 * h * 4 * v0 + 4 },
         { &vifTmp, pixels * 4 * kVifTmpWords * v0 * twoPass + 4 },
-        { &rdRef[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 }, { &rdDis[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 },
-        { &rdRef[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 }, { &rdDis[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 },
+        // vif_fused keeps both pictures' samples in rdRef (a word each position).
+        { &rdRef[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 }, { &rdDis[0], (VkDeviceSize)w1 * h1 * 4 * v0 * twoPass + 4 },
+        { &rdRef[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 }, { &rdDis[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 * twoPass + 4 },
         { &picPrev[0], planeBytes * only1 + 4 }, { &picPrev[1], planeBytes * only1 + 4 },
         { &admAdditive, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 }, { &admCsfR, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 },
         { &admCsfRF, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 },
