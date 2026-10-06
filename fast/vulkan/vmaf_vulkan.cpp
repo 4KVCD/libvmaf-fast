@@ -449,7 +449,7 @@ struct Slot {
 enum { kPushBytes = 128, kMaxBindings = 9 };
 // vif_fused.slang's tile rows (TH) at each scale: the build script's TH
 // defines. Its tiles are 160 pixels wide.
-const uint32_t kVifTileRows[4] = { 2, 1, 2, 2 };
+const uint32_t kVifTileRows[4] = { 2, 2, 2, 2 };
 static_assert(kMaxBindings <= sizeof(Pass::bound) / sizeof(Pass::bound[0]), "Pass::bound holds a pass's buffers");
 // adm_dcm.slang's tile of contrast masking's positions (its TX x TY).
 const int kDcmTile[2] = { 16, 8 };

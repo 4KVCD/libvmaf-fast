@@ -68,8 +68,9 @@ struct Params {
 // 2.91 for 80 x 2, 2.90 for 192 x 1, 2.94 for 128 x 1, 2.98 for 64 x 2, 3.01
 // for 112 x 2, 3.43 for 240 x 1). Then two rows of 160, two pixels a thread,
 // each thread's sums added into the group's once (4K: scale 0 8.92 -> 8.13
-// ms, 2 0.331 -> 0.293, 3 0.076 -> 0.070; scale 1 1.50 -> 2.01, kept at one
-// row; scale 0 at 144 x 2 8.49, 176 x 2 8.65, 192 x 2 11.2, 160 x 3 10.7).
+// ms, 2 0.331 -> 0.293, 3 0.076 -> 0.070; scale 0 at 144 x 2 8.49, 176 x 2
+// 8.65, 192 x 2 11.2, 160 x 3 10.7). Scale 1 was 1.50 -> 2.01 until main's
+// loop over the pixels was kept a loop (below): 1.405 -> 1.293.
 // Rows share no vertical work; a wider tile computes fewer columns beyond its
 // pixels (16 of 176 here).
 #define TW 160
@@ -244,6 +245,10 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     for (int i = 0; i < VALUES; ++i)
         totals[i] = 0;
     const uint plane = TH * TCOLS;
+    // Kept a loop: unrolled, its two turns are two copies of statistics()'s
+    // long code, and the GPU's instruction cache takes the cost (Core Ultra 9
+    // 285K's iGPU, scale 1 at two rows a tile, 4K: 1.88 ms against 1.29).
+    [loop]
     for (uint o = local; o < uint(TW * TH); o += THREADS) {
         const int row = int(o / uint(TW)), px = int(o % uint(TW));
         const int x = x0 + px, y = y0 + row;
