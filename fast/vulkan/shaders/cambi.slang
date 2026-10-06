@@ -29,7 +29,7 @@
 //             CPU's double sum is while it is under 2^53 units (v1_host)
 #include "common.slang"
 
-[[vk::push_constant]] uniform uint pc[24];
+[[vk::push_constant]] uniform uint pc[32];  // (FROM_IMAGE: the pictures' places in the last words, common.slang)
 
 // The radix select's state (HIST, SELECT, SUM), in words: per scale the
 // prefix and what is left of k (2 * scale); the zero c-values (10 +
@@ -103,7 +103,11 @@ void main(uint3 id : SV_DispatchThreadID)
 // the picture, and works in shared memory on those and the 3 + 1 + 1 pixels
 // around them that the mask's window, the derivative and the anti-dithering
 // read. Each picture pixel of the tile is checked against the bit depth once.
+#if FROM_IMAGE
+[[vk::binding(0, 0)]] Texture2D<uint> picture;  // the distorted picture
+#else
 [[vk::binding(0, 0)]] StructuredBuffer<uint> picture;
+#endif
 [[vk::binding(1, 0)]] RWStructuredBuffer<uint> imageOut;
 [[vk::binding(2, 0)]] RWStructuredBuffer<uint> maskOut;
 [[vk::binding(3, 0)]] RWStructuredBuffer<uint> acc;
@@ -158,8 +162,22 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     // The samples a word (2 or 4) at a time, from ox - 1 (on a word: u0 is a
     // multiple of 16): every load first, then their conversion, so the loads
     // wait for memory together (STEP is fixed, so the loops unroll).
-    const int firstWord = (ox - 1) / PER_WORD;  // (negative at the left edge: those words are not read)
     if (local < MAX_SPAN * 2) gZeroWords[local] = 0;
+#if FROM_IMAGE
+    // A sample at a time from the texture.
+    for (int i = int(local); i < span * span; i += 256) {
+        const int lx = i % span, ly = i / span, x = ox + lx, y = oy + ly;
+        uint ten = 0;
+        if (x >= 0 && x < w && y >= 0 && y < h) {
+            const uint raw = image_pixel(picture, x, y, int(pc[PICTURE_DISTORTED]), int(pc[PICTURE_DISTORTED + 1]));
+            if (bpc > 8 && bpc < 16 && x >= u0 && x < u0 + core && y >= v0 && y < v0 + core && raw > (1u << bpc) - 1u)
+                InterlockedOr(acc[2 * pc[5]], 1u);
+            ten = to10_of(raw);
+        }
+        gTen[ly * span + lx] = ten;
+    }
+#else
+    const int firstWord = (ox - 1) / PER_WORD;  // (negative at the left edge: those words are not read)
     uint raws[LOADS];
     [unroll] for (int k = 0; k < LOADS; ++k) {
         const int i = int(local) + k * 256, lw = i % ROW_WORDS, ly = i / ROW_WORDS;
@@ -190,6 +208,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
             gTen[ly * span + lx] = ten;
         }
     }
+#endif
     GroupMemoryBarrierWithGroupSync();
     // DERIV of PRE (anti_dithering_filter of the converted picture): equal to
     // its right and lower neighbours (the last column and row: always). A

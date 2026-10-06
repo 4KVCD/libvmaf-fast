@@ -43,6 +43,36 @@ uint pixel(StructuredBuffer<uint> picture, int x, int y, int strideWords)
 #endif
 }
 
+// Vulkan VMAF's pictures mode (vv_pictures, FROM_IMAGE): VMAF v1's pictures
+// read where a decoder left them, its textures imported -- NV12 (8-bit) or
+// P010, whose 10-bit samples are in the top bits of 16 -- a plane viewed as
+// R8/R16 (luma) or R8G8/R16G16 (chroma, U and V). A picture's first sample is
+// at (ox, oy) of its texture (luma; chroma at half), given each frame in the
+// push constants' last words, as vv_pictures took them: the motion's previous
+// picture's at 26-27, the reference's at 28-29, the distorted's at 30-31.
+#ifndef FROM_IMAGE
+#define FROM_IMAGE 0
+#endif
+#define PICTURE_PREVIOUS 26
+#define PICTURE_REFERENCE 28
+#define PICTURE_DISTORTED 30
+#if FROM_IMAGE
+#if BPC16
+#define IMAGE_SHIFT 6
+#else
+#define IMAGE_SHIFT 0
+#endif
+uint image_pixel(Texture2D<uint> image, int x, int y, int ox, int oy)
+{
+    return image.Load(int3(x + ox, y + oy, 0)) >> IMAGE_SHIFT;
+}
+uint image_chroma(Texture2D<uint2> image, int x, int y, int ox, int oy, uint component)
+{
+    const uint2 both = image.Load(int3(x + (ox >> 1), y + (oy >> 1), 0));
+    return (component == 0 ? both.x : both.y) >> IMAGE_SHIFT;
+}
+#endif
+
 int sext16(int v) { return (v << 16) >> 16; }
 
 int msb32(uint v) { return int(firstbithigh(v)); }  // v != 0

@@ -20,12 +20,24 @@
 // plain one, a multiply and an add each rounded (no fused multiply-add):
 // `precise` keeps the driver from fusing them here.
 
-[[vk::push_constant]] uniform uint pc[16];
+[[vk::push_constant]] uniform uint pc[32];  // (FROM_IMAGE: the pictures' places in the last words, common.slang)
+#ifndef FROM_IMAGE
+#define FROM_IMAGE 0
+#endif
+#define PICTURE_REFERENCE 28  // (common.slang's)
+#define PICTURE_DISTORTED 30
 
 int mirror(int i, int n) { return i < 0 ? -i : (i >= n ? 2 * n - i - 2 : i); }
 
 #if STAGE == 1  // DEC
+#if FROM_IMAGE
+// The planes from the pictures' chroma textures: 0, 1 the reference's U and
+// V, 2, 3 the distorted's (as the shared buffers have them).
+[[vk::binding(0, 0)]] Texture2D<uint2> refChroma;
+[[vk::binding(4, 0)]] Texture2D<uint2> disChroma;
+#else
 [[vk::binding(0, 0)]] StructuredBuffer<uint> chroma;
+#endif
 [[vk::binding(1, 0)]] StructuredBuffer<float> filters;
 [[vk::binding(2, 0)]] RWStructuredBuffer<float> operating;
 [[vk::binding(3, 0)]] StructuredBuffer<uint> scaling;
@@ -36,6 +48,12 @@ int mirror(int i, int n) { return i < 0 ? -i : (i >= n ? 2 * n - i - 2 : i); }
 
 float sample(uint plane, int x, int y)
 {
+#if FROM_IMAGE
+    const uint place = plane < 2 ? PICTURE_REFERENCE : PICTURE_DISTORTED;
+    const int3 at = int3(x + (int(pc[place]) >> 1), y + (int(pc[place + 1]) >> 1), 0);
+    const uint2 both = plane < 2 ? refChroma.Load(at) : disChroma.Load(at);
+    const uint v = ((plane & 1) == 0 ? both.x : both.y) >> (pc[7] > 8 ? 6u : 0u);
+#else
     const uint base = plane * pc[3] + uint(y) * pc[2];
     uint v;
     if (pc[7] > 8) {
@@ -43,6 +61,7 @@ float sample(uint plane, int x, int y)
     } else {
         v = (chroma[base + uint(x >> 2)] >> ((x & 3) * 8)) & 0xFFu;
     }
+#endif
     precise float scaled = float(v) * asfloat(pc[8]);  // exact: v / 2^k
     precise float result = scaled + -128.0;
     return result;

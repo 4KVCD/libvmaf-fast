@@ -13,10 +13,19 @@ struct Params {
     int w, h, strideWords;
     int shiftY, addY;   // the picture's bit depth, and half of 1 << depth
     uint slot;
+#if FROM_IMAGE
+    uint unused[20];
+    int previousX, previousY, currentX, currentY;  // (common.slang's PICTURE_PREVIOUS, _REFERENCE)
+#endif
 };
 [[vk::push_constant]] Params pc;
+#if FROM_IMAGE
+[[vk::binding(0, 0)]] Texture2D<uint> current;
+[[vk::binding(1, 0)]] Texture2D<uint> previous;
+#else
 [[vk::binding(0, 0)]] StructuredBuffer<uint> current;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> previous;
+#endif
 [[vk::binding(2, 0)]] RWStructuredBuffer<uint> acc;
 
 static const int kFilter[5] = { 3571, 16004, 26386, 16004, 3571 };
@@ -69,6 +78,16 @@ int horizontal(uint base)
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
     const int x0 = int(group.x) * TILE_W, y0 = int(group.y) * TILE_H;
+#if FROM_IMAGE
+    // The differences a sample at a time from the two textures (mirrored at
+    // the picture's edges).
+    for (uint i = local; i < SPAN_H * SPAN_W; i += GROUP) {
+        const int column = mirror(x0 - 2 + int(i % SPAN_W), pc.w), row = mirror(y0 - 2 + int(i / SPAN_W), pc.h);
+        gDiff[i] = column >= 0 && column < pc.w && row >= 0 && row < pc.h  // (else: past the tile's last outputs, unused)
+            ? int(image_pixel(previous, column, row, pc.previousX, pc.previousY))
+                - int(image_pixel(current, column, row, pc.currentX, pc.currentY)) : 0;
+    }
+#else
     const bool inside = x0 >= 4 && x0 + TILE_W + 4 <= pc.w;
     if (inside) {
 #if BPC16
@@ -103,6 +122,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
                 ? int(pixel(previous, column, row, pc.strideWords)) - int(pixel(current, column, row, pc.strideWords)) : 0;
         }
     }
+#endif
     GroupMemoryBarrierWithGroupSync();
     for (uint i = local; i < TILE_H * SPAN_W; i += GROUP) {
         const uint lx = i % SPAN_W, ly = i / SPAN_W;

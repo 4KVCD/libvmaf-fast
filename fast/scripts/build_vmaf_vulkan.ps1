@@ -54,6 +54,8 @@ $shaders = [ordered]@{
     # as VMAF v0.6.1's does.
     'motion_v1_8'       = 'motion_v1', 'BPC16=0'
     'motion_v1_16'      = 'motion_v1', 'BPC16=1'
+    'motion_v1_8_img'   = 'motion_v1', 'BPC16=0', 'FROM_IMAGE=1'  # vv_pictures: from a decoder's textures
+    'motion_v1_16_img'  = 'motion_v1', 'BPC16=1', 'FROM_IMAGE=1'
     'adm_decouple_v1_0' = 'adm_decouple', 'SCALE0=1', 'BPC16=0', 'V1=1', 'VARIANT=0'
     'adm_decouple_v1'   = 'adm_decouple', 'SCALE0=0', 'BPC16=0', 'V1=1', 'VARIANT=0'
     'adm_csf_den_v1_0'  = 'adm_csf_den', 'SCALE0=1', 'BPC16=0', 'ROWWISE=1'
@@ -87,15 +89,22 @@ $shaders = [ordered]@{
     'cambi_front_16'    = 'cambi', 'STAGE=14', 'BPC16=1', 'STEP=2'
     'cambi_front_8_1'   = 'cambi', 'STAGE=14', 'BPC16=0', 'STEP=1'
     'cambi_front_16_1'  = 'cambi', 'STAGE=14', 'BPC16=1', 'STEP=1'
+    'cambi_front_8_img'    = 'cambi', 'STAGE=14', 'BPC16=0', 'STEP=2', 'FROM_IMAGE=1'
+    'cambi_front_16_img'   = 'cambi', 'STAGE=14', 'BPC16=1', 'STEP=2', 'FROM_IMAGE=1'
+    'cambi_front_8_1_img'  = 'cambi', 'STAGE=14', 'BPC16=0', 'STEP=1', 'FROM_IMAGE=1'
+    'cambi_front_16_1_img' = 'cambi', 'STAGE=14', 'BPC16=1', 'STEP=1', 'FROM_IMAGE=1'
     # VMAF v1's ADM after the wavelet transform, one pass per scale (shaders/adm_fused.slang).
     'adm_fused_0_8'     = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=0', 'SLIDE=1'
     'adm_fused_0_16'    = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=1', 'SLIDE=1'
+    'adm_fused_0_8_img'  = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=0', 'SLIDE=1', 'FROM_IMAGE=1'
+    'adm_fused_0_16_img' = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=1', 'SLIDE=1', 'FROM_IMAGE=1'
     'adm_fused'         = 'adm_fused', 'SCALE0=0', 'FROM_PICTURE=0', 'BPC16=0', 'SLIDE=1', 'BAND=8'
     'adm_fused_next'    = 'adm_fused', 'SCALE0=0', 'FROM_PICTURE=0', 'BPC16=0', 'SLIDE=1', 'BAND=8', 'NEXT_SCALE=1'
     'adm_rowsum'        = 'adm_fused', 'SCALE0=0', 'FROM_PICTURE=0', 'BPC16=0', 'ROWSUM=1'
     # VMAF v1's SpEED chroma (shaders/speed.slang): float sums in libvmaf's
     # order, each multiply and add rounded (NO_CONTRACTION: see Add-NoContraction).
     'speed_dec'         = 'speed', 'STAGE=1', 'NO_CONTRACTION=1'
+    'speed_dec_img'     = 'speed', 'STAGE=1', 'NO_CONTRACTION=1', 'FROM_IMAGE=1'
     'speed_blur'        = 'speed', 'STAGE=2', 'NO_CONTRACTION=1'
 }
 

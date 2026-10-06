@@ -83,7 +83,8 @@
     X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCreateFence) X(vkDestroyFence) \
     X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) X(vkDeviceWaitIdle) \
     X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) \
-    X(vkGetQueryPoolResults)
+    X(vkGetQueryPoolResults) X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) \
+    X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView)
 
 namespace {
 
@@ -428,7 +429,15 @@ struct Pass {
     // or writes): no barrier between them, so that the GPU runs them together
     // (but when profiling, which times each).
     bool overlapNext = false;
+    // vv_pictures: which of VMAF v1's passes that read the pictures it is,
+    // their textures bound and places pushed each frame (PictureRole).
+    int pictureRole = 0;
 };
+
+// vv_pictures' passes: motion (the reference and the previous one's luma),
+// ADM's scale 0 (both pictures' luma), CAMBI's FRONT (the distorted luma) and
+// SpEED's DEC (both pictures' chroma).
+enum PictureRole { kPictureNone, kPictureMotion, kPictureAdm, kPictureCambi, kPictureSpeed };
 
 // A buffer a pass binds, or part of one (at a multiple of the storage
 // buffers' offset alignment).
@@ -438,6 +447,7 @@ struct Bound {
     Bound(Buffer *b) : buffer(b) {}
     Bound(Buffer *b, VkDeviceSize o, VkDeviceSize r) : buffer(b), offset(o), range(r) {}
 };
+const Bound kPictureBinding(nullptr);  // a picture's texture (vv_pictures), bound each frame
 
 struct Slot {
     Buffer staging, result;
@@ -451,6 +461,12 @@ struct Slot {
     std::vector<Pass> speedPassesHost;
     Buffer speedKeep;                 // and the filtered planes est_params reads (host-visible)
     std::vector<Pass> speedPasses;
+    // vv_pictures: the frame's pictures (indices of vv_context::pictureCache:
+    // the reference, the distorted one, the reference before it for motion)
+    // and their first samples' places (previous x, y, reference x, y,
+    // distorted x, y: the push constants' last words, shaders/common.slang).
+    int pictureRef = -1, pictureDis = -1, picturePrev = -1;
+    uint32_t places[6] = {};
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool busy = false;
@@ -717,6 +733,26 @@ struct vv_context {
     template <typename F> int per_slot(std::vector<Pass> &list, F bound);
     // VMAF v1: the slots' luma planes are read where they are written (no copy).
     bool direct = false;
+    // VMAF v1 from a decoder's textures (flag bit 2, vv_pictures): the pictures
+    // read where the decoder left them, not copied into the slots. Imported
+    // once each (pictureCache); `lastPicture`: the reference before, motion's.
+    bool pictures = false;
+    struct Picture {
+        HANDLE handle = nullptr;
+        uint32_t width = 0, height = 0;
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView views[2] = {};  // luma, chroma (UINT)
+    };
+    std::vector<Picture> pictureCache;
+    int lastPicture = -1;
+    uint32_t lastPlace[2] = {};
+    PFN_vkGetMemoryWin32HandlePropertiesKHR memoryHandleProperties = nullptr;
+    int import_picture(HANDLE handle, uint32_t width, uint32_t height);
+    int set_pictures(HANDLE reference, uint32_t referenceW, uint32_t referenceH, int referenceX, int referenceY,
+                     HANDLE distorted, uint32_t distortedW, uint32_t distortedH, int distortedX, int distortedY);
+    void picture_descriptors(VkDescriptorSet set, const Pass &pass, const Slot &slot);
+    void picture_barriers(VkCommandBuffer cb, const Slot &slot, bool acquire);
     uint32_t disOffset = 0;  // the distorted plane's place in a slot's staging buffer
     // VMAF v1 with a decoder's frames: the four chroma planes in a slot's
     // staging buffer too (ref U, ref V, dis U, dis V), from sharedChroma, each
@@ -747,6 +783,12 @@ vv_context::~vv_context()
     for (Slot &slot : slots) {
         if (slot.fence)
             vk.vkDestroyFence(device, slot.fence, nullptr);
+    }
+    for (Picture &picture : pictureCache) {
+        for (VkImageView view : picture.views)
+            if (view) vk.vkDestroyImageView(device, view, nullptr);
+        if (picture.image) vk.vkDestroyImage(device, picture.image, nullptr);
+        if (picture.memory) vk.vkFreeMemory(device, picture.memory, nullptr);
     }
     for (Buffer *buffer : buffers) {
         if (buffer->buffer)
@@ -852,9 +894,20 @@ int vv_context::create_pipeline(int shader, uint32_t bindings)
     if (vk.vkCreateShaderModule(device, &module, nullptr, &pipeline.module) != VK_SUCCESS)
         return fail(-1, std::string("vkCreateShaderModule failed for ") + kShaders[shader].name);
     VkDescriptorSetLayoutBinding layoutBindings[kMaxBindings] = {};
+    // vv_pictures' shaders: the pictures' textures (the bindings in `images`).
+    uint32_t images = 0;
+    if (shader == kShader_motion_v1_8_img || shader == kShader_motion_v1_16_img || shader == kShader_adm_fused_0_8_img
+        || shader == kShader_adm_fused_0_16_img)
+        images = 3;
+    if (shader == kShader_cambi_front_8_img || shader == kShader_cambi_front_16_img
+        || shader == kShader_cambi_front_8_1_img || shader == kShader_cambi_front_16_1_img)
+        images = 1;
+    if (shader == kShader_speed_dec_img)
+        images = 1 | 16;
     for (uint32_t i = 0; i < bindings; ++i) {
         layoutBindings[i].binding = i;
-        layoutBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        layoutBindings[i].descriptorType = (images >> i) & 1 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+                                                             : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         layoutBindings[i].descriptorCount = 1;
         layoutBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
@@ -884,7 +937,8 @@ int vv_context::create_pipeline(int shader, uint32_t bindings)
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT };
     size.requiredSubgroupSize = narrowSubgroup;
     const bool narrow = shader == kShader_cambi_cvalues_slide_16 || shader == kShader_cambi_cvalues_slide
-                        || shader == kShader_adm_fused_0_8 || shader == kShader_adm_fused_0_16 || shader == kShader_adm_fused;
+                        || shader == kShader_adm_fused_0_8 || shader == kShader_adm_fused_0_16 || shader == kShader_adm_fused
+                        || shader == kShader_adm_fused_0_8_img || shader == kShader_adm_fused_0_16_img;
     if (narrowSubgroup && narrow)
         info.stage.pNext = &size;
     if (vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline.pipeline) != VK_SUCCESS)
@@ -903,12 +957,16 @@ VkDescriptorSet vv_context::descriptor_set(int shader, const std::vector<Bound> 
         return VK_NULL_HANDLE;
     VkDescriptorBufferInfo infos[kMaxBindings];
     VkWriteDescriptorSet writes[kMaxBindings];
-    uint32_t count = 0;
+    uint32_t count = 0, binding = 0;
     for (const Bound &entry : bound) {
+        if (!entry.buffer) {  // a picture's texture (kPictureBinding): bound each frame
+            ++binding;
+            continue;
+        }
         infos[count] = { entry.buffer->buffer, entry.offset, entry.range };
         writes[count] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         writes[count].dstSet = set;
-        writes[count].dstBinding = count;
+        writes[count].dstBinding = binding++;
         writes[count].descriptorCount = 1;
         writes[count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[count].pBufferInfo = &infos[count];
@@ -1237,10 +1295,22 @@ int vv_context::build_passes_v1()
     // or the one before it (the five-frame window). Frame i's reference is
     // kept in picPrev[i % 2] once the frame is done.
     for (int parity = 0; parity < 2 && !error; ++parity) {
-        const int32_t constants[] = { w, h, strideWords, bpc, 1 << (bpc - 1), kSlotSad };
+        int32_t constants[kPushBytes / 4] = { w, h, strideWords, bpc, 1 << (bpc - 1), kSlotSad };
         Buffer *previous = &picPrev[options.fiveFrameWindow ? parity : 1 - parity];
+        if (pictures) {  // the two pictures' textures, each frame
+            error = add_pass(motion[parity], deep ? kShader_motion_v1_16_img : kShader_motion_v1_8_img,
+                             { kPictureBinding, kPictureBinding, &acc }, constants, kPushBytes, groups(w, 64),
+                             groups(h, 16));
+            if (!error)
+                error = per_slot(motion[parity], [&](Slot &) {
+                    return std::vector<Bound>{ kPictureBinding, kPictureBinding, Bound(&acc) };
+                });
+            if (!error)
+                motion[parity].back().pictureRole = kPictureMotion;
+            continue;
+        }
         error = add_pass(motion[parity], deep ? kShader_motion_v1_16 : kShader_motion_v1_8,
-                         { &picRef, previous, &acc }, constants, sizeof constants, groups(w, 64), groups(h, 16));
+                         { &picRef, previous, &acc }, constants, 6 * 4, groups(w, 64), groups(h, 16));
         if (!error && direct)  // the frame before's (or the one before it) reference where it is: its slot
             error = per_slot(motion[parity], [&](Slot &slot) {
                 const size_t count = slots.size(), lag = options.fiveFrameWindow ? 2 : 1;
@@ -1403,7 +1473,21 @@ int vv_context::build_passes_v1()
             const int rows = std::max(0, p[43] - p[42]);
             const uint32_t chunks = groups(std::max(0, colEnd - colStart), kAdmOwnColumns);
             const uint32_t constants[] = { (uint32_t)(scale * kAdmParams), chunks };
-            if (scale == 0) {
+            if (scale == 0 && pictures) {
+                uint32_t pushed[kPushBytes / 4] = { constants[0], constants[1] };
+                error = add_pass(scored, deep ? kShader_adm_fused_0_16_img : kShader_adm_fused_0_8_img,
+                                 { kPictureBinding, kPictureBinding, &divTable, &admParams, &acc, &bandsRef[1],
+                                   &bandsDis[1], &admPartial },
+                                 pushed, kPushBytes, chunks, groups(rows, kAdmBandRows));
+                if (!error)
+                    error = per_slot(scored, [&](Slot &) {
+                        return std::vector<Bound>{ kPictureBinding, kPictureBinding, Bound(&divTable),
+                                                   Bound(&admParams), Bound(&acc), Bound(&bandsRef[1]),
+                                                   Bound(&bandsDis[1]), Bound(&admPartial) };
+                    });
+                if (!error)
+                    scored.back().pictureRole = kPictureAdm;
+            } else if (scale == 0) {
                 error = add_pass(scored, deep ? kShader_adm_fused_0_16 : kShader_adm_fused_0_8,
                                  { inRef, inDis, &divTable, &admParams, &acc, &bandsRef[1], &bandsDis[1], &admPartial },
                                  constants, sizeof constants, chunks, groups(rows, kAdmBandRows));
@@ -1562,6 +1646,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     skip = (flags >> 16) & 7;
     passLimit = (flags >> 20) & 0xFF;
     shared = (flags >> 19) & 1;
+    pictures = shared && (flags >> 2) & 1;  // (VMAF v1 only: decided in init, once the options are known)
     const char *extensions[4] = { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME, nullptr, nullptr, nullptr };
     uint32_t extensionCount = shared ? 1 : 0;
     {   // Subgroups of 32 lanes where they are faster (narrowSubgroup).
@@ -1693,7 +1778,12 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         getMemoryHandle = (PFN_vkGetMemoryWin32HandleKHR)api->vkGetDeviceProcAddr(device, "vkGetMemoryWin32HandleKHR");
         if (!getMemoryHandle)
             return fail(-4, deviceName + " cannot share its memory with a decoder");
+        memoryHandleProperties = (PFN_vkGetMemoryWin32HandlePropertiesKHR)api->vkGetDeviceProcAddr(
+            device, "vkGetMemoryWin32HandlePropertiesKHR");
     }
+    // The pictures from a decoder's textures: VMAF v1 at 8 or 10 bits (NV12,
+    // P010), motion against the frame before (not the five-frame window).
+    pictures = pictures && v1 && (bpc == 8 || bpc == 10) && !options.fiveFrameWindow && memoryHandleProperties;
 
     VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1701,11 +1791,12 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     if (vk.vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS)
         return fail(-1, "vkCreateCommandPool failed");
     // VMAF v1 with CAMBI and SpEED: about 150 passes, and 7 per slot (up to 16 slots).
-    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512 * kMaxBindings };
+    const VkDescriptorPoolSize poolSizes[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512 * kMaxBindings },
+                                                { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256 } };  // (vv_pictures')
     VkDescriptorPoolCreateInfo descriptorInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     descriptorInfo.maxSets = 512;
-    descriptorInfo.poolSizeCount = 1;
-    descriptorInfo.pPoolSizes = &poolSize;
+    descriptorInfo.poolSizeCount = 2;
+    descriptorInfo.pPoolSizes = poolSizes;
     if (vk.vkCreateDescriptorPool(device, &descriptorInfo, nullptr, &descriptorPool) != VK_SUCCESS)
         return fail(-1, "vkCreateDescriptorPool failed");
 
@@ -1754,7 +1845,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // Read where they are, the slots' pictures stay as long as the frames
     // after read them as their previous (staging()): a slot or two more, for
     // as many frames in flight.
-    if (direct)
+    if (direct && !pictures)
         slots.resize(std::min<size_t>(16, slots.size() + (options.fiveFrameWindow ? 2 : 1)));
     std::vector<VkCommandBuffer> commands(slots.size());
     VkCommandBufferAllocateInfo allocate = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
@@ -1899,17 +1990,26 @@ int vv_context::enable_cambi(const double *values)
         const uint32_t constants[] = { (uint32_t)w, (uint32_t)h, strideBytes / 4, (uint32_t)bpc,
                                        bpc < 10 ? 1u : 0u, (uint32_t)kSlotCambiInvalid, (uint32_t)c.mask_index,
                                        step, outW, outH };
-        const int front = c.speedup ? (bpc > 8 ? kShader_cambi_front_16 : kShader_cambi_front_8)
-                                    : (bpc > 8 ? kShader_cambi_front_16_1 : kShader_cambi_front_8_1);
+        const int front = pictures
+            ? (c.speedup ? (bpc > 8 ? kShader_cambi_front_16_img : kShader_cambi_front_8_img)
+                         : (bpc > 8 ? kShader_cambi_front_16_1_img : kShader_cambi_front_8_1_img))
+            : (c.speedup ? (bpc > 8 ? kShader_cambi_front_16 : kShader_cambi_front_8)
+                         : (bpc > 8 ? kShader_cambi_front_16_1 : kShader_cambi_front_8_1));
         // (scale 0's MODE too: it writes scale 0's filtered image)
+        uint32_t pushed[kPushBytes / 4] = {};
+        memcpy(pushed, constants, sizeof constants);
         error = add_pass(scored, front,
-                         { &picDis, &cambiFiltered[0], c.speedup ? &cambiMask[0] : &cambiMaskFull,
-                           &acc }, constants, sizeof constants, groups((int)outW, 16), groups((int)outH, 16));
+                         { pictures ? kPictureBinding : Bound(&picDis), &cambiFiltered[0],
+                           c.speedup ? &cambiMask[0] : &cambiMaskFull, &acc },
+                         pushed, pictures ? kPushBytes : (uint32_t)sizeof constants, groups((int)outW, 16),
+                         groups((int)outH, 16));
         if (!error && direct)
             error = per_slot(scored, [&](Slot &slot) {
-                return std::vector<Bound>{ slot_dis(slot), Bound(&cambiFiltered[0]),
+                return std::vector<Bound>{ pictures ? kPictureBinding : slot_dis(slot), Bound(&cambiFiltered[0]),
                                            Bound(c.speedup ? &cambiMask[0] : &cambiMaskFull), Bound(&acc) };
             });
+        if (!error && pictures)
+            scored.back().pictureRole = kPictureCambi;
     }
     // Each scale's image is the one before's filtered one decimated, its mask
     // the one before's decimated: MODE reads them every other pixel and row.
@@ -2087,17 +2187,24 @@ int vv_context::enable_speed(const double *values)
         // From the host buffer; with a decoder's frames, also from the staging buffer (the default then).
         for (int fromStaging = 0; fromStaging < (shared ? 2 : 1); ++fromStaging) {
             std::vector<Pass> &list = shared && !fromStaging ? slot.speedPassesHost : slot.speedPasses;
-            uint32_t constants[10];
-            memcpy(constants, dec, sizeof constants);
+            uint32_t constants[kPushBytes / 4] = {};
+            memcpy(constants, dec, sizeof dec);
             Bound chroma = Bound(&slot.speedChroma);
             if (fromStaging) {
                 chroma = Bound(&slot.staging, sharedChroma, 4ull * sharedChromaSpacing);
                 constants[3] = sharedChromaSpacing / 4;  // planeWords
             }
-            if (int error = add_pass(list, kShader_speed_dec, { chroma, &speedFilterTaps, &speedOperating,
-                                     &speedScaling }, constants, sizeof constants,
-                                     groups(f.operating_w * f.operating_h * 4, perGroup), 1))
+            if (fromStaging && pictures) {  // from the pictures' textures (vv_pictures)
+                if (int error = add_pass(list, kShader_speed_dec_img, { kPictureBinding, &speedFilterTaps,
+                                         &speedOperating, &speedScaling, kPictureBinding }, constants, kPushBytes,
+                                         groups(f.operating_w * f.operating_h * 4, perGroup), 1))
+                    return error;
+                list.back().pictureRole = kPictureSpeed;
+            } else if (int error = add_pass(list, kShader_speed_dec, { chroma, &speedFilterTaps, &speedOperating,
+                                            &speedScaling }, constants, sizeof dec,
+                                            groups(f.operating_w * f.operating_h * 4, perGroup), 1)) {
                 return error;
+            }
             if (int error = add_pass(list, kShader_speed_blur, { &speedOperating, &speedFilterTaps, &slot.speedKeep },
                                      blur, sizeof blur, groups(f.operating_w, 16), groups(f.operating_h, 16)))
                 return error;
@@ -2347,6 +2454,8 @@ int vv_context::commit(bool score)
     }
     vk.vkCmdFillBuffer(cb, acc.buffer, 0, VK_WHOLE_SIZE, 0);
     barrier(vk, cb, kTransfer, kCompute | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
+    if (pictures)
+        picture_barriers(cb, slot, true);
     stamp(kProfileUpload);
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
     const std::vector<Pass> *lists[4] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
@@ -2361,8 +2470,18 @@ int vv_context::commit(bool score)
         const Pipeline &pipeline = pipelines[pass.shader];
         vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
         const VkDescriptorSet set = pass.slotSets.empty() ? pass.set : pass.slotSets[slotIndex];
-        vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &set, 0, nullptr);
-        vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pass.constantBytes, pass.constants);
+        if (pass.pictureRole) {  // the frame's pictures (vv_pictures), and their places
+            picture_descriptors(set, pass, slot);
+            uint32_t pushed[kPushBytes / 4];
+            memcpy(pushed, pass.constants, kPushBytes);
+            memcpy(pushed + kPushBytes / 4 - 6, slot.places, sizeof slot.places);
+            vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &set, 0, nullptr);
+            vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, kPushBytes, pushed);
+        } else {
+            vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &set, 0, nullptr);
+            vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pass.constantBytes,
+                                  pass.constants);
+        }
         if (pass.indirect)
             vk.vkCmdDispatchIndirect(cb, pass.indirect, pass.indirectOffset);
         else
@@ -2419,15 +2538,7 @@ int vv_context::commit(bool score)
                 break;
             if (!pass.groups[0] || !pass.groups[1])
                 continue;
-            const Pipeline &pipeline = pipelines[pass.shader];
-            vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
-            const VkDescriptorSet set = pass.slotSets.empty() ? pass.set : pass.slotSets[slotIndex];
-            vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &set, 0, nullptr);
-            vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pass.constantBytes, pass.constants);
-            if (pass.indirect)
-                vk.vkCmdDispatchIndirect(cb, pass.indirect, pass.indirectOffset);
-            else
-                vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], pass.groups[2]);
+            record(pass);
             if (!pass.overlapNext || profile)
                 barrier(vk, cb, kCompute, kCompute | kTransfer | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
             stamp(pass.shader);
@@ -2438,6 +2549,8 @@ int vv_context::commit(bool score)
         VkBufferCopy keep = { 0, 0, planeBytes };
         vk.vkCmdCopyBuffer(cb, picRef.buffer, picPrev[index % 2].buffer, 1, &keep);
     }
+    if (pictures)
+        picture_barriers(cb, slot, false);
     VkBufferCopy back = { 0, 0, kSlots * 8 };
     vk.vkCmdCopyBuffer(cb, acc.buffer, slot.result.buffer, 1, &back);
     stamp(kProfileCopies);
@@ -2476,6 +2589,163 @@ int vv_context::commit(bool score)
         ++cpuCount[kCpuRecord];
     }
     return 0;
+}
+
+// A decoder's texture (its KMT handle, `width` x `height`, NV12 or P010 as
+// the context's bit depth says), imported the first time it comes: its index
+// in pictureCache, or a negative error.
+int vv_context::import_picture(HANDLE handle, uint32_t width, uint32_t height)
+{
+    for (size_t i = 0; i < pictureCache.size(); ++i)
+        if (pictureCache[i].handle == handle && pictureCache[i].width == width && pictureCache[i].height == height)
+            return (int)i;
+    if (pictureCache.size() >= 64)
+        return fail(-3, "vv_pictures: more pictures than a decoder has");
+    Picture picture;
+    picture.handle = handle;
+    picture.width = width;
+    picture.height = height;
+    const bool wide = bpc > 8;
+    VkExternalMemoryImageCreateInfo external = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+    VkImageCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    info.pNext = &external;
+    info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // its planes viewed as UINT
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = wide ? VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 : VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+    info.extent = { width, height, 1 };
+    info.mipLevels = info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    auto discard = [&](const char *text) {
+        for (VkImageView view : picture.views)
+            if (view) vk.vkDestroyImageView(device, view, nullptr);
+        if (picture.image) vk.vkDestroyImage(device, picture.image, nullptr);
+        if (picture.memory) vk.vkFreeMemory(device, picture.memory, nullptr);
+        return fail(-1, text);
+    };
+    if (vk.vkCreateImage(device, &info, nullptr, &picture.image) != VK_SUCCESS)
+        return discard("vv_pictures: Vulkan cannot take the decoder's pictures");
+    VkMemoryWin32HandlePropertiesKHR properties = { VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
+    memoryHandleProperties(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT, handle, &properties);
+    VkMemoryRequirements requirements;
+    vk.vkGetImageMemoryRequirements(device, picture.image, &requirements);
+    int type = -1;
+    for (uint32_t i = 0; i < memoryProperties.memoryTypeCount && type < 0; ++i)
+        if ((requirements.memoryTypeBits & properties.memoryTypeBits) & (1u << i))
+            type = (int)i;
+    VkMemoryDedicatedAllocateInfo exclusive = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+    exclusive.image = picture.image;
+    VkImportMemoryWin32HandleInfoKHR import = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+    import.pNext = &exclusive;
+    import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+    import.handle = handle;
+    VkMemoryAllocateInfo allocate = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    allocate.pNext = &import;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = (uint32_t)type;
+    if (type < 0 || vk.vkAllocateMemory(device, &allocate, nullptr, &picture.memory) != VK_SUCCESS
+        || vk.vkBindImageMemory(device, picture.image, picture.memory, 0) != VK_SUCCESS)
+        return discard("vv_pictures: Vulkan cannot take the decoder's pictures");
+    for (int plane = 0; plane < 2; ++plane) {
+        VkImageViewCreateInfo view = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        view.image = picture.image;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = plane == 0 ? (wide ? VK_FORMAT_R16_UINT : VK_FORMAT_R8_UINT)
+                                 : (wide ? VK_FORMAT_R16G16_UINT : VK_FORMAT_R8G8_UINT);
+        view.subresourceRange = { (VkImageAspectFlags)(plane == 0 ? VK_IMAGE_ASPECT_PLANE_0_BIT
+                                                                  : VK_IMAGE_ASPECT_PLANE_1_BIT), 0, 1, 0, 1 };
+        if (vk.vkCreateImageView(device, &view, nullptr, &picture.views[plane]) != VK_SUCCESS)
+            return discard("vv_pictures: Vulkan cannot view the decoder's pictures' planes");
+    }
+    pictureCache.push_back(picture);
+    return (int)pictureCache.size() - 1;
+}
+
+// The frame begun's pictures (vv_pictures).
+int vv_context::set_pictures(HANDLE reference, uint32_t referenceW, uint32_t referenceH, int referenceX, int referenceY,
+                             HANDLE distorted, uint32_t distortedW, uint32_t distortedH, int distortedX, int distortedY)
+{
+    if (!pictures)
+        return fail(-3, "this context does not take a decoder's textures");
+    if (!pending)
+        return fail(-3, "no frame was started");
+    const int ref = import_picture(reference, referenceW, referenceH);
+    if (ref < 0)
+        return ref;
+    const int dis = import_picture(distorted, distortedW, distortedH);
+    if (dis < 0)
+        return dis;
+    Slot &slot = *pending;
+    slot.pictureRef = ref;
+    slot.pictureDis = dis;
+    slot.picturePrev = lastPicture >= 0 ? lastPicture : ref;  // (the first frame's motion is not run)
+    const uint32_t places[6] = { lastPicture >= 0 ? lastPlace[0] : (uint32_t)referenceX,
+                                 lastPicture >= 0 ? lastPlace[1] : (uint32_t)referenceY,
+                                 (uint32_t)referenceX, (uint32_t)referenceY, (uint32_t)distortedX, (uint32_t)distortedY };
+    memcpy(slot.places, places, sizeof places);
+    lastPicture = ref;
+    lastPlace[0] = (uint32_t)referenceX;
+    lastPlace[1] = (uint32_t)referenceY;
+    return 0;
+}
+
+// A pass's pictures bound in `set` (its slot's, not in use: the slot's frame
+// before is done).
+void vv_context::picture_descriptors(VkDescriptorSet set, const Pass &pass, const Slot &slot)
+{
+    VkDescriptorImageInfo infos[2];
+    VkWriteDescriptorSet writes[2];
+    uint32_t count = 0;
+    auto add = [&](uint32_t binding, int picture, int plane) {
+        infos[count] = { VK_NULL_HANDLE, pictureCache[(size_t)picture].views[plane], VK_IMAGE_LAYOUT_GENERAL };
+        writes[count] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        writes[count].dstSet = set;
+        writes[count].dstBinding = binding;
+        writes[count].descriptorCount = 1;
+        writes[count].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[count].pImageInfo = &infos[count];
+        ++count;
+    };
+    switch (pass.pictureRole) {
+    case kPictureMotion: add(0, slot.pictureRef, 0); add(1, slot.picturePrev, 0); break;
+    case kPictureAdm: add(0, slot.pictureRef, 0); add(1, slot.pictureDis, 0); break;
+    case kPictureCambi: add(0, slot.pictureDis, 0); break;
+    case kPictureSpeed: add(0, slot.pictureRef, 1); add(4, slot.pictureDis, 1); break;
+    default: break;
+    }
+    vk.vkUpdateDescriptorSets(device, count, writes, 0, nullptr);
+}
+
+// The frame's pictures taken from Direct3D 11 (the external queue family)
+// before its passes, or given back after them.
+void vv_context::picture_barriers(VkCommandBuffer cb, const Slot &slot, bool acquire)
+{
+    VkImageMemoryBarrier barriers[3];
+    uint32_t count = 0;
+    for (int picture : { slot.pictureRef, slot.pictureDis, slot.picturePrev }) {
+        bool seen = picture < 0;
+        for (uint32_t i = 0; i < count && !seen; ++i)
+            seen = barriers[i].image == pictureCache[(size_t)picture].image;
+        if (seen)
+            continue;
+        VkImageMemoryBarrier &b = barriers[count++];
+        b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        b.srcAccessMask = acquire ? 0 : VK_ACCESS_SHADER_READ_BIT;
+        b.dstAccessMask = acquire ? VK_ACCESS_SHADER_READ_BIT : 0;
+        b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = acquire ? VK_QUEUE_FAMILY_EXTERNAL : queueFamily;
+        b.dstQueueFamilyIndex = acquire ? queueFamily : VK_QUEUE_FAMILY_EXTERNAL;
+        b.image = pictureCache[(size_t)picture].image;
+        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    }
+    if (count)
+        vk.vkCmdPipelineBarrier(cb, acquire ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : kCompute,
+                                acquire ? kCompute : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr,
+                                count, barriers);
 }
 
 int vv_context::flush()
@@ -2622,6 +2892,25 @@ VV_EXPORT int vv_shared_next(vv_context *context, int *slot, uint32_t *stride, u
     *planeBytes = context->disOffset;  // where the distorted plane starts
     return (int)context->slots.size();
 }
+
+// The frame begun's pictures where a decoder left them (a context made with
+// flag bit 2 -- vv_pictures_mode says whether it takes them): each its
+// texture's KMT handle (a Direct3D 11 texture shared without a mutex), the
+// texture's size and its first sample's place in it, NV12 (8-bit) or P010
+// (10-bit, the samples' bits at the top). Instead of the frame's planes in
+// the slot's staging buffer: the pictures must stay as they are until the
+// frame is done -- and the reference until the next frame is (its motion).
+VV_EXPORT int vv_pictures(vv_context *context, void *reference, uint32_t referenceW, uint32_t referenceH,
+                          int referenceX, int referenceY, void *distorted, uint32_t distortedW, uint32_t distortedH,
+                          int distortedX, int distortedY)
+{
+    return context->set_pictures(reference, referenceW, referenceH, referenceX, referenceY, distorted, distortedW,
+                                 distortedH, distortedX, distortedY);
+}
+
+// 1 if the context takes its frames' pictures from a decoder's textures
+// (vv_pictures), else 0.
+VV_EXPORT int vv_pictures_mode(vv_context *context) { return context->pictures ? 1 : 0; }
 
 // A slot's staging buffer as a Win32 handle another API on this GPU imports
 // (an opaque Win32 handle of a dedicated allocation of *bytes: CUDA's

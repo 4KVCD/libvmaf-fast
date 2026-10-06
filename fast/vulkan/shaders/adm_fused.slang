@@ -36,8 +36,15 @@
 #define NEXT 0
 #endif
 
+#if FROM_IMAGE
+[[vk::push_constant]] uniform uint pc[32];  // the scale's first word in params; the pictures' places (common.slang)
+#else
 [[vk::push_constant]] uniform uint pc[4];  // the scale's first word in params
-#if FROM_PICTURE
+#endif
+#if FROM_PICTURE && FROM_IMAGE
+[[vk::binding(0, 0)]] Texture2D<uint> refPicture;
+[[vk::binding(1, 0)]] Texture2D<uint> disPicture;
+#elif FROM_PICTURE
 [[vk::binding(0, 0)]] StructuredBuffer<uint> refPicture;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> disPicture;
 #else
@@ -141,14 +148,22 @@ static const int kLoSum = 46342;
 
 // adm_dwt.slang's SCALE0 transform at band position (i, j): a, and h, v, d
 // in bands[0..2].
-int transform(StructuredBuffer<uint> source, int i, int j, out int bands[3])
+#if FROM_IMAGE
+int transform(Texture2D<uint> source, int place, int i, int j, out int bands[3])
+#else
+int transform(StructuredBuffer<uint> source, int place, int i, int j, out int bands[3])
+#endif
 {
     const int4 columns = indices(j, PIC_W), rows = indices(i, PIC_H);
     int lo[4], hi[4];
     for (int c = 0; c < 4; ++c) {
         int sumLo = 0, sumHi = 0;
         for (int k = 0; k < 4; ++k) {
+#if FROM_IMAGE
+            const int sample = int(image_pixel(source, columns[c], rows[k], int(pc[place]), int(pc[place + 1])));
+#else
             const int sample = int(pixel(source, columns[c], rows[k], PIC_STRIDE));
+#endif
             sumLo += kLo[k] * sample;
             sumHi += kHi[k] * sample;
         }
@@ -174,8 +189,8 @@ int transform(StructuredBuffer<uint> source, int i, int j, out int bands[3])
 void load_bands(int i, int j, out int o[3], out int t[3])
 {
 #if FROM_PICTURE
-    transform(refPicture, i, j, o);
-    transform(disPicture, i, j, t);
+    transform(refPicture, PICTURE_REFERENCE, i, j, o);
+    transform(disPicture, PICTURE_DISTORTED, i, j, t);
 #else
     const int from = (i * IN_STRIDE + j) * 4;
     for (int b = 0; b < 3; ++b) {
@@ -349,8 +364,8 @@ void slide_row(int i, int j, uint local, bool own, inout int restored[3], inout 
     // 1's transform of a); rows and columns past it as the masking reads them.
     int o[3] = { 0, 0, 0 }, t[3] = { 0, 0, 0 };
     if (cj >= 0 && cj < BW) {
-        aRef = transform(refPicture, ci, cj, o);
-        aDis = transform(disPicture, ci, cj, t);
+        aRef = transform(refPicture, PICTURE_REFERENCE, ci, cj, o);
+        aDis = transform(disPicture, PICTURE_DISTORTED, ci, cj, t);
     }
     if (inDen) {
         for (int b = 0; b < 3; ++b)
