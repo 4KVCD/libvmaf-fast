@@ -1214,7 +1214,7 @@ int vv_context::build_passes_v1()
         const int32_t constants[] = { w, h, strideWords, bpc, 1 << (bpc - 1), kSlotSad };
         Buffer *previous = &picPrev[options.fiveFrameWindow ? parity : 1 - parity];
         error = add_pass(motion[parity], deep ? kShader_motion_v1_16 : kShader_motion_v1_8,
-                         { &picRef, previous, &acc }, constants, sizeof constants, groups(w, 16), groups(h, 16));
+                         { &picRef, previous, &acc }, constants, sizeof constants, groups(w, 64), groups(h, 16));
         if (!error && direct)  // the frame before's (or the one before it) reference where it is: its slot
             error = per_slot(motion[parity], [&](Slot &slot) {
                 const size_t count = slots.size(), lag = options.fiveFrameWindow ? 2 : 1;
