@@ -494,6 +494,9 @@ struct vv_context {
     int decoupleVariant = 0;  // adm_decouple_0's VARIANT (shaders/adm_decouple.slang)
     // VIF's two passes as one (vif_fused); VV_VIF_FUSED=0 for the two, to compare.
     bool vifFused = true;
+    // The GPU has subgroup arithmetic (Vulkan 1.1's, optional): motion adds
+    // up its groups' distances with it (motion_8w, _16w), as vif_fused its sums.
+    bool subgroupSums = true;
     uint32_t strideBytes = 0, planeBytes = 0;
     // The first passes read each pair's frames where they were written (the
     // frame slot's staging buffers: the reference's in staging, the
@@ -1050,7 +1053,9 @@ int vv_context::build_passes()
     // Motion (integer_motion_cuda.c: calculate_motion_score).
     for (int parity = 0; parity < 2 && !error && !(skip & 1); ++parity) {
         const int32_t constants[] = { w, h, strideWords, bpc, 1 << (bpc - 1), kSlotSad };
-        error = add_pass(motion[parity], deep ? kShader_motion_16 : kShader_motion_8,
+        const int shader = subgroupSums ? (deep ? kShader_motion_16w : kShader_motion_8w)
+                                        : (deep ? kShader_motion_16 : kShader_motion_8);
+        error = add_pass(motion[parity], shader,
                          { &picRef, &blur[parity], &blur[1 - parity], &acc }, constants, sizeof constants,
                          groups(w, 64), groups(h, 8));
     }
@@ -1720,7 +1725,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
             api->vkGetPhysicalDeviceProperties2(physical, &query);
         const VkSubgroupFeatureFlags needed = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
         if (!(subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) || (subgroup.supportedOperations & needed) != needed)
-            vifFused = false;
+            vifFused = subgroupSums = false;
     }
     if (const char *text = getenv("VV_ADM_BOTH"))
         admBoth = strcmp(text, "0") != 0;

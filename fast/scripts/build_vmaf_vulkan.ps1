@@ -27,6 +27,8 @@ $output = Join-Path $outputDirectory 'vmaf_vulkan.dll'
 $shaders = [ordered]@{
     'motion_8'          = 'motion', 'BPC16=0'
     'motion_16'         = 'motion', 'BPC16=1'
+    'motion_8w'         = 'motion', 'BPC16=0', 'WAVE=1'
+    'motion_16w'        = 'motion', 'BPC16=1', 'WAVE=1'
     'vif_vert_0_8'      = 'vif_vert', 'SRC_PICTURE=1', 'BPC16=0', 'SCALE=0', 'FW=17', 'FW_RD=9'
     'vif_vert_0_16'     = 'vif_vert', 'SRC_PICTURE=1', 'BPC16=1', 'SCALE=0', 'FW=17', 'FW_RD=9'
     'vif_vert_1'        = 'vif_vert', 'SRC_PICTURE=0', 'BPC16=0', 'SCALE=1', 'FW=9', 'FW_RD=5'

@@ -64,8 +64,18 @@ groupshared uint gIn[IN_W / 2 * IN_H];
 // makes its columns' sums again from gIn, in 32 bits.
 groupshared uint gVertical[TH * IN_W / 2];
 groupshared uint gWide;
+#ifndef WAVE
+#define WAVE 0
+#endif
+#if WAVE
+// The group's distance, each subgroup's sum (subgroup arithmetic, which the
+// engine uses where the GPU has it) added in: one barrier, where adding up
+// the threads' distances in group memory took two.
+groupshared uint gTotal;
+#else
 // Each thread's distance, for the group's sum.
 groupshared uint gDistances[TW / 2 * TH];
+#endif
 
 // Column `column`'s vertical sum (the kernel's blurred_y, rounded) at tile
 // row `row`, from gIn: the wide tiles' way.
@@ -98,8 +108,12 @@ void main(uint3 group : SV_GroupID, uint3 lid : SV_GroupThreadID, uint local : S
     // Each sample of the tile read once, not 25 times: the kernel's sums of
     // the same samples, in the same order.
     const int x0 = int(group.x) * TW, y0 = int(group.y) * TH;
-    if (local == 0)
+    if (local == 0) {
         gWide = 0;  // before the first barrier below; set after it
+#if WAVE
+        gTotal = 0;
+#endif
+    }
 #if BPC16
     // The bits above the depth, in both samples of a word.
     const uint above = ((0xFFFFu << uint(P_shiftY)) & 0xFFFFu) * 0x10001u;
@@ -183,6 +197,15 @@ void main(uint3 group : SV_GroupID, uint3 lid : SV_GroupThreadID, uint local : S
         if (second)
             distance += uint(abs(int(blurred[1]) - int(before >> 16)));
     }
+#if WAVE
+    // At most 512 pixels' distances of 16 bits: below 2^25.
+    const uint subgroupSum = WaveActiveSum(distance);
+    if (WaveIsFirstLane())
+        InterlockedAdd(gTotal, subgroupSum);
+    GroupMemoryBarrierWithGroupSync();
+    if (local == 0 && gTotal != 0)
+        acc_add64(acc, P_slot, uint64_t(gTotal));
+#else
     gDistances[local] = distance;
     GroupMemoryBarrierWithGroupSync();
     if (local < uint(TW / 2 * TH / 16)) {
@@ -199,4 +222,5 @@ void main(uint3 group : SV_GroupID, uint3 lid : SV_GroupThreadID, uint local : S
         if (sum != 0)
             acc_add64(acc, P_slot, uint64_t(sum));
     }
+#endif
 }
