@@ -502,11 +502,17 @@ struct vv_context {
     // up its groups' distances with it (motion_8w, _16w), as vif_fused its sums.
     bool subgroupSums = true;
     uint32_t strideBytes = 0, planeBytes = 0;
+    // Where the distorted's plane starts in a slot's staging buffer, when
+    // that holds both planes (all but direct without shared): planeBytes,
+    // rounded up to the GPU's alignment of storage buffers' offsets when the
+    // passes read it there (direct and shared).
+    VkDeviceSize disOffset = 0;
     // The first passes read each pair's frames where they were written (the
     // frame slot's staging buffers: the reference's in staging, the
-    // distorted's in stagingDis), not from picRef and picDis after a copy:
-    // on integrated GPUs, and discrete ones whose memory the CPU writes
-    // (barFrames), but for VMAF v1 and frames from a decoder's CUDA (shared).
+    // distorted's in stagingDis, or in staging at disOffset where a decoder
+    // writes them), not from picRef and picDis after a copy: on integrated
+    // GPUs, discrete ones whose memory the CPU writes (barFrames), and frames
+    // a decoder writes on the GPU (shared); but not for VMAF v1.
     // VV_DIRECT_FRAMES=0 for the copy, to compare.
     bool direct = true;
     // A discrete GPU whose memory the CPU can map as a whole (Resizable BAR:
@@ -1025,7 +1031,9 @@ int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_l
         for (uint32_t b = 0; b < count; ++b) {
             Buffer *buffer = bound.begin()[b];
             infos[b].buffer = buffer == &picRef ? slots[i].staging.buffer
-                              : buffer == &picDis ? slots[i].stagingDis.buffer : buffer->buffer;
+                              : buffer == &picDis ? (shared ? slots[i].staging.buffer : slots[i].stagingDis.buffer)
+                              : buffer->buffer;
+            infos[b].offset = buffer == &picDis && shared ? disOffset : 0;
             writes[b].dstSet = pass.slotSets[i];
         }
         vk.vkUpdateDescriptorSets(device, count, writes, 0, nullptr);
@@ -1808,8 +1816,8 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         if (const char *text = getenv("VV_BAR_FRAMES"))
             barFrames = barFrames && strcmp(text, "0") != 0;
     }
-    direct = direct && !shared && !v1
-             && (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || barFrames);
+    direct = direct && !v1
+             && (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || barFrames || shared);
     barFrames = barFrames && direct;
     if (const char *text = getenv("VV_VIF_FUSED"))
         vifFused = strcmp(text, "0") != 0;
@@ -1978,6 +1986,10 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     const uint32_t sampleBytes = bpc > 8 ? 2 : 1;
     strideBytes = ((uint32_t)w * sampleBytes + 3) & ~3u;
     planeBytes = strideBytes * (uint32_t)h;
+    {
+        const VkDeviceSize align = std::max<VkDeviceSize>(properties.limits.minStorageBufferOffsetAlignment, 4);
+        disOffset = direct && shared ? (planeBytes + align - 1) / align * align : planeBytes;
+    }
     const VkDeviceSize pixels = (VkDeviceSize)w * h;
     const int w1 = (w + 1) / 2, h1 = (h + 1) / 2, w2 = (w1 + 1) / 2, h2 = (h1 + 1) / 2;
     const int rw1 = (w / 2 + 1) / 2, rh1 = (h / 2 + 1) / 2;
@@ -2034,9 +2046,10 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         if (vk.vkCreateFence(device, &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS)
             return fail(-1, "vkCreateFence failed");
-        if (int error = create_buffer(slot.staging, (VkDeviceSize)planeBytes * (direct ? 1 : 2), !shared, shared, true))
+        const bool apart = direct && !shared;  // the distorted's plane in stagingDis
+        if (int error = create_buffer(slot.staging, apart ? planeBytes : disOffset + planeBytes, !shared, shared, true))
             return error;
-        if (int error = create_buffer(slot.stagingDis, direct ? planeBytes : 4, true, false, true))
+        if (int error = create_buffer(slot.stagingDis, apart ? planeBytes : 4, true, false, true))
             return error;
         if (int error = create_buffer(slot.result, kSlots * 8, true))
             return error;
@@ -2141,7 +2154,8 @@ int vv_context::staging(uint8_t **ref, uint8_t **dis)
         return error;
     pending = &slot;
     *ref = (uint8_t *)slot.staging.mapped;
-    *dis = direct ? (uint8_t *)slot.stagingDis.mapped : (uint8_t *)slot.staging.mapped + planeBytes;
+    *dis = direct && !shared ? (uint8_t *)slot.stagingDis.mapped
+           : slot.staging.mapped ? (uint8_t *)slot.staging.mapped + disOffset : nullptr;
     return 0;
 }
 
@@ -2252,7 +2266,9 @@ int vv_context::commit(bool score)
         // "external" queue family for the copy and handed back after it,
         // in the general layout throughout (the memory is Direct3D's).
         const int textures[2] = { pendingTextures[0], score ? pendingTextures[1] : -1 };
-        Buffer *targets[2] = { direct ? &slot.staging : &picRef, direct ? &slot.stagingDis : &picDis };
+        Buffer *targets[2] = { direct ? &slot.staging : &picRef,
+                               direct ? (shared ? &slot.staging : &slot.stagingDis) : &picDis };
+        const VkDeviceSize offsets[2] = { 0, direct && shared ? disOffset : 0 };
         pendingTextures[0] = pendingTextures[1] = -1;
         for (int i = 0; i < 2; ++i) {
             if (textures[i] < 0)
@@ -2268,6 +2284,7 @@ int vv_context::commit(bool score)
             vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
                                     nullptr, 0, nullptr, 1, &take);
             VkBufferImageCopy region = {};
+            region.bufferOffset = offsets[i];
             region.bufferRowLength = strideBytes / (bpc > 8 ? 2 : 1);
             region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             region.imageExtent = { (uint32_t)w, (uint32_t)h, 1 };
@@ -2284,7 +2301,7 @@ int vv_context::commit(bool score)
         VkBufferCopy copy = { 0, 0, planeBytes };
         vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
         if (score) {
-            copy.srcOffset = planeBytes;
+            copy.srcOffset = disOffset;
             vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picDis.buffer, 1, &copy);
         }
     }
@@ -2545,10 +2562,10 @@ VV_EXPORT int vv_commit(vv_context *context, int score) { return context->commit
 // For a context made with flag bit 19 (frames from GPU memory): the staging
 // buffer the next pair's luma planes are to be written into by the API that
 // imported it -- *slot says which (they take turns), the reference's rows
-// start at offset 0 and the distorted's at *planeBytes, *stride bytes apart.
+// start at offset 0 and the distorted's at *disOffset, *stride bytes apart.
 // Once they are written (and that API has finished writing), vv_commit.
 // Returns how many slots there are.
-VV_EXPORT int vv_shared_next(vv_context *context, int *slot, uint32_t *stride, uint32_t *planeBytes)
+VV_EXPORT int vv_shared_next(vv_context *context, int *slot, uint32_t *stride, uint32_t *disOffset)
 {
     if (!context->shared)
         return fail(-3, "this context takes its frames from host memory");
@@ -2557,7 +2574,7 @@ VV_EXPORT int vv_shared_next(vv_context *context, int *slot, uint32_t *stride, u
         return error;
     *slot = (int)context->nextSlot;
     *stride = context->strideBytes;
-    *planeBytes = context->planeBytes;
+    *disOffset = (uint32_t)context->disOffset;
     return (int)context->slots.size();
 }
 
