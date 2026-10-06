@@ -328,7 +328,10 @@ void main(uint3 id : SV_DispatchThreadID)
 // pc: w, h, pad, vltLuma, bandBase, bandSize, tvi[0..3] (+ num_diffs), weights[0..3], rows per workgroup
 #define NUM_DIFFS 4
 #define S 64             // the tile's columns: a thread each
-#define COLS 128         // S + 2 * 32
+#ifndef MAX_PAD
+#define MAX_PAD 32       // the pads (window_size / 2) this variant takes
+#endif
+#define COLS (S + 2 * MAX_PAD)  // the columns its windows reach: less shared memory, more workgroups at once
 #define WORDS (COLS / 4)
 #define VALUES 64        // a window of values
 #define CORE 56          // VALUES - 2 * NUM_DIFFS

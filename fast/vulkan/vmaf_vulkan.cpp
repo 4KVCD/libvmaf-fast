@@ -1846,7 +1846,8 @@ int vv_context::enable_cambi(const double *values)
             }
             constants[14] = rows;
             const bool slide = (c.window_size >> 1) <= 32 && c.v_band_size <= 32 * 56 && !cambiBruteForce;
-            error = slide ? add_pass(cvalues, kShader_cambi_cvalues_slide, { &cambiFiltered[scale], mask, &cambiC[scale],
+            const int slideShader = (c.window_size >> 1) <= 16 ? kShader_cambi_cvalues_slide_16 : kShader_cambi_cvalues_slide;
+            error = slide ? add_pass(cvalues, slideShader, { &cambiFiltered[scale], mask, &cambiC[scale],
                                      &cambiReciprocal }, constants, sizeof constants, groups(sw, 64), groups(sh, (int)rows))
                           : add_pass(cvalues, kShader_cambi_cvalues, { &cambiFiltered[scale], mask, &cambiC[scale],
                                      &cambiReciprocal }, constants, sizeof constants, groups(sw, 16), groups(sh, 16));
