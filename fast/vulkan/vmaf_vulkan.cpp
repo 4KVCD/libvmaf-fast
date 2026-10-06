@@ -51,6 +51,7 @@
 
 #include "shaders_spv.h"
 #include "v1_host.h"
+#include "v1_speed.h"
 #include "cambi_lut.h"
 
 #define VV_EXPORT extern "C" __declspec(dllexport)
@@ -183,6 +184,7 @@ struct FrameSums {
     uint64_t slots[kSlots] = {};
     double cambiPooled[V1_CAMBI_SCALES] = {};  // spatial_pooling on the CPU, where the GPU's top k was not exact
     unsigned cambiPooledScales = 0;           // which scales those are (bits)
+    double speed[3] = { NAN, NAN, NAN };      // SpEED chroma's u, v and uv scores
 };
 
 // As libvmaf: write_scores() of integer_vif_cuda.c.
@@ -417,6 +419,9 @@ struct Slot {
     Buffer staging, result;
     Buffer cambiKeep;                 // VMAF v1's CAMBI: the c-values of scales the CPU pools (host-visible)
     std::vector<Pass> cambiKeepPasses;
+    Buffer speedChroma;               // VMAF v1's SpEED: the pair's chroma planes (host-visible)
+    Buffer speedKeep;                 // and the filtered planes est_params reads (host-visible)
+    std::vector<Pass> speedPasses;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool busy = false;
@@ -495,6 +500,18 @@ struct vv_context {
         cambiC[V1_CAMBI_SCALES];
     int enable_cambi(const double *values);
 
+    // VMAF v1's SpEED chroma (vv_v1_speed): the GPU filters the four chroma
+    // planes (shaders/speed.slang), v1_speed.c scores them when a frame is
+    // collected.
+    bool speed = false;
+    V1SpeedOptions speedOptions = {};
+    V1SpeedFilters speedFilters = {};
+    V1Speed *speedState = nullptr;
+    uint32_t chromaW = 0, chromaH = 0, chromaStrideBytes = 0, chromaPlaneBytes = 0;
+    Buffer speedFilterTaps, speedOperating, speedScaling;
+    std::vector<float> speedPlanes;  // a frame's filtered planes, out of the slot's buffer
+    int enable_speed(const double *values);
+
     std::vector<Slot> slots;
     unsigned nextSlot = 0;
     unsigned frames = 0;
@@ -510,6 +527,7 @@ struct vv_context {
     int upload(Buffer &target, const void *data, size_t bytes);
     int build_passes();
     int submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *dis, ptrdiff_t disStride, bool score);
+    int submit_v1(const uint8_t *const planes[6], const ptrdiff_t strides[6], bool score);
     int staging(uint8_t **ref, uint8_t **dis);
     int commit(bool score);
     Slot *pending = nullptr;
@@ -519,6 +537,7 @@ struct vv_context {
 
 vv_context::~vv_context()
 {
+    v1_speed_free(speedState);
     if (!device)
         return;
     vk.vkDeviceWaitIdle(device);
@@ -1326,9 +1345,10 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     poolInfo.queueFamilyIndex = queueFamily;
     if (vk.vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS)
         return fail(-1, "vkCreateCommandPool failed");
-    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256 * kMaxBindings };  // VMAF v1 with CAMBI: about 150 passes
+    // VMAF v1 with CAMBI and SpEED: about 150 passes, and 7 per slot (up to 16 slots).
+    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512 * kMaxBindings };
     VkDescriptorPoolCreateInfo descriptorInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    descriptorInfo.maxSets = 256;
+    descriptorInfo.maxSets = 512;
     descriptorInfo.poolSizeCount = 1;
     descriptorInfo.pPoolSizes = &poolSize;
     if (vk.vkCreateDescriptorPool(device, &descriptorInfo, nullptr, &descriptorPool) != VK_SUCCESS)
@@ -1579,6 +1599,98 @@ int vv_context::enable_cambi(const double *values)
     return 0;
 }
 
+// SpEED chroma's passes, per slot (each reads its slot's chroma planes and
+// writes its slot's filtered ones): DEC and BLUR of shaders/speed.slang, on
+// 4:2:0's chroma, w/2 x h/2 as libvmaf's init_chroma takes it.
+int vv_context::enable_speed(const double *values)
+{
+    if (!v1)
+        return fail(-3, "SpEED is calculated in a VMAF v1 context only");
+    if (frames || speed)
+        return fail(-3, "SpEED is started before the first frame");
+    V1SpeedOptions &o = speedOptions;
+    o.kernelscale = values[0];
+    o.prescale = values[1];
+    o.bilinear = values[2] != 0;
+    o.sigma_nn = values[3];
+    o.nn_floor = values[4];
+    o.weight_var_mode = (int)values[5];
+    o.max_val = values[6];
+    // picture_copy reads 8-bit samples but at 10, 12 and 16 bits.
+    if (bpc != 8 && bpc != 10 && bpc != 12 && bpc != 16)
+        return fail(-4, "SpEED: only 8, 10, 12 and 16 bits are calculated on the GPU");
+    chromaW = (uint32_t)w / 2;
+    chromaH = (uint32_t)h / 2;
+    if (int error = v1_speed_filters(&o, chromaW, chromaH, &speedFilters))
+        return fail(error, error == -4 ? "SpEED: only the bilinear prescale is calculated on the GPU"
+                                       : "SpEED: speed.c's init refuses this picture or these options");
+    const V1SpeedFilters &f = speedFilters;
+    // The bilinear tables (a word of zeros where the plane is not rescaled).
+    std::vector<uint32_t> scaling(1, 0);
+    if (f.scaled) {
+        const size_t sw = (size_t)f.scaled_w, sh = (size_t)f.scaled_h;
+        scaling.assign(3 * sw + 3 * sh, 0);
+        std::vector<int> x1(sw), x2(sw), y1(sh), y2(sh);
+        std::vector<float> dx(sw), dy(sh);
+        v1_speed_bilinear_tables(chromaW, chromaH, &f, x1.data(), x2.data(), dx.data(), y1.data(), y2.data(), dy.data());
+        for (size_t i = 0; i < sw; ++i) {
+            scaling[i] = (uint32_t)x1[i];
+            scaling[sw + i] = (uint32_t)x2[i];
+            memcpy(&scaling[2 * sw + i], &dx[i], 4);
+        }
+        for (size_t i = 0; i < sh; ++i) {
+            scaling[3 * sw + i] = (uint32_t)y1[i];
+            scaling[3 * sw + sh + i] = (uint32_t)y2[i];
+            memcpy(&scaling[3 * sw + 2 * sh + i], &dy[i], 4);
+        }
+    }
+    if (int error = create_buffer(speedScaling, scaling.size() * 4, false))
+        return error;
+    if (int error = upload(speedScaling, scaling.data(), scaling.size() * 4))
+        return error;
+    const uint32_t sampleBytes = bpc > 8 ? 2 : 1;
+    chromaStrideBytes = (chromaW * sampleBytes + 3) & ~3u;
+    chromaPlaneBytes = chromaStrideBytes * chromaH;
+    const VkDeviceSize operating = (VkDeviceSize)f.operating_w * f.operating_h;
+    std::vector<float> taps(f.antialias, f.antialias + f.antialias_taps);
+    taps.insert(taps.end(), f.blur, f.blur + f.blur_taps);
+    if (int error = create_buffer(speedFilterTaps, taps.size() * sizeof(float), false))
+        return error;
+    if (int error = upload(speedFilterTaps, taps.data(), taps.size() * sizeof(float)))
+        return error;
+    if (int error = create_buffer(speedOperating, operating * 4 * sizeof(float), false))
+        return error;
+    float inverse = bpc == 8 ? 1.0f : 1.0f / (float)(1u << (bpc == 10 ? 2 : bpc == 12 ? 4 : 8));
+    uint32_t inverseBits;
+    memcpy(&inverseBits, &inverse, sizeof inverseBits);
+    for (Slot &slot : slots) {
+        if (int error = create_buffer(slot.speedChroma, (VkDeviceSize)chromaPlaneBytes * 4, true))
+            return error;
+        if (int error = create_buffer(slot.speedKeep, operating * 4 * sizeof(float), true))
+            return error;
+        const uint32_t dec[] = { (uint32_t)f.scaled_w, (uint32_t)f.scaled_h, chromaStrideBytes / 4,
+                                 chromaPlaneBytes / 4, (uint32_t)f.operating_w, (uint32_t)f.operating_h,
+                                 (uint32_t)f.antialias_taps, (uint32_t)bpc, inverseBits, f.scaled ? 1u : 0u };
+        if (int error = add_pass(slot.speedPasses, kShader_speed_dec, { &slot.speedChroma, &speedFilterTaps,
+                                 &speedOperating, &speedScaling }, dec, sizeof dec, groups(f.operating_w, 16),
+                                 groups(f.operating_h, 16)))
+            return error;
+        slot.speedPasses.back().groups[2] = 4;
+        const uint32_t blur[] = { (uint32_t)f.operating_w, (uint32_t)f.operating_h, (uint32_t)f.antialias_taps,
+                                  (uint32_t)f.blur_taps };
+        if (int error = add_pass(slot.speedPasses, kShader_speed_blur, { &speedOperating, &speedFilterTaps,
+                                 &slot.speedKeep }, blur, sizeof blur, groups(f.operating_w, 16), groups(f.operating_h, 16)))
+            return error;
+        slot.speedPasses.back().groups[2] = 4;
+    }
+    speedState = v1_speed_new(&o, chromaW, chromaH);
+    if (!speedState)
+        return fail(-2, "SpEED: out of memory");
+    speedPlanes.resize((size_t)operating * 4);
+    speed = true;
+    return 0;
+}
+
 int vv_context::collect(Slot &slot)
 {
     if (!slot.busy)
@@ -1606,6 +1718,13 @@ int vv_context::collect(Slot &slot)
             frame.cambiPooled[scale] = v1_cambi_pool(values.data(), cambiOptions.topk, (unsigned)sw, (unsigned)sh);
             frame.cambiPooledScales |= 1u << scale;
         }
+    }
+    if (speed && slot.scored) {
+        // Out of the slot's buffer first: est_params reads each value hundreds of times.
+        memcpy(speedPlanes.data(), slot.speedKeep.mapped, speedPlanes.size() * sizeof(float));
+        const size_t n = speedPlanes.size() / 4;
+        float *planes[4] = { &speedPlanes[0], &speedPlanes[2 * n], &speedPlanes[n], &speedPlanes[3 * n] };  // ref U, dis U, ref V, dis V
+        v1_speed_chroma(speedState, planes, frame.speed);
     }
     return 0;
 }
@@ -1651,6 +1770,46 @@ int vv_context::submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *d
     return commit(score);
 }
 
+// VMAF v1's way in with the chroma planes, which SpEED reads: planes and
+// strides of the reference's Y, U and V and the distorted's.
+int vv_context::submit_v1(const uint8_t *const planes[6], const ptrdiff_t strides[6], bool score)
+{
+    if (shared)
+        return fail(-3, "this context takes its frames from GPU memory");
+    if (!planes[0] || (score && !planes[3]))
+        return fail(-3, "a frame needs its reference picture, a scored one its distorted one too");
+    if (speed && score) {
+        for (int plane : { 1, 2, 4, 5 }) {
+            if (!planes[plane])
+                return fail(-3, "SpEED needs the chroma planes");
+        }
+    }
+    uint8_t *targets[2];
+    if (int error = staging(&targets[0], &targets[1]))
+        return error;
+    auto copy = [](uint8_t *to, uint32_t toStride, const uint8_t *from, ptrdiff_t fromStride, size_t rowBytes,
+                   uint32_t rows) {
+        if (fromStride == (ptrdiff_t)toStride) {
+            memcpy(to, from, (size_t)toStride * (rows - 1) + rowBytes);
+        } else {
+            for (uint32_t y = 0; y < rows; ++y)
+                memcpy(to + (size_t)y * toStride, from + (ptrdiff_t)y * fromStride, rowBytes);
+        }
+    };
+    const size_t sampleBytes = bpc > 8 ? 2 : 1;
+    copy(targets[0], strideBytes, planes[0], strides[0], (size_t)w * sampleBytes, (uint32_t)h);
+    if (score)
+        copy(targets[1], strideBytes, planes[3], strides[3], (size_t)w * sampleBytes, (uint32_t)h);
+    if (speed && score) {
+        uint8_t *chroma = (uint8_t *)pending->speedChroma.mapped;
+        const int order[4] = { 1, 2, 4, 5 };  // ref U, ref V, dis U, dis V
+        for (int i = 0; i < 4; ++i)
+            copy(chroma + (size_t)i * chromaPlaneBytes, chromaStrideBytes, planes[order[i]], strides[order[i]],
+                 chromaW * sampleBytes, chromaH);
+    }
+    return commit(score);
+}
+
 int vv_context::commit(bool score)
 {
     if (!pending)
@@ -1679,8 +1838,9 @@ int vv_context::commit(bool score)
     vk.vkCmdFillBuffer(cb, acc.buffer, 0, VK_WHOLE_SIZE, 0);
     barrier(vk, cb, kTransfer, kCompute | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
-    const std::vector<Pass> *lists[3] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
-                                          score && cambi ? &slot.cambiKeepPasses : nullptr };
+    const std::vector<Pass> *lists[4] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
+                                          score && cambi ? &slot.cambiKeepPasses : nullptr,
+                                          score && speed ? &slot.speedPasses : nullptr };
     for (const std::vector<Pass> *list : lists) {
         if (!list)
             continue;
@@ -1708,6 +1868,13 @@ int vv_context::commit(bool score)
     }
     VkBufferCopy back = { 0, 0, kSlots * 8 };
     vk.vkCmdCopyBuffer(cb, acc.buffer, slot.result.buffer, 1, &back);
+    // What the shaders and the copy wrote into host-visible buffers, visible
+    // to the host once the fence is signalled.
+    VkMemoryBarrier toHost = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    toHost.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vk.vkCmdPipelineBarrier(cb, kCompute | kTransfer, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, nullptr, 0,
+                            nullptr);
     vk.vkEndCommandBuffer(cb);
     VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.commandBufferCount = 1;
@@ -1923,6 +2090,59 @@ VV_EXPORT int vv_v1_cambi_scores(vv_context *context, double *out, unsigned fram
         }
         out[i] = v1_cambi_score(scores, c.pixels_in_window, context->cambiOptions.max_val);
     }
+    return (int)sums.size();
+}
+
+// VMAF v1's SpEED chroma on the GPU (and libvmaf's est_params on the CPU,
+// v1_speed.c), for a context made by vv_create_v1, before its first frame;
+// its frames then go in with vv_submit_v1 (or, from a decoder, their chroma
+// with vv_chroma_staging). `options`: speed_kernelscale, speed_prescale,
+// 1 if speed_prescale_method is bilinear (else 0), speed_sigma_nn,
+// speed_nn_floor, speed_weight_var_mode, speed_max_val: seven doubles. -4
+// for what it does not calculate (a prescale method other than bilinear, a
+// bit depth picture_copy reads as 8 bits).
+VV_EXPORT int vv_v1_speed(vv_context *context, const double *options)
+{
+    return context->enable_speed(options);
+}
+
+// The next frame pair, with its chroma: `planes` and `strides` of the
+// reference's Y, U and V and of the distorted's (4:2:0; samples as
+// vv_submit's). `score` as vv_submit's (the distorted's planes may then be null).
+VV_EXPORT int vv_submit_v1(vv_context *context, const uint8_t *const *planes, const ptrdiff_t *strides, int score)
+{
+    return context->submit_v1(planes, strides, score != 0);
+}
+
+// For a frame begun with vv_staging or vv_shared_next, in a context with
+// SpEED: where its four chroma planes go before vv_commit -- the reference's
+// U and V, then the distorted's, at planes[0..3], rows *stride bytes apart
+// (w/2 x h/2 samples: 4:2:0's chroma as libvmaf takes it).
+VV_EXPORT int vv_chroma_staging(vv_context *context, uint8_t **planes, uint32_t *stride)
+{
+    if (!context->speed)
+        return fail(-3, "SpEED is not calculated in this context");
+    if (!context->pending)
+        return fail(-3, "no frame was started");
+    uint8_t *chroma = (uint8_t *)context->pending->speedChroma.mapped;
+    for (int i = 0; i < 4; ++i)
+        planes[i] = chroma + (size_t)i * context->chromaPlaneBytes;
+    *stride = context->chromaStrideBytes;
+    return 0;
+}
+
+// Every frame's SpEED chroma scores, after vv_flush: three doubles per frame,
+// libvmaf's speed_chroma_u_score, _v_score and _uv_score (with
+// speed_chroma_max_val); NaN for a frame that was not scored. Returns the
+// number of frames.
+VV_EXPORT int vv_v1_speed_scores(vv_context *context, double *out, unsigned frames)
+{
+    if (!context->speed)
+        return fail(-3, "SpEED is not calculated in this context");
+    const std::vector<FrameSums> &sums = context->sums;
+    const unsigned n = (unsigned)std::min<size_t>(frames, sums.size());
+    for (unsigned i = 0; i < n; ++i)
+        memcpy(out + 3 * (size_t)i, sums[i].speed, sizeof sums[i].speed);
     return (int)sums.size();
 }
 

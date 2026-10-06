@@ -82,6 +82,46 @@ $shaders = [ordered]@{
     'cambi_sum'         = 'cambi', 'STAGE=10', 'BPC16=0'
     'cambi_args'        = 'cambi', 'STAGE=11', 'BPC16=0'
     'cambi_keep'        = 'cambi', 'STAGE=12', 'BPC16=0'
+    # VMAF v1's SpEED chroma (shaders/speed.slang): float sums in libvmaf's
+    # order, each multiply and add rounded (NO_CONTRACTION: see Add-NoContraction).
+    'speed_dec'         = 'speed', 'STAGE=1', 'NO_CONTRACTION=1'
+    'speed_blur'        = 'speed', 'STAGE=2', 'NO_CONTRACTION=1'
+}
+
+# A SPIR-V module with every float multiply, add, subtract and negation
+# decorated NoContraction, which forbids the driver to fuse a multiply and an
+# add (Vulkan otherwise lets it). Slang drops HLSL's `precise`, which is what
+# would ask for this. The decorations go before the module's first.
+function Add-NoContraction([byte[]]$bytes) {
+    $count = $bytes.Length / 4
+    $words = New-Object 'uint32[]' $count
+    [Buffer]::BlockCopy($bytes, 0, $words, 0, $bytes.Length)
+    if ($words[0] -ne 0x07230203) { throw 'not a SPIR-V module' }
+    $ids = [System.Collections.Generic.List[uint32]]::new()
+    $first = -1
+    $i = 5
+    while ($i -lt $count) {
+        $opcode = $words[$i] -band 0xFFFF
+        $length = $words[$i] -shr 16
+        if ($length -eq 0 -or $i + $length -gt $count) { throw 'a malformed SPIR-V module' }
+        if ($first -lt 0 -and ($opcode -eq 71 -or $opcode -eq 72)) { $first = $i }  # OpDecorate, OpMemberDecorate
+        if ($opcode -in 127, 129, 131, 133) { $ids.Add($words[$i + 2]) }  # OpFNegate, OpFAdd, OpFSub, OpFMul
+        $i += $length
+    }
+    if ($first -lt 0) { throw 'a SPIR-V module without decorations' }
+    $patched = New-Object 'uint32[]' ($count + 3 * $ids.Count)
+    [Array]::Copy($words, 0, $patched, 0, $first)
+    $at = $first
+    foreach ($id in $ids) {
+        $patched[$at] = [uint32]0x00030047  # OpDecorate, 3 words
+        $patched[$at + 1] = $id
+        $patched[$at + 2] = [uint32]42      # NoContraction
+        $at += 3
+    }
+    [Array]::Copy($words, $first, $patched, $at, $count - $first)
+    $out = New-Object 'byte[]' ($patched.Length * 4)
+    [Buffer]::BlockCopy($patched, 0, $out, 0, $out.Length)
+    return , $out
 }
 
 function Invoke-Checked([string]$what, [scriptblock]$command) {
@@ -133,6 +173,7 @@ foreach ($name in $shaders.Keys) {
                    '-stage', 'compute', '-O2', '-o', $spirv) + @($definitions | ForEach-Object { "-D$_" })
     Invoke-Checked "Compiling the shader $name" { & $slangc @arguments }
     $bytes = [System.IO.File]::ReadAllBytes($spirv)
+    if ($definitions -contains 'NO_CONTRACTION=1') { $bytes = Add-NoContraction $bytes }
     $words = for ($i = 0; $i -lt $bytes.Length; $i += 4) { '0x{0:x8}' -f [System.BitConverter]::ToUInt32($bytes, $i) }
     [void]$header.AppendLine("static const uint32_t kSpirv_$name[] = {")
     for ($i = 0; $i -lt $words.Count; $i += 10) {
@@ -154,14 +195,22 @@ $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer
 $visualStudio = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $visualStudio) { throw 'Visual Studio with the C++ tools was not found' }
 New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
-$compile = "cl /nologo /LD /O2 /MT /EHsc /std:c++17 /W3 /wd4244 /wd4305 /wd4996 /Brepro /I`"$build`" /I`"$(Join-Path $headers 'include')`" " +
-    "`"$(Join-Path $source 'vmaf_vulkan.cpp')`" `"$(Join-Path $source 'v1_host.c')`" /Fo`"$build\\`" /Fe`"$output`" /link /Brepro /IMPLIB:`"$build\vmaf_vulkan.lib`""
+# SpEED's covariance kernels are libvmaf's own files, compiled as libvmaf's
+# meson.build compiles them (/arch:AVX2, /arch:AVX512), so they round as its.
+$x86 = Join-Path $repository 'libvmaf/src/feature/x86'
+$kernels = @(
+    "cl /nologo /c /O2 /MT /W3 /Brepro /arch:AVX2 `"$(Join-Path $x86 'speed_avx2.c')`" /Fo`"$build\speed_avx2.obj`"",
+    "if errorlevel 1 exit /b 1",
+    "cl /nologo /c /O2 /MT /W3 /Brepro /arch:AVX512 `"$(Join-Path $x86 'speed_avx512.c')`" /Fo`"$build\speed_avx512.obj`"",
+    "if errorlevel 1 exit /b 1")
+$compile = "cl /nologo /LD /O2 /MT /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4305 /wd4996 /Brepro /I`"$build`" /I`"$(Join-Path $headers 'include')`" " +
+    "`"$(Join-Path $source 'vmaf_vulkan.cpp')`" `"$(Join-Path $source 'v1_host.c')`" `"$(Join-Path $source 'v1_speed.c')`" " +
+    "`"$build\speed_avx2.obj`" `"$build\speed_avx512.obj`" /Fo`"$build\\`" /Fe`"$output`" /link /Brepro /IMPLIB:`"$build\vmaf_vulkan.lib`""
 $batch = Join-Path $build 'compile.bat'
-Set-Content -Path $batch -Encoding ascii -Value @(
+Set-Content -Path $batch -Encoding ascii -Value (@(
     '@echo off',
     "set PATH=$(Split-Path $vswhere);%PATH%",
-    "call `"$visualStudio\VC\Auxiliary\Build\vcvars64.bat`" >nul",
-    $compile)
+    "call `"$visualStudio\VC\Auxiliary\Build\vcvars64.bat`" >nul") + $kernels + @($compile))
 Invoke-Checked 'Compiling vmaf_vulkan.dll' { cmd /c $batch }
 
 # The notice that ships with it: the shaders and the engine are a port of
