@@ -440,6 +440,11 @@ struct Slot {
     Buffer cambiKeep;                 // VMAF v1's CAMBI: the c-values of scales the CPU pools (host-visible)
     std::vector<Pass> cambiKeepPasses;
     Buffer speedChroma;               // VMAF v1's SpEED: the pair's chroma planes (host-visible)
+    // With frames from a decoder (shared): SpEED reads the chroma planes from
+    // `staging` (sharedChroma), unless the frame's came through speedChroma
+    // (vv_chroma_staging): then speedPassesHost.
+    bool chromaFromHost = false;
+    std::vector<Pass> speedPassesHost;
     Buffer speedKeep;                 // and the filtered planes est_params reads (host-visible)
     std::vector<Pass> speedPasses;
     VkCommandBuffer commands = VK_NULL_HANDLE;
@@ -693,6 +698,10 @@ struct vv_context {
     // VMAF v1: the slots' luma planes are read where they are written (no copy).
     bool direct = false;
     uint32_t disOffset = 0;  // the distorted plane's place in a slot's staging buffer
+    // VMAF v1 with a decoder's frames: the four chroma planes in a slot's
+    // staging buffer too (ref U, ref V, dis U, dis V), from sharedChroma, each
+    // sharedChromaSpacing bytes after the one before (vv_shared_chroma).
+    uint32_t sharedChroma = 0, sharedChromaSpacing = 0;
     Bound slot_ref(Slot &slot) { return Bound(&slot.staging, 0, planeBytes); }
     Bound slot_dis(Slot &slot) { return Bound(&slot.staging, disOffset, planeBytes); }
     int upload(Buffer &target, const void *data, size_t bytes);
@@ -1588,6 +1597,13 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // The distorted plane's offset: a multiple of 256, which any storage
     // buffer offset alignment divides (VMAF v1 binds the planes there).
     disOffset = (planeBytes + 255) & ~255u;
+    VkDeviceSize stagingBytes = (VkDeviceSize)disOffset + planeBytes;
+    if (v1 && shared) {  // 4:2:0's chroma as libvmaf takes it, w/2 x h/2, its rows a word apart
+        const uint32_t chromaStride = ((uint32_t)(w / 2) * (bpc > 8 ? 2 : 1) + 3) & ~3u;
+        sharedChroma = (uint32_t)((stagingBytes + 255) & ~VkDeviceSize(255));
+        sharedChromaSpacing = (chromaStride * (uint32_t)(h / 2) + 255) & ~255u;
+        stagingBytes = (VkDeviceSize)sharedChroma + 4ull * sharedChromaSpacing;
+    }
     // Read where they are, in the GPU's own memory, when a decoder writes them
     // (shared); host memory, which the GPU reads more slowly than its own
     // (measured on a Radeon 780M: by the passes reading the pictures, more
@@ -1630,7 +1646,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         if (vk.vkCreateFence(device, &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS)
             return fail(-1, "vkCreateFence failed");
-        if (int error = create_buffer(slot.staging, (VkDeviceSize)disOffset + planeBytes, !shared, shared, !shared))
+        if (int error = create_buffer(slot.staging, stagingBytes, !shared, shared, !shared))
             return error;
         if (int error = create_buffer(slot.result, kSlots * 8, true))
             return error;
@@ -1928,16 +1944,27 @@ int vv_context::enable_speed(const double *values)
                                  chromaPlaneBytes / 4, (uint32_t)f.operating_w, (uint32_t)f.operating_h,
                                  (uint32_t)f.antialias_taps, (uint32_t)bpc, inverseBits, f.scaled ? 1u : 0u };
         const int perGroup = 64 / f.antialias_taps;  // outputs a workgroup (a thread per column of each)
-        if (int error = add_pass(slot.speedPasses, kShader_speed_dec, { &slot.speedChroma, &speedFilterTaps,
-                                 &speedOperating, &speedScaling }, dec, sizeof dec,
-                                 groups(f.operating_w * f.operating_h * 4, perGroup), 1))
-            return error;
         const uint32_t blur[] = { (uint32_t)f.operating_w, (uint32_t)f.operating_h, (uint32_t)f.antialias_taps,
                                   (uint32_t)f.blur_taps };
-        if (int error = add_pass(slot.speedPasses, kShader_speed_blur, { &speedOperating, &speedFilterTaps,
-                                 &slot.speedKeep }, blur, sizeof blur, groups(f.operating_w, 16), groups(f.operating_h, 16)))
-            return error;
-        slot.speedPasses.back().groups[2] = 4;
+        // From the host buffer; with a decoder's frames, also from the staging buffer (the default then).
+        for (int fromStaging = 0; fromStaging < (shared ? 2 : 1); ++fromStaging) {
+            std::vector<Pass> &list = shared && !fromStaging ? slot.speedPassesHost : slot.speedPasses;
+            uint32_t constants[10];
+            memcpy(constants, dec, sizeof constants);
+            Bound chroma = Bound(&slot.speedChroma);
+            if (fromStaging) {
+                chroma = Bound(&slot.staging, sharedChroma, 4ull * sharedChromaSpacing);
+                constants[3] = sharedChromaSpacing / 4;  // planeWords
+            }
+            if (int error = add_pass(list, kShader_speed_dec, { chroma, &speedFilterTaps, &speedOperating,
+                                     &speedScaling }, constants, sizeof constants,
+                                     groups(f.operating_w * f.operating_h * 4, perGroup), 1))
+                return error;
+            if (int error = add_pass(list, kShader_speed_blur, { &speedOperating, &speedFilterTaps, &slot.speedKeep },
+                                     blur, sizeof blur, groups(f.operating_w, 16), groups(f.operating_h, 16)))
+                return error;
+            list.back().groups[2] = 4;
+        }
     }
     const int workers = (int)std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u);
     if (!speedPool.start(o, chromaW, chromaH, (size_t)operating, workers))
@@ -2177,7 +2204,10 @@ int vv_context::commit(bool score)
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
     const std::vector<Pass> *lists[4] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
                                           score && cambi ? &slot.cambiKeepPasses : nullptr,
-                                          score && speed ? &slot.speedPasses : nullptr };
+                                          score && speed ? (slot.chromaFromHost ? &slot.speedPassesHost
+                                                                                : &slot.speedPasses) : nullptr };
+    if (shared)
+        slot.chromaFromHost = false;  // the next frame's: from staging unless vv_chroma_staging says
     for (const std::vector<Pass> *list : lists) {
         if (!list)
             continue;
@@ -2488,6 +2518,24 @@ VV_EXPORT int vv_chroma_staging(vv_context *context, uint8_t **planes, uint32_t 
     uint8_t *chroma = (uint8_t *)context->pending->speedChroma.mapped;
     for (int i = 0; i < 4; ++i)
         planes[i] = chroma + (size_t)i * context->chromaPlaneBytes;
+    *stride = context->chromaStrideBytes;
+    if (context->shared)
+        context->pending->chromaFromHost = true;  // SpEED reads this frame's from here
+    return 0;
+}
+
+// For a context made with flag bit 19 (frames from GPU memory) with SpEED:
+// where in each slot's staging buffer (the memory vv_export gives) the four
+// chroma planes go -- the reference's U and V, then the distorted's, from
+// *offset, *spacing bytes apart, rows *stride bytes apart (w/2 x h/2
+// samples). A decoder writes them there on the GPU, as the lumas; or the
+// frame's go through vv_chroma_staging instead.
+VV_EXPORT int vv_shared_chroma(vv_context *context, uint64_t *offset, uint32_t *spacing, uint32_t *stride)
+{
+    if (!context->shared || !context->speed)
+        return fail(-3, "no chroma in the shared buffers");
+    *offset = context->sharedChroma;
+    *spacing = context->sharedChromaSpacing;
     *stride = context->chromaStrideBytes;
     return 0;
 }
