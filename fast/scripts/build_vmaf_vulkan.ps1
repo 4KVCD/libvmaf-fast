@@ -82,6 +82,7 @@ $shaders = [ordered]@{
     'cambi_sum'         = 'cambi', 'STAGE=10', 'BPC16=0'
     'cambi_args'        = 'cambi', 'STAGE=11', 'BPC16=0'
     'cambi_keep'        = 'cambi', 'STAGE=12', 'BPC16=0'
+    'cambi_cvalues_slide' = 'cambi', 'STAGE=13', 'BPC16=0'
     # VMAF v1's SpEED chroma (shaders/speed.slang): float sums in libvmaf's
     # order, each multiply and add rounded (NO_CONTRACTION: see Add-NoContraction).
     'speed_dec'         = 'speed', 'STAGE=1', 'NO_CONTRACTION=1'

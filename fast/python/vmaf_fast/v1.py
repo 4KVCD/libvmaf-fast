@@ -141,7 +141,8 @@ def _cambi_gpu_options(options: dict) -> ctypes.Array | None:
     return (ctypes.c_double * 9)(float(o["cambi_high_res_speedup"]), float(o["cambi_vis_lum_threshold"]),
                                  float(o["cambi_max_val"]), topk, float(o["window_size"]), float(o["tvi_threshold"]),
                                  float(o["max_log_contrast"]), 0.0 if eotf == "bt1886" else 1.0,
-                                 1.0 if os.environ.get("VMAF_FAST_TEST_CAMBI_POOL_ON_CPU") else 0.0)
+                                 float((1 if os.environ.get("VMAF_FAST_TEST_CAMBI_POOL_ON_CPU") else 0)
+                                       | (2 if os.environ.get("VMAF_FAST_TEST_CAMBI_BRUTE_FORCE") else 0)))
 
 
 #: SpEED chroma's options the GPU takes (vv_v1_speed), with speed.c's

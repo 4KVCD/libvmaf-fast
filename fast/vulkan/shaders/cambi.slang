@@ -205,6 +205,174 @@ void main(uint3 id : SV_DispatchThreadID)
     cValues[y * w + x] = asuint(c);
 }
 
+#elif STAGE == 13  // CVALUES_SLIDE
+// CVALUES, the same counts kept as calculate_c_values keeps them: as the
+// window moves down a row, the row entering it is added and the row leaving
+// it taken away. A workgroup takes a tile of S columns and a band of rows;
+// in shared memory it keeps, per column its windows reach, how many masked,
+// in-band pixels of each value the window's rows have there (a byte: at most
+// 2 * pad + 1 <= 65), and a pixel's count of a value is the sum of the bytes
+// of its window's 2 * pad + 1 columns. The values are taken VALUES at a time
+// (window k: the values 56k - 4 .. 56k + 59, for the pixels of value
+// 56k .. 56k + 55, which read their value +- 4), only the windows the tile's
+// pixels are in: one or two where the picture is flat, which is where pixels
+// are masked. For pads up to 32 (CVALUES otherwise).
+[[vk::binding(0, 0)]] StructuredBuffer<uint> image;
+[[vk::binding(1, 0)]] StructuredBuffer<uint> mask;
+[[vk::binding(2, 0)]] RWStructuredBuffer<uint> cValues;
+[[vk::binding(3, 0)]] StructuredBuffer<float> reciprocal;
+// pc: w, h, pad, vltLuma, bandBase, bandSize, tvi[0..3] (+ num_diffs), weights[0..3], rows per workgroup
+#define NUM_DIFFS 4
+#define S 64             // the tile's columns: a thread each
+#define COLS 128         // S + 2 * 32
+#define WORDS (COLS / 4)
+#define VALUES 64        // a window of values
+#define CORE 56          // VALUES - 2 * NUM_DIFFS
+#define MAX_ROWS 128     // rows per workgroup, at most
+
+groupshared uint gCounts[VALUES * WORDS];  // [value - the window's first][column], a byte each
+groupshared uint gWindows;                 // the windows the tile's pixels are in (bits)
+groupshared uint gRowWindows[MAX_ROWS];   // and each row's
+
+// Row r's pixel in local column lc: its value less the band's base if it is
+// masked and in the band (counted), else -1. Read ahead of its use: the
+// loads are what a row's step waits for.
+int pixel_compact(int r, int x0, int pad, uint lc)
+{
+    const int w = int(pc[0]), h = int(pc[1]);
+    const int col = x0 - pad + int(lc);
+    if (r < 0 || r >= h || col < 0 || col >= w || int(lc) >= S + 2 * pad) return -1;
+    const int compact = int(image[r * w + col]) - int(pc[4]);
+    return mask[r * w + col] != 0 && compact >= 0 && compact < int(pc[5]) ? compact : -1;
+}
+
+// A counted pixel of local column lc added (or taken away), if its value is
+// in the window that starts at `first`.
+void count_pixel(int compact, uint lc, int first, bool remove)
+{
+    const int local = compact - first;
+    if (compact < 0 || local < 0 || local >= VALUES) return;
+    const uint one = 1u << ((lc & 3u) * 8u);
+    InterlockedAdd(gCounts[uint(local) * WORDS + (lc >> 2)], remove ? 0u - one : one);
+}
+
+// The pixels of value first + local in the window of the tile's column t.
+uint window_count(int local, uint t, int pad)
+{
+    const uint base = uint(local) * WORDS, last = t + uint(2 * pad);
+    uint sum = 0;
+    for (uint word = t >> 2; word <= (last >> 2); ++word) {
+        uint bytes = gCounts[base + word];
+        if (word == (t >> 2)) bytes &= 0xFFFFFFFFu << ((t & 3u) * 8u);
+        if (word == (last >> 2)) bytes &= 0xFFFFFFFFu >> ((3u - (last & 3u)) * 8u);
+        sum += (bytes & 0x00FF00FFu) + ((bytes >> 8) & 0x00FF00FFu);
+    }
+    return (sum & 0xFFFFu) + (sum >> 16);
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex)
+{
+    const int w = int(pc[0]), h = int(pc[1]), pad = int(pc[2]);
+    const int bandBase = int(pc[4]), bandSize = int(pc[5]);
+    const int x0 = int(group.x) * S, y0 = int(group.y * pc[14]);
+    const int y1 = min(y0 + int(pc[14]), h);
+    const int x = x0 + int(t);
+    const int rows = y1 - y0;
+    if (t == 0) gWindows = 0;
+    for (int i = int(t); i < rows; i += 64) gRowWindows[i] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    // The windows of values the tile's masked, in-band pixels are in, in all
+    // and row by row; the other pixels' c-values are 0.
+    uint windows = 0;
+    for (int y = y0; y < y1; ++y) {
+        if (x >= w) break;
+        const int compact = int(image[y * w + x]) - bandBase;
+        if (mask[y * w + x] != 0 && compact >= 0 && compact < bandSize) {
+            const uint bit = 1u << uint(compact / CORE);
+            windows |= bit;
+            InterlockedOr(gRowWindows[y - y0], bit);
+        } else {
+            cValues[y * w + x] = 0;
+        }
+    }
+    InterlockedOr(gWindows, windows);
+    GroupMemoryBarrierWithGroupSync();
+    uint todo = gWindows;
+    while (todo != 0) {
+        const int k = int(firstbitlow(todo));
+        const uint bit = 1u << uint(k);
+        todo &= todo - 1;
+        const int first = k * CORE - NUM_DIFFS;
+        // The window slides from the first row with pixels in it to the last.
+        int ys = rows, ye = -1;
+        for (int i = 0; i < rows; ++i) {
+            if (gRowWindows[i] & bit) {
+                ys = min(ys, i);
+                ye = i;
+            }
+        }
+        ys += y0;
+        ye += y0;
+        for (uint i = t; i < VALUES * WORDS; i += 64) gCounts[i] = 0;
+        GroupMemoryBarrierWithGroupSync();
+        // The window of row ys, eight rows' loads at a time.
+        for (int r0 = ys - pad; r0 < ys + pad; r0 += 8) {
+            int v[16];
+            [unroll] for (int j = 0; j < 8; ++j) {
+                v[j] = r0 + j < ys + pad ? pixel_compact(r0 + j, x0, pad, t) : -1;
+                v[8 + j] = r0 + j < ys + pad ? pixel_compact(r0 + j, x0, pad, t + 64) : -1;
+            }
+            [unroll] for (int j = 0; j < 8; ++j) {
+                count_pixel(v[j], t, first, false);
+                count_pixel(v[8 + j], t + 64, first, false);
+            }
+        }
+        // Each row's step: its entering and leaving rows' pixels, and its own
+        // (the tile's column), read one step ahead.
+        int add0 = pixel_compact(ys + pad, x0, pad, t), add1 = pixel_compact(ys + pad, x0, pad, t + 64);
+        int remove0 = -1, remove1 = -1;
+        int own = x < w ? pixel_compact(ys, x0, pad, t + uint(pad)) : -1;
+        for (int y = ys; y <= ye; ++y) {
+            const int a0 = add0, a1 = add1, r0 = remove0, r1 = remove1, o = own;
+            if (y < ye) {
+                add0 = pixel_compact(y + 1 + pad, x0, pad, t);
+                add1 = pixel_compact(y + 1 + pad, x0, pad, t + 64);
+                remove0 = pixel_compact(y - pad, x0, pad, t);
+                remove1 = pixel_compact(y - pad, x0, pad, t + 64);
+                own = x < w ? pixel_compact(y + 1, x0, pad, t + uint(pad)) : -1;
+            }
+            count_pixel(a0, t, first, false);
+            count_pixel(a1, t + 64, first, false);
+            count_pixel(r0, t, first, true);
+            count_pixel(r1, t + 64, first, true);
+            if ((gRowWindows[y - y0] & bit) == 0) continue;  // nothing to read: no barrier
+            GroupMemoryBarrierWithGroupSync();
+            if (o >= 0 && o / CORE == k) {
+                const int compact = o, I = o + bandBase;
+                float c = 0.0;
+                const int local = compact - first;
+                const uint p0 = window_count(local, t, pad);
+                const int value = I + NUM_DIFFS;
+                for (int d = 0; d < NUM_DIFFS; ++d) {
+                    if (value <= int(pc[6 + d]) && value + d + 1 > int(pc[3])) {
+                        // (The gate keeps compact + d + 1 inside the band, as on the CPU.)
+                        const uint p1 = compact + d + 1 < bandSize ? window_count(local + d + 1, t, pad) : 0u;
+                        const uint p2 = compact - d - 1 >= 0 ? window_count(local - d - 1, t, pad) : 0u;
+                        const uint pm = p1 > p2 ? p1 : p2;
+                        const float val = float(int(pc[10 + d]) * int(p0) * int(pm)) * reciprocal[pm + p0];
+                        if (val > c) c = val;
+                    }
+                }
+                cValues[y * w + x] = asuint(c);
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
 #elif STAGE == 7  // CLEAR
 [[vk::binding(0, 0)]] RWStructuredBuffer<uint> target;
 // pc: count

@@ -493,6 +493,7 @@ struct vv_context {
     // out, and the buffers its passes use.
     bool cambi = false;
     bool cambiPoolOnCpu = false;  // every scale pooled by v1_host (the tests of that)
+    bool cambiBruteForce = false; // the c-values counted pixel by pixel (CVALUES), for the tests of CVALUES_SLIDE
     Buffer cambiArgs;             // the KEEP passes' dispatch sizes
     VkDeviceSize cambiKeepOffset[V1_CAMBI_SCALES] = {};  // each scale's place in a slot's cambiKeep (words)
     V1CambiOptions cambiOptions = {};
@@ -1475,7 +1476,8 @@ int vv_context::enable_cambi(const double *values)
     o.tvi_threshold = values[5];
     o.max_log_contrast = (int)values[6];
     o.eotf = (int)values[7];
-    cambiPoolOnCpu = values[8] != 0;
+    cambiPoolOnCpu = ((int)values[8] & 1) != 0;
+    cambiBruteForce = ((int)values[8] & 2) != 0;
     if (int error = v1_cambi_constants(&o, (unsigned)w, (unsigned)h, &cambiConst))
         return fail(error, "CAMBI: cambi.c's init refuses this picture or these options");
     const V1CambiConstants &c = cambiConst;
@@ -1562,14 +1564,20 @@ int vv_context::enable_cambi(const double *values)
                              groups(sw, 16), groups(sh, 16));
         }
         if (!error) {
-            uint32_t constants[14] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)(c.window_size >> 1),
+            // The sliding counts (CVALUES_SLIDE) for windows of at most 65.
+            const uint32_t rows = 16;
+            uint32_t constants[15] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)(c.window_size >> 1),
                                        (uint32_t)c.vlt_luma, (uint32_t)c.v_band_base, (uint32_t)c.v_band_size };
             for (int d = 0; d < 4; ++d) {
                 constants[6 + d] = (uint32_t)c.tvi_for_diff[d];
                 constants[10 + d] = (uint32_t)c.diff_weights[d];
             }
-            error = add_pass(scored, kShader_cambi_cvalues, { &cambiFiltered[scale], mask, &cambiC[scale],
-                             &cambiReciprocal }, constants, sizeof constants, groups(sw, 16), groups(sh, 16));
+            constants[14] = rows;
+            const bool slide = (c.window_size >> 1) <= 32 && c.v_band_size <= 32 * 56 && !cambiBruteForce;
+            error = slide ? add_pass(scored, kShader_cambi_cvalues_slide, { &cambiFiltered[scale], mask, &cambiC[scale],
+                                     &cambiReciprocal }, constants, sizeof constants, groups(sw, 64), groups(sh, (int)rows))
+                          : add_pass(scored, kShader_cambi_cvalues, { &cambiFiltered[scale], mask, &cambiC[scale],
+                                     &cambiReciprocal }, constants, sizeof constants, groups(sw, 16), groups(sh, 16));
         }
         const uint32_t n = (uint32_t)(sw * sh);
         const uint32_t histGroups = std::min<uint32_t>(groups((int)n, 256), 128);
@@ -2149,8 +2157,9 @@ VV_EXPORT int vv_flush(vv_context *context) { return context->flush(); }
 // vv_create_v1, before its first frame. `options`: cambi_high_res_speedup,
 // cambi_vis_lum_threshold, cambi_max_val, the topk in effect, window_size,
 // tvi_threshold, max_log_contrast, the eotf in effect (0 bt1886, 1 pq), and
-// 1 to pool every scale on the CPU (the tests of that; 0 pools only where the
-// GPU's sum is not exact in a double): nine doubles. -4 for options it does
+// test flags: 1 pools every scale on the CPU (0: only where the GPU's sum is
+// not exact in a double), 2 counts the c-values pixel by pixel (CVALUES, not
+// CVALUES_SLIDE): nine doubles. -4 for options it does
 // not calculate (max_log_contrast other than 2).
 VV_EXPORT int vv_v1_cambi(vv_context *context, const double *options)
 {
