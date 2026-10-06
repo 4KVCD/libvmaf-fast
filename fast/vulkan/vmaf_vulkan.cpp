@@ -1846,7 +1846,7 @@ int vv_context::enable_cambi(const double *values)
     struct { Buffer *buffer; VkDeviceSize bytes; } sized[] = {
         { &cambiImage, full * 4 }, { &cambiMaskFull, full * 4 },
         { &cambiReciprocal, sizeof kCambiReciprocal }, { &cambiHist, (VkDeviceSize)histWords * 4 },
-        { &cambiState, (10 + V1_CAMBI_SCALES) * 4 },  // per scale: prefix, remaining; then the zero c-values
+        { &cambiState, 36 * 4 },  // shaders/cambi.slang's state (STATE_*)
     };
     for (auto &entry : sized) {
         if (int error = create_buffer(*entry.buffer, entry.bytes, false))
@@ -1870,6 +1870,11 @@ int vv_context::enable_cambi(const double *values)
     }
     if (int error = upload(cambiReciprocal, kCambiReciprocal, sizeof kCambiReciprocal))
         return error;
+    {   // level 0's sums start at 0 (SELECT puts them back to 0 for the next frame)
+        const uint32_t zeros[36] = {};
+        if (int error = upload(cambiState, zeros, sizeof zeros))
+            return error;
+    }
     if (int error = create_buffer(cambiArgs, V1_CAMBI_SCALES * 3 * 4, false))
         return error;
     VkDeviceSize keepWords = 0;

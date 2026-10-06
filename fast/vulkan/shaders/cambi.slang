@@ -31,6 +31,18 @@
 
 [[vk::push_constant]] uniform uint pc[24];
 
+// The radix select's state (HIST, SELECT, SUM), in words: per scale the
+// prefix and what is left of k (2 * scale); the zero c-values (10 +
+// scale); level 0's sum of the nonzero ones, in
+// units of 2^-24 (a 64-bit sum, slot 8 + scale of acc_add64) and whether one
+// was out of its range (26 + scale); and whether the select is done (31 +
+// scale): when level 0 finds the k-th largest among the zeros -- most
+// c-values are 0 at high resolutions -- it is 0, the sum above it level 0's,
+// and the other levels and SUM have nothing left to do.
+#define STATE_SUM 8         // acc_add64's slot
+#define STATE_INEXACT 26
+#define STATE_DONE 31
+
 #if STAGE == 1  // PRE
 [[vk::binding(0, 0)]] StructuredBuffer<uint> picture;
 [[vk::binding(1, 0)]] RWStructuredBuffer<uint> image;
@@ -548,10 +560,10 @@ void main(uint3 id : SV_DispatchThreadID)
 [[vk::binding(4, 0)]] StructuredBuffer<uint> cValues4;
 #if STAGE == 8
 [[vk::binding(5, 0)]] RWStructuredBuffer<uint> hist;    // every scale's and level's bins
-[[vk::binding(6, 0)]] StructuredBuffer<uint> state;     // every scale's prefix, remaining
+[[vk::binding(6, 0)]] RWStructuredBuffer<uint> state;   // (above)
 // pc: level, n[5], groups[5]
 #else
-[[vk::binding(5, 0)]] StructuredBuffer<uint> state;     // every scale's threshold bits, remaining
+[[vk::binding(5, 0)]] StructuredBuffer<uint> state;     // (above)
 [[vk::binding(6, 0)]] RWStructuredBuffer<uint> acc;
 // pc: (unused), n[5], groups[5], the first scale's slot (sum, threshold, remaining, inexact: 4 a scale)
 #endif
@@ -576,11 +588,14 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
     const uint scale = group.y, level = pc[0];
     if (group.x >= pc[6 + scale]) return;  // the scale's workgroups
+    if (level > 0 && state[STATE_DONE + scale] != 0) return;  // found at level 0
     const uint bins = level < 2 ? 4096u : 256u;
     for (uint b = local; b < bins; b += 256) gHist[b] = 0;
     GroupMemoryBarrierWithGroupSync();
     const uint prefix = state[scale * 2];
     const uint stride = pc[6 + scale] * 256, n = pc[1 + scale];
+    uint64_t sum = 0;  // level 0: the nonzero values', as SUM adds them
+    bool inexact = false;
     for (uint i = group.x * 256 + local; i < n; i += stride) {
         const uint bits = c_value(scale, i);
         // Most c-values are 0 (pixels not masked): not counted here, every
@@ -589,6 +604,11 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         uint bin;
         if (level == 0) {
             bin = bits >> 20;
+            const uint e = bits >> 23;
+            if (e >= 126 && e < 142)
+                sum += uint64_t((bits & 0x7FFFFFu) | 0x800000u) << (e - 126);
+            else
+                inexact = true;
         } else if (level == 1) {
             if ((bits >> 20) != prefix) continue;
             bin = (bits >> 8) & 0xFFFu;
@@ -597,6 +617,11 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
             bin = bits & 0xFFu;
         }
         InterlockedAdd(gHist[bin], 1u);
+    }
+    if (level == 0) {
+        const uint64_t total = WaveActiveSum(sum);
+        if (WaveIsFirstLane() && total != 0) acc_add64(state, STATE_SUM + scale, total);
+        if (WaveActiveAnyTrue(inexact) && WaveIsFirstLane()) InterlockedOr(state[STATE_INEXACT + scale], 1u);
     }
     GroupMemoryBarrierWithGroupSync();
     const uint offset = (scale * 3 + level) * 4096;
@@ -613,6 +638,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
     const uint scale = group.y;
     if (group.x >= pc[6 + scale]) return;
+    if (state[STATE_DONE + scale] != 0) return;  // level 0 added it up
     if (local == 0) gInexact = 0;
     GroupMemoryBarrierWithGroupSync();
     const uint threshold = state[scale * 2];
@@ -666,6 +692,7 @@ groupshared uint gScan[256];
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
     const uint scale = group.y, level = pc[0];
+    if (level > 0 && state[STATE_DONE + scale] != 0) return;  // found at level 0
     const uint bins = level < 2 ? 4096u : 256u, per = bins / 256;
     const uint at = scale * 2, offset = (scale * 3 + level) * 4096;
     const uint remaining = level == 0 ? pc[1 + scale] : state[at + 1];
@@ -722,8 +749,26 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         const uint next = level == 0 ? chosen : (prefix << (level < 2 ? 12u : 8u)) | chosen;
         state[at] = next;
         state[at + 1] = left;
+        const uint slot = pc[6] + scale * 4;
+        if (level == 0) {
+            // Among the zeros (bin 0 holds no other value: a nonzero c-value
+            // is at least 0.5): the k-th largest is 0, and level 0 has added
+            // up the values above it, as SUM would.
+            const bool zero = chosen == 0;
+            state[STATE_DONE + scale] = zero ? 1u : 0u;
+            if (zero) {
+                acc[2 * (slot + 1)] = 0;
+                acc[2 * (slot + 2)] = left;
+                const uint64_t sum = uint64_t(state[2 * (STATE_SUM + scale)])
+                                     | (uint64_t(state[2 * (STATE_SUM + scale) + 1]) << 32);
+                if (sum != 0) acc_add64(acc, slot, sum);
+                if (state[STATE_INEXACT + scale] != 0) InterlockedOr(acc[2 * (slot + 3)], 1u);
+            }
+            state[2 * (STATE_SUM + scale)] = 0;  // for the next frame
+            state[2 * (STATE_SUM + scale) + 1] = 0;
+            state[STATE_INEXACT + scale] = 0;
+        }
         if (level == 2) {
-            const uint slot = pc[6] + scale * 4;
             acc[2 * (slot + 1)] = next;  // the k-th largest value's bits
             acc[2 * (slot + 2)] = left;  // how many of it are in the top k
         }
