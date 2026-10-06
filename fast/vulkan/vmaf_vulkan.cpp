@@ -435,6 +435,8 @@ struct Slot {
 };
 
 enum { kPushBytes = 128, kMaxBindings = 9 };
+// adm_dcm.slang's tile of contrast masking's positions (its TX x TY).
+const int kDcmTile[2] = { 16, 8 };
 
 // VMAF v1's options for ADM3 and motion3 (the model's feature_opts_dicts).
 struct V1Options {
@@ -517,6 +519,12 @@ struct vv_context {
     // BOTH); VV_ADM_BOTH=0 for a pass each, to compare.
     Buffer admRB, admAB, admFB;
     bool admBoth = true;
+    // ADM's decouple and both limits' contrast masking as one pass a scale
+    // (shaders/adm_dcm.slang), each row's masking sums in admRows until
+    // adm_rows.slang rounds them: all but VMAF v1, the decouple variants and
+    // pass-limited (diagnosis) runs. VV_ADM_FUSED=0 for the separate passes.
+    Buffer admRows;
+    bool admFused = true;
 
     std::vector<Pass> motion[2];  // by frame parity
     std::vector<Pass> scored;     // VIF and ADM
@@ -895,6 +903,7 @@ int vv_context::build_passes()
     uint32_t i_rfactor[12];
     adm_rfactors(i_rfactor);
     int inW = w, inH = h, inStride = strideWords;
+    uint32_t rowSlot = 0;  // admRows' next scale's first sum
     for (int scale = 0; scale < kScales && !error && !(skip & 4); ++scale) {
         const int set = scale % 2;
         Buffer *inRef = scale == 0 ? &picRef : &bandsARef[1 - set];
@@ -944,8 +953,60 @@ int vv_context::build_passes()
             if (error)
                 break;
         }
+        if (admFused) {  // adm_decouple and adm_cm below, in one pass, then the rows' rounding
+            int left = bw * (float)(ADM_BORDER_FACTOR) - 0.5f;
+            int top = bh * (float)(ADM_BORDER_FACTOR) - 0.5f;
+            int right = bw - left;
+            int bottom = bh - top;
+            int start_col, end_col, start_row, end_row;
+            if (scale == 0) {
+                start_col = std::max(0, left);
+                end_col = std::min(right, bw);
+                start_row = std::max(0, top);
+                end_row = std::min(bottom, bh);
+            } else {
+                start_col = (left > 1) ? left : ((left <= 0) ? 0 : 1);
+                end_col = (right < (bw - 1)) ? right : ((right > (bw - 1)) ? bw : bw - 1);
+                start_row = (top > 1) ? top : ((top <= 0) ? 0 : 1);
+                end_row = (bottom < (bh - 1)) ? bottom : ((bottom > (bh - 1)) ? bh : bh - 1);
+            }
+            const int rows = std::max(0, end_row - start_row);
+            static const int shift_sub[3] = { 10, 10, 12 }, fixed_shift[3] = { 4, 4, 3 };
+            static const int shift_xsq[3] = { 29, 29, 30 };
+            struct {
+                int32_t w, h, inStride, startRow, endRow, startCol, endCol;
+                uint32_t gainA, gainB, rfactor[3];
+                int32_t shiftSub[3], shiftSq[3], shiftCub[3];
+                uint32_t rowSlot;
+            } constants = {};
+            constants.w = bw;
+            constants.h = bh;
+            constants.inStride = bandStride;
+            constants.startRow = start_row;
+            constants.endRow = start_row + rows;
+            constants.startCol = start_col;
+            constants.endCol = std::max(start_col, end_col);
+            constants.gainA = 100;
+            constants.gainB = 1;
+            for (int band = 0; band < 3; ++band) {
+                constants.rfactor[band] = i_rfactor[scale * 3 + band];
+                constants.shiftSub[band] = scale == 0 ? shift_sub[band] : 0;
+                constants.shiftSq[band] = scale == 0 ? shift_xsq[band] : 30;
+                const double shift = scale == 0 ? ceil(log2((double)bw) - fixed_shift[band]) : ceil(log2((double)bw));
+                constants.shiftCub[band] = shift > 0 ? (int32_t)shift : 0;
+            }
+            constants.rowSlot = rowSlot;
+            error = add_pass(scored, scale == 0 ? kShader_adm_dcm_0 : kShader_adm_dcm,
+                             { &bandsRef[set], &bandsDis[set], &divTable, &admRows }, &constants, sizeof constants,
+                             groups(constants.endCol - start_col, kDcmTile[0]), groups(rows, kDcmTile[1]));
+            const uint32_t finish[] = { (uint32_t)rows, (uint32_t)ceil_log2(bh), rowSlot,
+                                        (uint32_t)(kSlotCm + scale * 3), (uint32_t)(kScales * 3) };
+            if (!error)
+                error = add_pass(scored, kShader_adm_rows, { &admRows, &acc }, finish, sizeof finish, 6, 1);
+            rowSlot += 6 * (uint32_t)rows;
+        }
         // The enhancement gain limit: 100 (VMAF), then 1 (VMAF NEG).
-        for (int limit = 0; limit < 2 && !error; ++limit) {
+        for (int limit = 0; limit < 2 && !error && !admFused; ++limit) {
             {   // adm_decouple_device / adm_decouple_s123_device, adm_csf_device / i4_adm_csf_device
                 int left = bw * (float)(ADM_BORDER_FACTOR) - 0.5f - 1;
                 int top = bh * (float)(ADM_BORDER_FACTOR) - 0.5f - 1;
@@ -1411,13 +1472,17 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         sizeControl.pNext = nullptr;
     }
     // Intel's GPUs run ADM's shaders fastest at 8 lanes (Core Ultra 9 285K's
-    // iGPU: ADM 2.97 -> 2.42 ms a 1080p pair); the others at the driver's
-    // choice. No shader uses subgroup operations: the width changes no sum.
+    // iGPU: ADM 2.97 -> 2.42 ms a 1080p pair), but the fused decouple and
+    // masking (adm_dcm) at 16 (0.64 -> 0.44 ms at scale 0); the others at the
+    // driver's choice. Subgroup operations are only integer sums here (the
+    // same in any order): the width changes no sum.
     if (subgroupSizeControl && properties.vendorID == 0x8086) {
         for (int i = 0; i < kShaderCount; ++i)
             if (!strncmp(kShaders[i].name, "adm_", 4))
-                subgroupSizes[i] = 8;
+                subgroupSizes[i] = strncmp(kShaders[i].name, "adm_dcm", 7) ? 8 : 16;
     }
+    if (const char *text = getenv("VV_ADM_FUSED"))
+        admFused = strcmp(text, "0") != 0;
     if (const char *text = getenv("VV_DIRECT_FRAMES"))
         direct = strcmp(text, "0") != 0;
     // Only where the staging memory is the GPU's own (an integrated GPU): a
@@ -1461,6 +1526,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         }
     }
     decoupleVariant = (flags >> 28) & 7;
+    admFused = admFused && admBoth && !v1 && !decoupleVariant && !passLimit;
     api->vkGetPhysicalDeviceMemoryProperties(physical, &memoryProperties);
 
     uint32_t familyCount = 0;
@@ -1557,6 +1623,9 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         { &admRB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
         { &admAB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
         { &admFB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
+        // Six 64-bit sums a row of contrast masking at each scale: fewer than
+        // 2 * h1 + 4 rows in all.
+        { &admRows, (VkDeviceSize)(2 * h1 + 4) * 6 * 8 * (admFused ? 1 : 0) + 4 },
     };
     for (auto &entry : sized) {
         if (int error = create_buffer(*entry.buffer, entry.bytes, false))
@@ -1781,6 +1850,8 @@ int vv_context::commit(bool score)
         }
     }
     vk.vkCmdFillBuffer(cb, acc.buffer, 0, VK_WHOLE_SIZE, 0);
+    if (admFused && score)
+        vk.vkCmdFillBuffer(cb, admRows.buffer, 0, VK_WHOLE_SIZE, 0);
     barrier(vk, cb, kTransfer, kCompute);
     stamp(kShaderCount);
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
