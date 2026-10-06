@@ -281,7 +281,9 @@ bool fast_gain(int sigma12, int sigma1, int sigma2, out int sv, out int64_t term
     if (rem < 0 || rem >= divisor || q < 0)
         return false;
     const float fraction = float(uint(rem)) * inv;  // R / sigma1
-    const float P = float(q) + fraction;
+    // q (here in 0..2^46) as a float from its words: a 64-bit integer's
+    // conversion is many instructions on GPUs without 64-bit integers.
+    const float P = float(uint(uint64_t(q) >> 32)) * 4294967296.0 + float(uint(q)) + fraction;
     const float c = P * (6.5536e-6 * inv);          // P eps / sigma1
     // The residual: max((int)(sigma2 - g * sigma12), 0).
     const float phi = c - fraction;
