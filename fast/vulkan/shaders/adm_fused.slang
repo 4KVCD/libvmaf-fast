@@ -21,10 +21,20 @@
 //
 // FROM_PICTURE (scale 0): the bands are not read but calculated here from the
 // two pictures, as adm_dwt.slang's SCALE0 calculates them, for each pixel
-// the pass reads; its workgroups cover the whole band image, and do scale
-// 1's wavelet transform of the approximation bands (a) too, as adm_dwt.slang
-// does it, writing scale 1's bands (slide_scale1).
+// the pass reads. NEXT (scale 0, and NEXT_SCALE: scales 1 and 2): the
+// workgroups cover the whole band image, and do the next scale's wavelet
+// transform of its approximation bands (a), as adm_dwt.slang does it,
+// writing the next scale's bands (next_vertical, next_horizontal).
 #include "common.slang"
+
+#ifndef NEXT_SCALE
+#define NEXT_SCALE 0
+#endif
+#if FROM_PICTURE || NEXT_SCALE
+#define NEXT 1
+#else
+#define NEXT 0
+#endif
 
 [[vk::push_constant]] uniform uint pc[4];  // the scale's first word in params
 #if FROM_PICTURE
@@ -38,8 +48,11 @@
 [[vk::binding(3, 0)]] StructuredBuffer<int> params;
 [[vk::binding(4, 0)]] RWStructuredBuffer<uint> acc;
 #if FROM_PICTURE
-[[vk::binding(5, 0)]] RWStructuredBuffer<int> refBands1;  // scale 1's bands: a, h, v, d a position
-[[vk::binding(6, 0)]] RWStructuredBuffer<int> disBands1;
+[[vk::binding(5, 0)]] RWStructuredBuffer<int> refNext;  // the next scale's bands: a, h, v, d a position
+[[vk::binding(6, 0)]] RWStructuredBuffer<int> disNext;
+#elif NEXT_SCALE
+[[vk::binding(6, 0)]] RWStructuredBuffer<int> refNext;
+[[vk::binding(7, 0)]] RWStructuredBuffer<int> disNext;
 #endif
 
 // params, from pc[0]:
@@ -84,8 +97,8 @@
 #define ADD_V P(48)
 #define SHIFT_H P(49)
 #define ADD_H P(50)
-#define BANDS1_STRIDE P(51)   // scale 1's bands' positions a row
-#define SHIFT_V1 P(52)         // scale 1's transform (adm_dwt.slang's, not SCALE0)
+#define NEXT_STRIDE P(51)     // NEXT: the next scale's bands' positions a row
+#define SHIFT_V1 P(52)         // its transform (adm_dwt.slang's, not SCALE0)
 #define ADD_V1 P(53)
 #define SHIFT_H1 P(54)
 #define ADD_H1 P(55)
@@ -107,10 +120,8 @@ struct Decoupled {
     int restored[3], additive[3], csfA[3], csfF[3], csfR[3], csfRF[3];
 };
 
-#if FROM_PICTURE
 static const int kLo[4] = { 15826, 27411, 7345, -4240 };
 static const int kHi[4] = { -4240, -7345, 27411, -15826 };
-static const int kLoSum = 46342;
 
 // adm_dwt.slang's calculate_indices
 int4 indices(int n, int limit)
@@ -124,6 +135,9 @@ int4 indices(int n, int limit)
     if (at.w >= limit) at.w = 2 * limit - at.w - 1;
     return at;
 }
+
+#if FROM_PICTURE
+static const int kLoSum = 46342;
 
 // adm_dwt.slang's SCALE0 transform at band position (i, j): a, and h, v, d
 // in bands[0..2].
@@ -348,6 +362,12 @@ void slide_row(int i, int j, uint local, bool own, inout int restored[3], inout 
         for (int b = 0; b < 3; ++b)
             den[b] = den_term(int(refBands[from + 1 + b]));
     }
+#if NEXT_SCALE
+    if (cj >= 0 && cj < BW) {  // a, for the next scale's transform (everywhere in the band)
+        aRef = int(refBands[(ci * IN_STRIDE + cj) * 4]);
+        aDis = int(disBands[(ci * IN_STRIDE + cj) * 4]);
+    }
+#endif
 #endif
     if (in_cm_decouple(ci, cj)) {
 #if FROM_PICTURE
@@ -369,7 +389,7 @@ void slide_row(int i, int j, uint local, bool own, inout int restored[3], inout 
     gRingRF[ring * GROUP + local] = sumRF;
 }
 
-#if FROM_PICTURE
+#if NEXT
 groupshared int gScale1[4 * GROUP];  // per column: scale 1's vertical lo and hi, of each picture
 
 // The band row slide step k gives (k = -1 and BH as the masking mirrors them).
@@ -378,7 +398,7 @@ int step_row(int k)
     return k == -1 ? 1 : (k == BH ? BH - 1 : k);
 }
 
-// Scale 1's vertical transform of the thread's column for its row I (rows
+// The next scale's vertical transform of the thread's column for its row I (rows
 // indices(I, BH) of a, all among the last four steps' -- s - 3 .. s, a[0..3]),
 // into gScale1 (before the barrier its horizontal transform waits for).
 void scale1_vertical(int I, int s, int aRef[4], int aDis[4], uint local)
@@ -403,7 +423,7 @@ void scale1_vertical(int I, int s, int aRef[4], int aDis[4], uint local)
     gScale1[3 * GROUP + local] = int((hi[1] + ADD_V1) >> SHIFT_V1);
 }
 
-// Scale 1's horizontal transform at (I, J) (J's columns among the
+// The next scale's horizontal transform at (I, J) (J's columns among the
 // workgroup's, its first one c0 - 1 at local 0), its bands written.
 void scale1_horizontal(int I, int J, int c0)
 {
@@ -418,13 +438,13 @@ void scale1_horizontal(int I, int J, int c0)
             h += int64_t(kLo[c]) * hi;
             d += int64_t(kHi[c]) * hi;
         }
-        const int out = (I * BANDS1_STRIDE + J) * 4;
+        const int out = (I * NEXT_STRIDE + J) * 4;
         const int4 bands = int4(int((a + ADD_H1) >> SHIFT_H1), int((h + ADD_H1) >> SHIFT_H1),
                                 int((v + ADD_H1) >> SHIFT_H1), int((d + ADD_H1) >> SHIFT_H1));
         if (p == 0) {
-            refBands1[out] = bands.x; refBands1[out + 1] = bands.y; refBands1[out + 2] = bands.z; refBands1[out + 3] = bands.w;
+            refNext[out] = bands.x; refNext[out + 1] = bands.y; refNext[out + 2] = bands.z; refNext[out + 3] = bands.w;
         } else {
-            disBands1[out] = bands.x; disBands1[out + 1] = bands.y; disBands1[out + 2] = bands.z; disBands1[out + 3] = bands.w;
+            disNext[out] = bands.x; disNext[out + 1] = bands.y; disNext[out + 2] = bands.z; disNext[out + 3] = bands.w;
         }
     }
 }
@@ -434,7 +454,7 @@ void scale1_horizontal(int I, int J, int c0)
 [numthreads(GROUP, 1, 1)]
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
-#if FROM_PICTURE
+#if NEXT
     const int colStart = 0;  // the approximation bands, all of them
 #else
     const int colStart = min(CM_LEFT, DEN_LEFT);
@@ -454,10 +474,10 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         int newRef, newDis;
         slide_row(i + 1, j, local, ownColumn && i + 1 < end, nextRestored, nextAdditive, nextA, nextR, nextDen,
                   newRef, newDis);
-#if FROM_PICTURE
+#if NEXT
         aRef[0] = aRef[1]; aRef[1] = aRef[2]; aRef[2] = aRef[3]; aRef[3] = newRef;
         aDis[0] = aDis[1]; aDis[1] = aDis[2]; aDis[2] = aDis[3]; aDis[3] = newDis;
-        // Scale 1's row I once the step has given its last row of a (2I + 2;
+        // The next scale's row I once the step has given its last row of a (2I + 2;
         // the band's last step for its last row when it is odd), of the I
         // whose first row 2I is the workgroup's.
         const int s = i + 1;
@@ -470,7 +490,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
             scale1_vertical(I, s, aRef, aDis, local);
 #endif
         GroupMemoryBarrierWithGroupSync();
-#if FROM_PICTURE
+#if NEXT
         if (I >= 0 && local < uint(OWN / 2)) {
             const int c0 = int(group.x) * OWN, J = c0 / 2 + int(local);
             if (J < (BW + 1) / 2)

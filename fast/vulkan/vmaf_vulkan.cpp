@@ -1294,14 +1294,6 @@ int vv_context::build_passes_v1()
 
         static const int kV[4][2] = { { 0, 0 }, { 0, 0 }, { 16, 32768 }, { 16, 32768 } };
         static const int kH[4][2] = { { 16, 32768 }, { 15, 16384 }, { 16, 32768 }, { 15, 16384 } };
-        if (scale > 1) {  // the wavelet transform, as for VMAF v0.6.1 (scales 0 and 1's: in scale 0's fused pass)
-            const int32_t constants[] = { inW, inH, inStride, bandStride, kV[scale][0], kV[scale][1],
-                                          kH[scale][0], kH[scale][1] };
-            error = add_pass(scored, kShader_adm_dwt, { inRef, inDis, &bandsRef[set], &bandsDis[set] }, constants,
-                             sizeof constants, groups(bw, 16), groups(bh, 8));
-            if (error)
-                break;
-        }
         // adm_csf_den, adm_decouple, adm_csf and adm_cm of both images in
         // one pass (shaders/adm_fused.slang), its parameters in admParams.
         int32_t *p = &admParamValues[(size_t)scale * kAdmParams];
@@ -1382,9 +1374,16 @@ int vv_context::build_passes_v1()
             p[42] = std::min(p[8], p[12]);
             p[43] = std::max(p[9], p[13]);
         }
-        if (scale == 0) {  // the transform from the pictures, and all of the band image (its a)
+        if (scale < kScales - 1) {  // the next scale's transform, of all of the band image's a
             p[42] = 0;
             p[43] = bh;
+            p[51] = set == 1 ? (w + 1) / 2 : ((w + 1) / 2 + 1) / 2;  // the next scale's bands' stride
+            p[52] = kV[scale + 1][0];
+            p[53] = kV[scale + 1][1];
+            p[54] = kH[scale + 1][0];
+            p[55] = kH[scale + 1][1];
+        }
+        if (scale == 0) {  // the transform from the pictures
             p[44] = inW;
             p[45] = inH;
             p[46] = inStride;
@@ -1392,17 +1391,14 @@ int vv_context::build_passes_v1()
             p[48] = 1 << (bpc - 1);
             p[49] = kH[0][0];
             p[50] = kH[0][1];
-            p[51] = ((w + 1) / 2 + 1) / 2;  // scale 1's bands' stride
-            p[52] = kV[1][0];
-            p[53] = kV[1][1];
-            p[54] = kH[1][0];
-            p[55] = kH[1][1];
+
         }
         {   // SLIDE: workgroups of kAdmOwnColumns columns down bands of
             // kAdmBandRows rows, each row's sums per workgroup into admPartial;
             // then ROWSUM adds and rounds each row's.
-            const int colStart = scale == 0 ? 0 : std::min(p[10], p[14]);
-            const int colEnd = scale == 0 ? bw : std::max(p[11], p[15]);
+            const bool next = scale < kScales - 1;  // all of the band image (the next scale's transform)
+            const int colStart = next ? 0 : std::min(p[10], p[14]);
+            const int colEnd = next ? bw : std::max(p[11], p[15]);
             const int rows = std::max(0, p[43] - p[42]);
             const uint32_t chunks = groups(std::max(0, colEnd - colStart), kAdmOwnColumns);
             const uint32_t constants[] = { (uint32_t)(scale * kAdmParams), chunks };
@@ -1417,8 +1413,12 @@ int vv_context::build_passes_v1()
                                                    Bound(&admPartial) };
                     });
             } else {
-                error = add_pass(scored, kShader_adm_fused, { &bandsRef[set], &bandsDis[set], &divTable, &admParams, &acc,
-                                 &admPartial }, constants, sizeof constants, chunks, groups(rows, kAdmBandRowsSmall));
+                error = next ? add_pass(scored, kShader_adm_fused_next, { &bandsRef[set], &bandsDis[set], &divTable,
+                                        &admParams, &acc, &admPartial, &bandsRef[1 - set], &bandsDis[1 - set] },
+                                        constants, sizeof constants, chunks, groups(rows, kAdmBandRowsSmall))
+                             : add_pass(scored, kShader_adm_fused, { &bandsRef[set], &bandsDis[set], &divTable, &admParams,
+                                        &acc, &admPartial }, constants, sizeof constants, chunks,
+                                        groups(rows, kAdmBandRowsSmall));
             }
             if (!error)
                 error = add_pass(scored, kShader_adm_rowsum, { &bandsRef[set], &bandsDis[set], &divTable, &admParams, &acc,

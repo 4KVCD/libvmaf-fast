@@ -91,6 +91,7 @@ $shaders = [ordered]@{
     'adm_fused_0_8'     = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=0', 'SLIDE=1'
     'adm_fused_0_16'    = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=1', 'SLIDE=1'
     'adm_fused'         = 'adm_fused', 'SCALE0=0', 'FROM_PICTURE=0', 'BPC16=0', 'SLIDE=1', 'BAND=8'
+    'adm_fused_next'    = 'adm_fused', 'SCALE0=0', 'FROM_PICTURE=0', 'BPC16=0', 'SLIDE=1', 'BAND=8', 'NEXT_SCALE=1'
     'adm_rowsum'        = 'adm_fused', 'SCALE0=0', 'FROM_PICTURE=0', 'BPC16=0', 'ROWSUM=1'
     # VMAF v1's SpEED chroma (shaders/speed.slang): float sums in libvmaf's
     # order, each multiply and add rounded (NO_CONTRACTION: see Add-NoContraction).
