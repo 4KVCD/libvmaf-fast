@@ -103,7 +103,13 @@ uint64_t total48(Sum48 sum)
 // below 2^40: the same word as the 48-bit sum's, whatever the samples. (At
 // 10 bits nothing wraps at all: the high parts add up to under 2^28.)
 #define add48(sum, a, b) { sum.high += ((a) >> 8) * (b); sum.low += ((a) & 0xFFu) * (b); }
-#define total48(sum) ((uint64_t(sum.high) << 8) + uint64_t(sum.low))
+// That word, (high 2^8 + low + addSq) >> shiftSq modulo 2^32, made in 32
+// bits: high 2^8 is a multiple of 2^shiftSq (shiftSq <= 8), so it is
+// high 2^(8 - shiftSq) + ((low + addSq) >> shiftSq), and low + addSq is
+// below 2^29 + 2^7.
+#define shifted48(sum) ((sum.high << (8 - pc.shiftSq)) + ((sum.low + pc.addSq) >> pc.shiftSq))
+#else
+#define shifted48(sum) uint((total48(sum) + pc.addSq) >> pc.shiftSq)
 #endif
 
 // vif_vert.slang's main for one pixel, into the tile at `at`.
@@ -199,9 +205,9 @@ void vertical(int x, int y, uint at)
     gTile[2 * plane + at] = disSq;
     gTile[3 * plane + at] = refDis;
 #else
-    gTile[plane + at] = uint((total48(refSq) + pc.addSq) >> pc.shiftSq);
-    gTile[2 * plane + at] = uint((total48(disSq) + pc.addSq) >> pc.shiftSq);
-    gTile[3 * plane + at] = uint((total48(refDis) + pc.addSq) >> pc.shiftSq);
+    gTile[plane + at] = shifted48(refSq);
+    gTile[2 * plane + at] = shifted48(disSq);
+    gTile[3 * plane + at] = shifted48(refDis);
 #endif
 #if FW_RD > 0
     if (nextRow)
