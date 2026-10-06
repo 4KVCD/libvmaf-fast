@@ -610,7 +610,7 @@ struct vv_context {
     float rfactorV1[kScales][3] = {};
     int build_passes_v1();
     // adm_fused.slang's parameters per scale (kAdmParams words each).
-    enum { kAdmParams = 52, kAdmFusedRows = 4 };
+    enum { kAdmParams = 52, kAdmFusedRows = 2 };
     Buffer admParams;
     std::vector<int32_t> admParamValues;
     int skip = 0;  // timing tests: 1 = no motion, 2 = no VIF, 4 = no ADM

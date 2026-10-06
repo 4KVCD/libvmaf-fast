@@ -88,7 +88,7 @@
 
 #include "adm_decouple_common.slang"
 
-#define ROWS 4
+#define ROWS 2
 #define GROUP 128
 #define SPAN (GROUP + 2)
 // Per pixel of the rows and their neighbours: the bands' csfF summed, and csfRF's.
