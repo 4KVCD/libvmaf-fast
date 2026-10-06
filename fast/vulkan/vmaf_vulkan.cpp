@@ -610,7 +610,7 @@ struct vv_context {
     float rfactorV1[kScales][3] = {};
     int build_passes_v1();
     // adm_fused.slang's parameters per scale (kAdmParams words each).
-    enum { kAdmParams = 44, kAdmFusedRows = 4 };
+    enum { kAdmParams = 52, kAdmFusedRows = 4 };
     Buffer admParams;
     std::vector<int32_t> admParamValues;
     int skip = 0;  // timing tests: 1 = no motion, 2 = no VIF, 4 = no ADM
@@ -1245,20 +1245,15 @@ int vv_context::build_passes_v1()
                 i_rfactor[band] = (uint32_t)(rfactor[band] * pow2_32);
         }
 
-        {   // the wavelet transform, as for VMAF v0.6.1
-            static const int kV[4][2] = { { 0, 0 }, { 0, 0 }, { 16, 32768 }, { 16, 32768 } };
-            static const int kH[4][2] = { { 16, 32768 }, { 15, 16384 }, { 16, 32768 }, { 15, 16384 } };
-            const int32_t constants[] = { inW, inH, inStride, bandStride,
-                                          scale == 0 ? bpc : kV[scale][0], scale == 0 ? 1 << (bpc - 1) : kV[scale][1],
+        static const int kV[4][2] = { { 0, 0 }, { 0, 0 }, { 16, 32768 }, { 16, 32768 } };
+        static const int kH[4][2] = { { 16, 32768 }, { 15, 16384 }, { 16, 32768 }, { 15, 16384 } };
+        if (scale > 0) {  // the wavelet transform, as for VMAF v0.6.1 (scale 0's: in the fused pass)
+            const int32_t constants[] = { inW, inH, inStride, bandStride, kV[scale][0], kV[scale][1],
                                           kH[scale][0], kH[scale][1] };
-            const int shader = scale == 0 ? (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8) : kShader_adm_dwt;
-            error = add_pass(scored, shader, { inRef, inDis, &bandsRef[set], &bandsDis[set] }, constants,
-                             sizeof constants, groups(bw, 16), groups(bh, 8));
-            if (!error && direct && scale == 0)
-                error = per_slot(scored, [&](Slot &slot) {
-                    return std::vector<Bound>{ slot_ref(slot), slot_dis(slot), Bound(&bandsRef[set]),
-                                               Bound(&bandsDis[set]) };
-                });
+            // Scale 1 reads scale 0's approximation bands, one int32 a position.
+            error = add_pass(scored, scale == 1 ? kShader_adm_dwt_approx : kShader_adm_dwt,
+                             { inRef, inDis, &bandsRef[set], &bandsDis[set] }, constants, sizeof constants,
+                             groups(bw, 16), groups(bh, 8));
             if (error)
                 break;
         }
@@ -1339,12 +1334,34 @@ int vv_context::build_passes_v1()
             p[42] = std::min(start_row, p[12]);
             p[43] = std::max(end_row, p[13]);
         }
+        if (scale == 0) {  // the transform from the pictures, and all of the band image (its a)
+            p[42] = 0;
+            p[43] = bh;
+            p[44] = inW;
+            p[45] = inH;
+            p[46] = inStride;
+            p[47] = bpc;
+            p[48] = 1 << (bpc - 1);
+            p[49] = kH[0][0];
+            p[50] = kH[0][1];
+            p[51] = bandStride;
+        }
         {
             const uint32_t constants[] = { (uint32_t)(scale * kAdmParams) };
             const uint32_t rowGroups = (uint32_t)std::max(0, (p[43] - p[42] + kAdmFusedRows - 1) / kAdmFusedRows);
-            error = add_pass(scored, scale == 0 ? kShader_adm_fused_0 : kShader_adm_fused,
-                             { &bandsRef[set], &bandsDis[set], &divTable, &admParams, &acc }, constants,
-                             sizeof constants, 1, rowGroups);
+            if (scale == 0) {
+                error = add_pass(scored, deep ? kShader_adm_fused_0_16 : kShader_adm_fused_0_8,
+                                 { inRef, inDis, &divTable, &admParams, &acc, &bandsRef[set], &bandsDis[set] },
+                                 constants, sizeof constants, 1, rowGroups);
+                if (!error && direct)
+                    error = per_slot(scored, [&](Slot &slot) {
+                        return std::vector<Bound>{ slot_ref(slot), slot_dis(slot), Bound(&divTable), Bound(&admParams),
+                                                   Bound(&acc), Bound(&bandsRef[set]), Bound(&bandsDis[set]) };
+                    });
+            } else {
+                error = add_pass(scored, kShader_adm_fused, { &bandsRef[set], &bandsDis[set], &divTable, &admParams, &acc },
+                                 constants, sizeof constants, 1, rowGroups);
+            }
         }
         inW = bw;
         inH = bh;

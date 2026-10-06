@@ -18,14 +18,29 @@
 // in any order (it is modulo 2^32 if it wraps). The rows' sums are each
 // rounded as the CPU code rounds them, a row at a time: here when the whole
 // row is summed.
+//
+// FROM_PICTURE (scale 0): the bands are not read but calculated here from the
+// two pictures, as adm_dwt.slang's SCALE0 calculates them, for each pixel
+// the pass reads; its workgroups cover the whole band image, and write the
+// approximation bands (a) for the next scale's transform, one int32 a
+// position (adm_dwt.slang's A_PLANE reads them).
 #include "common.slang"
 
 [[vk::push_constant]] uniform uint pc[4];  // the scale's first word in params
+#if FROM_PICTURE
+[[vk::binding(0, 0)]] StructuredBuffer<uint> refPicture;
+[[vk::binding(1, 0)]] StructuredBuffer<uint> disPicture;
+#else
 [[vk::binding(0, 0)]] StructuredBuffer<uint> refBands;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> disBands;
+#endif
 [[vk::binding(2, 0)]] StructuredBuffer<uint> divTable;
 [[vk::binding(3, 0)]] StructuredBuffer<int> params;
 [[vk::binding(4, 0)]] RWStructuredBuffer<uint> acc;
+#if FROM_PICTURE
+[[vk::binding(5, 0)]] RWStructuredBuffer<int> refApprox;
+[[vk::binding(6, 0)]] RWStructuredBuffer<int> disApprox;
+#endif
 
 // params, from pc[0]:
 #define P(i) params[pc[0] + (i)]
@@ -61,6 +76,15 @@
 #define SLOT_DEN uint(P(41))
 #define FIRST_ROW P(42)
 #define LAST_ROW P(43)         // past it
+// FROM_PICTURE: adm_dwt.slang's SCALE0 parameters, and the approximation bands' row stride.
+#define PIC_W P(44)
+#define PIC_H P(45)
+#define PIC_STRIDE P(46)       // words per picture row
+#define SHIFT_V P(47)
+#define ADD_V P(48)
+#define SHIFT_H P(49)
+#define ADD_H P(50)
+#define APPROX_STRIDE P(51)
 
 #include "adm_decouple_common.slang"
 
@@ -79,15 +103,73 @@ struct Decoupled {
     int restored[3], additive[3], csfA[3], csfF[3], csfR[3], csfRF[3];
 };
 
-Decoupled decouple(int i, int j)
+#if FROM_PICTURE
+static const int kLo[4] = { 15826, 27411, 7345, -4240 };
+static const int kHi[4] = { -4240, -7345, 27411, -15826 };
+static const int kLoSum = 46342;
+
+// adm_dwt.slang's calculate_indices
+int4 indices(int n, int limit)
 {
-    Decoupled out;
+    int4 at = int4(2 * n - 1, 2 * n, 2 * n + 1, 2 * n + 2);
+    if (n == 0)
+        at = int4(1, 0, 1, 2);
+    if (at.x >= limit) at.x = 2 * limit - at.x - 1;
+    if (at.y >= limit) at.y = 2 * limit - at.y - 1;
+    if (at.z >= limit) at.z = 2 * limit - at.z - 1;
+    if (at.w >= limit) at.w = 2 * limit - at.w - 1;
+    return at;
+}
+
+// adm_dwt.slang's SCALE0 transform at band position (i, j): a, and h, v, d
+// in bands[0..2].
+int transform(StructuredBuffer<uint> source, int i, int j, out int bands[3])
+{
+    const int4 columns = indices(j, PIC_W), rows = indices(i, PIC_H);
+    int lo[4], hi[4];
+    for (int c = 0; c < 4; ++c) {
+        int sumLo = 0, sumHi = 0;
+        for (int k = 0; k < 4; ++k) {
+            const int sample = int(pixel(source, columns[c], rows[k], PIC_STRIDE));
+            sumLo += kLo[k] * sample;
+            sumHi += kHi[k] * sample;
+        }
+        sumLo -= kLoSum * ADD_V;
+        lo[c] = sext16((sumLo + ADD_V) >> SHIFT_V);
+        hi[c] = sext16((sumHi + ADD_V) >> SHIFT_V);
+    }
+    int a = 0, v = 0, h = 0, d = 0;
+    for (int c = 0; c < 4; ++c) {
+        a += kLo[c] * lo[c];
+        v += kHi[c] * lo[c];
+        h += kLo[c] * hi[c];
+        d += kHi[c] * hi[c];
+    }
+    bands[0] = sext16((h + ADD_H) >> SHIFT_H);
+    bands[1] = sext16((v + ADD_H) >> SHIFT_H);
+    bands[2] = sext16((d + ADD_H) >> SHIFT_H);
+    return (a + ADD_H) >> SHIFT_H;
+}
+#endif
+
+// A pixel's three bands of each picture (h, v, d): read, or calculated.
+void load_bands(int i, int j, out int o[3], out int t[3])
+{
+#if FROM_PICTURE
+    transform(refPicture, i, j, o);
+    transform(disPicture, i, j, t);
+#else
     const int from = (i * IN_STRIDE + j) * 4;
-    int o[3], t[3];
     for (int b = 0; b < 3; ++b) {
         o[b] = int(refBands[from + 1 + b]);
         t[b] = int(disBands[from + 1 + b]);
     }
+#endif
+}
+
+Decoupled decouple_bands(int o[3], int t[3])
+{
+    Decoupled out;
     const int64_t otDp = int64_t(o[0]) * t[0] + int64_t(o[1]) * t[1];
     const int64_t oMagSq = int64_t(o[0]) * o[0] + int64_t(o[1]) * o[1];
     const int64_t tMagSq = int64_t(t[0]) * t[0] + int64_t(t[1]) * t[1];
@@ -185,6 +267,13 @@ uint64_t den_term(int value)
 #endif
 }
 
+Decoupled decouple(int i, int j)
+{
+    int o[3], t[3];
+    load_bands(i, j, o, t);
+    return decouple_bands(o, t);
+}
+
 bool in_cm_decouple(int i, int j)  // decoupled for the masking: its region and a pixel around it
 {
     return i >= CM_TOP - 1 && i <= CM_BOTTOM && j >= CM_LEFT - 1 && j <= CM_RIGHT;
@@ -195,7 +284,11 @@ bool in_cm_decouple(int i, int j)  // decoupled for the masking: its region and 
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
     const int r0 = FIRST_ROW + int(group.y) * ROWS;
+#if FROM_PICTURE
+    const int colStart = 0, colEnd = BW;  // the approximation bands, all of them
+#else
     const int colStart = min(CM_LEFT, DEN_LEFT), colEnd = max(CM_RIGHT, DEN_RIGHT);
+#endif
     // Per row of the workgroup: the cm sums of the two images' three bands, and the denominator's.
     int64_t cm[ROWS][6];
     uint64_t den[ROWS][3];
@@ -210,8 +303,31 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         [unroll] for (int rr = 0; rr < ROWS + 2; ++rr) {
             const int i = r0 - 1 + rr;
             int sumF = 0, sumRF = 0;
+            const bool own = rr >= 1 && rr <= ROWS;
+            const bool inDen = own && i >= DEN_TOP && i < DEN_BOTTOM && j >= DEN_LEFT && j < DEN_RIGHT;
+#if FROM_PICTURE
+            // The transform once for all three uses: the approximation bands
+            // (the band image's every position), the denominator, the decoupling.
+            const bool approx = own && i < BH && j < BW;
+            int o[3], t[3];
+            if (approx || inDen || in_cm_decouple(i, j)) {
+                const int aRef = transform(refPicture, i, j, o), aDis = transform(disPicture, i, j, t);
+                if (approx) {
+                    refApprox[i * APPROX_STRIDE + j] = aRef;
+                    disApprox[i * APPROX_STRIDE + j] = aDis;
+                }
+            }
+            if (inDen) {
+                for (int b = 0; b < 3; ++b)
+                    den[rr - 1][b] += den_term(o[b]);
+            }
+#endif
             if (in_cm_decouple(i, j)) {
+#if FROM_PICTURE
+                const Decoupled d = decouple_bands(o, t);
+#else
                 const Decoupled d = decouple(i, j);
+#endif
                 sumF = d.csfF[0] + d.csfF[1] + d.csfF[2];
                 sumRF = d.csfRF[0] + d.csfRF[1] + d.csfRF[2];
                 if (rr >= 1 && rr <= ROWS) {
@@ -226,11 +342,13 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
             }
             gSumF[rr * SPAN + int(local) + 1] = sumF;
             gSumRF[rr * SPAN + int(local) + 1] = sumRF;
-            if (rr >= 1 && rr <= ROWS && i >= DEN_TOP && i < DEN_BOTTOM && j >= DEN_LEFT && j < DEN_RIGHT) {
+#if !FROM_PICTURE
+            if (inDen) {
                 const int from = (i * IN_STRIDE + j) * 4;
                 for (int b = 0; b < 3; ++b)
                     den[rr - 1][b] += den_term(int(refBands[from + 1 + b]));
             }
+#endif
         }
         // The columns either side of the chunk.
         if (local < 2) {

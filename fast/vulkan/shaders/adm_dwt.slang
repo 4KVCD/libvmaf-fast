@@ -75,7 +75,11 @@ void transform(StructuredBuffer<uint> source, RWStructuredBuffer<int> bands, int
     for (int c = 0; c < 4; ++c) {
         int64_t sumLo = 0, sumHi = 0;
         for (int i = 0; i < 4; ++i) {
+#if A_PLANE  // scale 0's approximation bands alone (adm_fused.slang's FROM_PICTURE)
+            int64_t sample = int64_t(int(source[rows[i] * pc.inStride + columns[c]]));
+#else
             int64_t sample = int64_t(int(source[(rows[i] * pc.inStride + columns[c]) * 4]));
+#endif
             sumLo += int64_t(kLo[i]) * sample;
             sumHi += int64_t(kHi[i]) * sample;
         }

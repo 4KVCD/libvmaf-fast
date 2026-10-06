@@ -86,8 +86,10 @@ $shaders = [ordered]@{
     'cambi_front_8'     = 'cambi', 'STAGE=14', 'BPC16=0'
     'cambi_front_16'    = 'cambi', 'STAGE=14', 'BPC16=1'
     # VMAF v1's ADM after the wavelet transform, one pass per scale (shaders/adm_fused.slang).
-    'adm_fused_0'       = 'adm_fused', 'SCALE0=1'
-    'adm_fused'         = 'adm_fused', 'SCALE0=0'
+    'adm_fused_0_8'     = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=0'
+    'adm_fused_0_16'    = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=1'
+    'adm_fused'         = 'adm_fused', 'SCALE0=0', 'FROM_PICTURE=0', 'BPC16=0'
+    'adm_dwt_approx'    = 'adm_dwt', 'SCALE0=0', 'BPC16=0', 'A_PLANE=1'
     # VMAF v1's SpEED chroma (shaders/speed.slang): float sums in libvmaf's
     # order, each multiply and add rounded (NO_CONTRACTION: see Add-NoContraction).
     'speed_dec'         = 'speed', 'STAGE=1', 'NO_CONTRACTION=1'
