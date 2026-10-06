@@ -532,6 +532,9 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     const uint stride = pc[6 + scale] * 256, n = pc[1 + scale];
     for (uint i = group.x * 256 + local; i < n; i += stride) {
         const uint bits = c_value(scale, i);
+        // Most c-values are 0 (pixels not masked): not counted here, every
+        // workgroup on one bin; SELECT adds them to bin 0 where they belong.
+        if (bits == 0) continue;
         uint bin;
         if (level == 0) {
             bin = bits >> 20;
@@ -600,7 +603,10 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 [[vk::binding(0, 0)]] StructuredBuffer<uint> hist;
 [[vk::binding(1, 0)]] RWStructuredBuffer<uint> state;   // prefix, remaining
 [[vk::binding(2, 0)]] RWStructuredBuffer<uint> acc;
-// pc: level, k[5], the first scale's slot (sum, threshold, remaining, inexact: 4 a scale)
+// pc: level, k[5], the first scale's slot (sum, threshold, remaining,
+// inexact: 4 a scale), n[5] (the scales' c-values). The zero c-values, which
+// HIST does not count, are n less the rest (level 0, kept in state[10 +
+// scale]), and are bin 0's at every level whose prefix is 0.
 
 groupshared uint gScan[256];
 
@@ -613,6 +619,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     const uint at = scale * 2, offset = (scale * 3 + level) * 4096;
     const uint remaining = level == 0 ? pc[1 + scale] : state[at + 1];
     const uint prefix = level == 0 ? 0u : state[at];
+    const uint zerosAt = 10 + scale;
     // The thread's bins, from the top: bins - 1 - per * local down.
     const uint top = bins - 1 - per * local;
     uint own = 0;
@@ -626,6 +633,13 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         GroupMemoryBarrierWithGroupSync();
     }
     const uint before = local == 0 ? 0u : gScan[local - 1];
+    // The zeros, in bin 0: the last thread's (the bottom bins' from the top).
+    uint zeros = 0;
+    if (level == 0)
+        zeros = pc[7 + scale] - gScan[255];
+    else if (prefix == 0)
+        zeros = state[zerosAt];
+    const uint scanned = gScan[local] + (local == 255 ? zeros : 0u);
     bool write = false;
     uint chosen = 0, left = 0;
     if (remaining == 0) {  // the top bin's count reaches it at once
@@ -634,10 +648,10 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
             left = 0;
             write = true;
         }
-    } else if (gScan[local] >= remaining && before < remaining) {
+    } else if (scanned >= remaining && before < remaining) {
         uint counted = before;
         for (uint i = 0; i < per; ++i) {
-            const uint count = hist[offset + top - i];
+            const uint count = hist[offset + top - i] + (top - i == 0 ? zeros : 0u);
             if (counted + count >= remaining) {
                 chosen = top - i;
                 left = remaining - counted;
@@ -646,11 +660,13 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
             counted += count;
         }
         write = true;
-    } else if (local == 255 && gScan[255] < remaining) {  // no bin reaches it
+    } else if (local == 255 && scanned < remaining) {  // no bin reaches it
         chosen = 0;
-        left = remaining - gScan[255];
+        left = remaining - scanned;
         write = true;
     }
+    if (level == 0 && local == 255)
+        state[zerosAt] = zeros;
     if (write) {
         const uint next = level == 0 ? chosen : (prefix << (level < 2 ? 12u : 8u)) | chosen;
         state[at] = next;

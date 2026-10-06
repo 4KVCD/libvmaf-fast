@@ -1752,7 +1752,7 @@ int vv_context::enable_cambi(const double *values)
     struct { Buffer *buffer; VkDeviceSize bytes; } sized[] = {
         { &cambiImage, full * 4 }, { &cambiMaskFull, full * 4 },
         { &cambiReciprocal, sizeof kCambiReciprocal }, { &cambiHist, (VkDeviceSize)histWords * 4 },
-        { &cambiState, V1_CAMBI_SCALES * 2 * 4 },
+        { &cambiState, (10 + V1_CAMBI_SCALES) * 4 },  // per scale: prefix, remaining; then the zero c-values
     };
     for (auto &entry : sized) {
         if (int error = create_buffer(*entry.buffer, entry.bytes, false))
@@ -1871,9 +1871,11 @@ int vv_context::enable_cambi(const double *values)
         error = add_pass(scored, kShader_cambi_hist, { &cambiC[0], &cambiC[1], &cambiC[2], &cambiC[3], &cambiC[4],
                          &cambiHist, &cambiState }, sizes, sizeof sizes, mostGroups, V1_CAMBI_SCALES);
         if (!error) {
-            uint32_t select[7] = { level };
-            for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale)
+            uint32_t select[12] = { level };
+            for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
                 select[1 + scale] = (uint32_t)c.topk_elements[scale];
+                select[7 + scale] = sizes[1 + scale];  // the scale's c-values
+            }
             select[6] = (uint32_t)kSlotCambi;
             error = add_pass(scored, kShader_cambi_select, { &cambiHist, &cambiState, &acc }, select, sizeof select, 1,
                              V1_CAMBI_SCALES);
