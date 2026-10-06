@@ -45,8 +45,10 @@
 #include <string.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -503,10 +505,18 @@ struct vv_context {
     // The first passes read each pair's frames where they were written (the
     // frame slot's staging buffers: the reference's in staging, the
     // distorted's in stagingDis), not from picRef and picDis after a copy:
-    // on integrated GPUs, but for VMAF v1 and frames from a decoder's CUDA
-    // (shared).
+    // on integrated GPUs, and discrete ones whose memory the CPU writes
+    // (barFrames), but for VMAF v1 and frames from a decoder's CUDA (shared).
     // VV_DIRECT_FRAMES=0 for the copy, to compare.
     bool direct = true;
+    // A discrete GPU whose memory the CPU can map as a whole (Resizable BAR:
+    // a device-local, host-visible type on the device-local heap): the frames'
+    // staging buffers there, the CPU writing them across PCIe itself, and the
+    // first passes reading them there, so the GPU has no copy to make. An RTX
+    // 5090's 4K 10-bit pair: 1.29 -> 0.47 ms of GPU time, and the CPU's copy
+    // into staging 1.85 -> 1.57 ms. VV_BAR_FRAMES=0 for staging in system
+    // memory, to compare.
+    bool barFrames = false;
     // The frames' luma planes come from another API on this GPU (a decoder's
     // CUDA, or its own Vulkan device), which writes them into the slots'
     // staging buffers: GPU memory it imports by the handles vv_export gives,
@@ -599,6 +609,27 @@ struct vv_context {
     int upload(Buffer &target, const void *data, size_t bytes);
     int build_passes();
     int submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *dis, ptrdiff_t disStride, bool score);
+    // submit's copy of the planes into staging, split by rows among
+    // copyThreads threads: the caller's and copiers, started by the first
+    // submit. On discrete GPUs, where the copy crosses PCIe: one thread's
+    // writes do not fill it (an RTX 5090's 4K 10-bit pair, into its memory:
+    // 1.57 ms with one thread, 1.04 with four). Not on integrated ones,
+    // whose GPU reads the same memory the threads write (Core Ultra 9 285K's
+    // iGPU: 4K 13.97 -> 14.25 ms a pair with four). VV_COPY_THREADS=N to
+    // compare.
+    unsigned copyThreads = 1;
+    std::vector<std::thread> copiers;
+    std::mutex copyMutex;
+    std::condition_variable copyStart, copyDone;
+    unsigned copyGeneration = 0, copyPending = 0;
+    bool copyQuit = false;
+    struct {
+        uint8_t *to[2];
+        const uint8_t *from[2];
+        ptrdiff_t stride[2];
+    } copyJob = {};
+    void copy_part(unsigned part);
+    void copier(unsigned part);
     int staging(uint8_t **ref, uint8_t **dis);
     int commit(bool score);
     Slot *pending = nullptr;
@@ -608,6 +639,15 @@ struct vv_context {
 
 vv_context::~vv_context()
 {
+    if (!copiers.empty()) {
+        {
+            std::lock_guard<std::mutex> lock(copyMutex);
+            copyQuit = true;
+        }
+        copyStart.notify_all();
+        for (std::thread &thread : copiers)
+            thread.join();
+    }
     if (!device)
         return;
     vk.vkDeviceWaitIdle(device);
@@ -682,8 +722,9 @@ int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisibl
     // 1080p 4.17 -> 4.15), and the CPU writes it as fast.
     const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     const VkMemoryPropertyFlags cached = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    const VkMemoryPropertyFlags local = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     const VkMemoryPropertyFlags wanted[3] = {
-        hostVisible ? (writeOnly ? visible : visible | cached) : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        hostVisible ? (writeOnly ? visible | (barFrames ? local : 0) : visible | cached) : local,
         hostVisible ? visible : VkMemoryPropertyFlags(0), VkMemoryPropertyFlags(0)
     };
     const VkMemoryPropertyFlags unwanted[3] = { hostVisible && writeOnly ? cached : 0, 0, 0 };
@@ -1739,12 +1780,37 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     }
     if (const char *text = getenv("VV_ADM_FUSED"))
         admFused = strcmp(text, "0") != 0;
+    if (properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
+        copyThreads = std::clamp(std::thread::hardware_concurrency(), 1u, 4u);
+    if (const char *text = getenv("VV_COPY_THREADS"))
+        copyThreads = (unsigned)std::clamp(atoi(text), 1, 16);
     if (const char *text = getenv("VV_DIRECT_FRAMES"))
         direct = strcmp(text, "0") != 0;
-    // Only where the staging memory is the GPU's own (an integrated GPU): a
-    // discrete GPU's shaders would read it across PCIe -- an RTX 5090's 4K
-    // pair took 13.6 ms of GPU time that way against 1.5 with the copy.
-    direct = direct && !shared && !v1 && properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    // Only where the staging memory is the GPU's own (an integrated GPU, or
+    // barFrames): a discrete GPU's shaders would read system memory across
+    // PCIe -- an RTX 5090's 4K pair took 13.6 ms of GPU time that way against
+    // 1.5 with the copy.
+    api->vkGetPhysicalDeviceMemoryProperties(physical, &memoryProperties);
+    if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU && !shared && !v1) {
+        // The device-local heap's host-visible type (Resizable BAR), on a
+        // heap of at least 1 GiB (without it, a 256 MB window) and with room
+        // for the slots' frames many times over.
+        const VkMemoryPropertyFlags bar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                          | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const VkDeviceSize frameBytes = 2ull * (((uint32_t)w * (bpc > 8 ? 2 : 1) + 3) & ~3u) * (uint32_t)h;
+        const VkDeviceSize needed = frameBytes * (VkDeviceSize)(((flags >> 8) & 0xFF) ? std::clamp((flags >> 8) & 0xFF, 1, 16) : 3);
+        for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
+            const VkMemoryType &type = memoryProperties.memoryTypes[i];
+            const VkDeviceSize heap = memoryProperties.memoryHeaps[type.heapIndex].size;
+            if ((type.propertyFlags & bar) == bar && heap >= (1ull << 30) && needed * 8 <= heap)
+                barFrames = true;
+        }
+        if (const char *text = getenv("VV_BAR_FRAMES"))
+            barFrames = barFrames && strcmp(text, "0") != 0;
+    }
+    direct = direct && !shared && !v1
+             && (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || barFrames);
+    barFrames = barFrames && direct;
     if (const char *text = getenv("VV_VIF_FUSED"))
         vifFused = strcmp(text, "0") != 0;
     // vif_fused adds up its group's sums with subgroup arithmetic (Vulkan
@@ -1791,7 +1857,6 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     }
     decoupleVariant = (flags >> 28) & 7;
     admFused = admFused && admBoth && !v1 && !decoupleVariant && !passLimit;
-    api->vkGetPhysicalDeviceMemoryProperties(physical, &memoryProperties);
 
     uint32_t familyCount = 0;
     api->vkGetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, nullptr);
@@ -2063,8 +2128,8 @@ int vv_context::collect(Slot &slot)
     return 0;
 }
 
-// The next frame pair's two luma planes in the memory the GPU copies them
-// from, for a caller that can write them there itself (a decoder): rows of
+// The next frame pair's two luma planes in the memory the GPU reads them
+// from (or copies them from: not direct), for a caller that can write them there itself (a decoder): rows of
 // strideBytes, the reference at *ref and the distorted at *dis. commit()
 // then scores what was written.
 int vv_context::staging(uint8_t **ref, uint8_t **dis)
@@ -2080,6 +2145,45 @@ int vv_context::staging(uint8_t **ref, uint8_t **dis)
     return 0;
 }
 
+// Rows [h * part / copyThreads, h * (part + 1) / copyThreads) of each plane
+// of copyJob.
+void vv_context::copy_part(unsigned part)
+{
+    const size_t rowBytes = (size_t)w * (bpc > 8 ? 2 : 1);
+    const int y0 = (int)((uint64_t)h * part / copyThreads), y1 = (int)((uint64_t)h * (part + 1) / copyThreads);
+    for (int plane = 0; plane < 2 && y1 > y0; ++plane) {
+        const uint8_t *from = copyJob.from[plane];
+        if (!from)
+            continue;
+        uint8_t *to = copyJob.to[plane] + (size_t)y0 * strideBytes;
+        from += (ptrdiff_t)y0 * copyJob.stride[plane];
+        if ((size_t)copyJob.stride[plane] == strideBytes) {
+            // The last row without its padding, which the caller's plane need not have.
+            memcpy(to, from, (size_t)(y1 - y0) * strideBytes - (y1 == h ? strideBytes - rowBytes : 0));
+        } else {
+            for (int y = y0; y < y1; ++y, to += strideBytes, from += copyJob.stride[plane])
+                memcpy(to, from, rowBytes);
+        }
+    }
+}
+
+void vv_context::copier(unsigned part)
+{
+    unsigned seen = 0;
+    std::unique_lock<std::mutex> lock(copyMutex);
+    for (;;) {
+        copyStart.wait(lock, [&] { return copyQuit || copyGeneration != seen; });
+        if (copyQuit)
+            return;
+        seen = copyGeneration;
+        lock.unlock();
+        copy_part(part);
+        lock.lock();
+        if (--copyPending == 0)
+            copyDone.notify_one();
+    }
+}
+
 int vv_context::submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *dis, ptrdiff_t disStride, bool score)
 {
     uint8_t *targets[2];
@@ -2087,19 +2191,27 @@ int vv_context::submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *d
         return fail(-3, "this context takes its frames from GPU memory");
     if (int error = staging(&targets[0], &targets[1]))
         return error;
-    const size_t rowBytes = (size_t)w * (bpc > 8 ? 2 : 1);
-    const uint8_t *planes[2] = { ref, score ? dis : nullptr };
-    const ptrdiff_t strides[2] = { refStride, disStride };
-    for (int plane = 0; plane < 2; ++plane) {
-        if (!planes[plane])
-            continue;
-        uint8_t *to = targets[plane];
-        if ((size_t)strides[plane] == strideBytes) {
-            memcpy(to, planes[plane], planeBytes - (strideBytes - rowBytes));
-        } else {
-            for (int y = 0; y < h; ++y)
-                memcpy(to + (size_t)y * strideBytes, planes[plane] + (ptrdiff_t)y * strides[plane], rowBytes);
+    copyJob = { { targets[0], targets[1] }, { ref, score ? dis : nullptr }, { refStride, disStride } };
+    if (copiers.empty() && copyThreads > 1) {
+        try {
+            for (unsigned part = 1; part < copyThreads; ++part)
+                copiers.emplace_back(&vv_context::copier, this, part);
+        } catch (const std::system_error &) {
+            copyThreads = (unsigned)copiers.size() + 1;  // the parts the threads made take
         }
+    }
+    if (!copiers.empty()) {
+        {
+            std::lock_guard<std::mutex> lock(copyMutex);
+            ++copyGeneration;
+            copyPending = (unsigned)copiers.size();
+        }
+        copyStart.notify_all();
+    }
+    copy_part(0);
+    if (!copiers.empty()) {
+        std::unique_lock<std::mutex> lock(copyMutex);
+        copyDone.wait(lock, [&] { return copyPending == 0; });
     }
     return commit(score);
 }
@@ -2417,7 +2529,9 @@ VV_EXPORT int vv_submit(vv_context *context, const uint8_t *reference, ptrdiff_t
 }
 
 // The memory to write the next pair's luma planes to (rows *stride bytes
-// apart), and vv_commit to score them: vv_submit without its copy.
+// apart), and vv_commit to score them: vv_submit without its copy. Only to
+// write: on a discrete GPU it can be the GPU's own memory, across PCIe,
+// which the CPU reads very slowly.
 VV_EXPORT int vv_staging(vv_context *context, uint8_t **reference, uint8_t **distorted, uint32_t *stride)
 {
     *stride = context->strideBytes;
