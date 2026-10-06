@@ -1338,7 +1338,8 @@ int vv_context::build_passes_v1()
         Buffer *inRef = scale == 0 ? &picRef : &bandsRef[1 - set];
         Buffer *inDis = scale == 0 ? &picDis : &bandsDis[1 - set];
         const int bw = (inW + 1) / 2, bh = (inH + 1) / 2;
-        const int bandStride = set == 0 ? (w + 1) / 2 : ((w + 1) / 2 + 1) / 2;
+        // (set 0 holds scale 2's bands only: rows of its width, not scale 0's)
+        const int bandStride = set == 0 ? (((w + 1) / 2 + 1) / 2 + 1) / 2 : ((w + 1) / 2 + 1) / 2;
         const int outStride = (w + 1) / 2;
         if (!v1_rfactors(options, scale, rfactorV1[scale]))
             return fail(-3, "VMAF v1: no contrast sensitivity table for this viewing distance and display height");
@@ -1448,7 +1449,7 @@ int vv_context::build_passes_v1()
         if (scale < kScales - 1) {  // the next scale's transform, of all of the band image's a
             p[42] = 0;
             p[43] = bh;
-            p[51] = set == 1 ? (w + 1) / 2 : ((w + 1) / 2 + 1) / 2;  // the next scale's bands' stride
+            p[51] = set == 1 ? (((w + 1) / 2 + 1) / 2 + 1) / 2 : ((w + 1) / 2 + 1) / 2;  // the next scale's bands' stride
             p[52] = kV[scale + 1][0];
             p[53] = kV[scale + 1][1];
             p[54] = kH[scale + 1][0];
@@ -1813,6 +1814,11 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         sharedChromaSpacing = (chromaStride * (uint32_t)(h / 2) + 255) & ~255u;
         stagingBytes = (VkDeviceSize)sharedChroma + 4ull * sharedChromaSpacing;
     }
+    // The pictures read where a decoder left them (vv_pictures): nothing is
+    // written into the slots' shared buffers, which are made only for a
+    // decoder to import (at 4K they were 3 x 47 MB).
+    if (pictures)
+        stagingBytes = 4096;
     // Read where they are, in the GPU's own memory, when a decoder writes them
     // (shared); host memory, which the GPU reads more slowly than its own
     // (measured on a Radeon 780M: by the passes reading the pictures, more
@@ -1829,7 +1835,9 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         { &rdRef[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 }, { &rdDis[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 },
         { &picPrev[0], planeBytes * only1 * (direct ? 0 : 1) + 4 }, { &picPrev[1], planeBytes * only1 * (direct ? 0 : 1) + 4 },
         { &logTable, 32768 * 4 }, { &divTable, 65536 * 4 },
-        { &bandsRef[0], (VkDeviceSize)w1 * h1 * 16 }, { &bandsDis[0], (VkDeviceSize)w1 * h1 * 16 },
+        // (VMAF v1's ADM: scale 2's bands, as wide as they are)
+        { &bandsRef[0], (VkDeviceSize)(v1 ? ((w2 + 1) / 2) * ((h2 + 1) / 2) : w1 * h1) * 16 },
+        { &bandsDis[0], (VkDeviceSize)(v1 ? ((w2 + 1) / 2) * ((h2 + 1) / 2) : w1 * h1) * 16 },
         { &bandsRef[1], (VkDeviceSize)w2 * h2 * 16 }, { &bandsDis[1], (VkDeviceSize)w2 * h2 * 16 },
         // VMAF v1 passes nothing between ADM's passes (adm_fused.slang): VMAF v0.6.1's images.
         { &admR, (VkDeviceSize)w1 * h1 * 16 * v0 + 4 }, { &admA, (VkDeviceSize)w1 * h1 * 16 * v0 + 4 },
@@ -2181,7 +2189,8 @@ int vv_context::enable_speed(const double *values)
     uint32_t inverseBits;
     memcpy(&inverseBits, &inverse, sizeof inverseBits);
     for (Slot &slot : slots) {
-        if (int error = create_buffer(slot.speedChroma, (VkDeviceSize)chromaPlaneBytes * 4, true, false, true))
+        // (the planes from host memory, vv_chroma_staging: not with the pictures read where they are)
+        if (int error = create_buffer(slot.speedChroma, pictures ? 4 : (VkDeviceSize)chromaPlaneBytes * 4, true, false, true))
             return error;
         if (int error = create_buffer(slot.speedKeep, operating * 4 * sizeof(float), true))
             return error;
@@ -2192,7 +2201,7 @@ int vv_context::enable_speed(const double *values)
         const uint32_t blur[] = { (uint32_t)f.operating_w, (uint32_t)f.operating_h, (uint32_t)f.antialias_taps,
                                   (uint32_t)f.blur_taps };
         // From the host buffer; with a decoder's frames, also from the staging buffer (the default then).
-        for (int fromStaging = 0; fromStaging < (shared ? 2 : 1); ++fromStaging) {
+        for (int fromStaging = pictures ? 1 : 0; fromStaging < (shared ? 2 : 1); ++fromStaging) {
             std::vector<Pass> &list = shared && !fromStaging ? slot.speedPassesHost : slot.speedPasses;
             uint32_t constants[kPushBytes / 4] = {};
             memcpy(constants, dec, sizeof dec);
@@ -3068,6 +3077,8 @@ VV_EXPORT int vv_chroma_staging(vv_context *context, uint8_t **planes, uint32_t 
         return fail(-3, "SpEED is not calculated in this context");
     if (!context->pending)
         return fail(-3, "no frame was started");
+    if (context->pictures)
+        return fail(-3, "this context reads the pictures where a decoder left them (vv_pictures)");
     uint8_t *chroma = (uint8_t *)context->pending->speedChroma.mapped;
     for (int i = 0; i < 4; ++i)
         planes[i] = chroma + (size_t)i * context->chromaPlaneBytes;
