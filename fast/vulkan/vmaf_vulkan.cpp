@@ -560,7 +560,8 @@ struct vv_context {
 
     ~vv_context();
     int init(int deviceIndex, int width, int height, int bitDepth, int flags);
-    int create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported = false);
+    int create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported = false,
+                      bool writeOnly = false);
     void destroy_last_buffer(Buffer &buffer);
     int create_pipeline(int shader, uint32_t bindings);
     void write_pipeline_stats(const char *name, VkPipeline pipeline);
@@ -627,7 +628,7 @@ vv_context::~vv_context()
     vk.vkDestroyDevice(device, nullptr);
 }
 
-int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported)
+int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported, bool writeOnly)
 {
     buffers.push_back(&buffer);
     buffer.size = (size + 3) & ~VkDeviceSize(3);
@@ -644,17 +645,24 @@ int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisibl
         return fail(-1, "vkCreateBuffer failed");
     VkMemoryRequirements requirements;
     vk.vkGetBufferMemoryRequirements(device, buffer.buffer, &requirements);
-    // Host memory: cached if there is such a type (results are read back).
+    // Host memory: cached if there is such a type, as results are read back;
+    // but memory the CPU only writes (writeOnly: the frames' staging) not, if
+    // there is such a type: the GPU reads uncached memory faster (Core Ultra 9
+    // 285K's iGPU, reading the frames from it: 4K 15.66 -> 15.56 ms a pair,
+    // 1080p 4.17 -> 4.15), and the CPU writes it as fast.
     const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkMemoryPropertyFlags cached = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     const VkMemoryPropertyFlags wanted[3] = {
-        hostVisible ? visible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        hostVisible ? (writeOnly ? visible : visible | cached) : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         hostVisible ? visible : VkMemoryPropertyFlags(0), VkMemoryPropertyFlags(0)
     };
+    const VkMemoryPropertyFlags unwanted[3] = { hostVisible && writeOnly ? cached : 0, 0, 0 };
     int type = -1;
     for (int attempt = 0; attempt < (hostVisible ? 2 : 3) && type < 0; ++attempt) {
         for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
             if ((requirements.memoryTypeBits & (1u << i)) &&
-                (memoryProperties.memoryTypes[i].propertyFlags & wanted[attempt]) == wanted[attempt]) {
+                (memoryProperties.memoryTypes[i].propertyFlags & wanted[attempt]) == wanted[attempt] &&
+                !(memoryProperties.memoryTypes[i].propertyFlags & unwanted[attempt])) {
                 type = (int)i;
                 break;
             }
@@ -1763,9 +1771,9 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         if (vk.vkCreateFence(device, &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS)
             return fail(-1, "vkCreateFence failed");
-        if (int error = create_buffer(slot.staging, (VkDeviceSize)planeBytes * (direct ? 1 : 2), !shared, shared))
+        if (int error = create_buffer(slot.staging, (VkDeviceSize)planeBytes * (direct ? 1 : 2), !shared, shared, true))
             return error;
-        if (int error = create_buffer(slot.stagingDis, direct ? planeBytes : 4, true))
+        if (int error = create_buffer(slot.stagingDis, direct ? planeBytes : 4, true, false, true))
             return error;
         if (int error = create_buffer(slot.result, kSlots * 8, true))
             return error;
