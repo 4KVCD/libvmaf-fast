@@ -41,16 +41,14 @@ float approximately(int64_t v)
 //     ot >= 0 && ot * ot >= (cos_1deg_sq * o_mag_sq) * t_mag_sq
 // (the common division by 4096 * 4096 changes nothing). cos_1deg_sq is the
 // float 0xFFEC0A * 2^-24.
-bool within_one_degree(int64_t otDp, int64_t oMagSq, int64_t tMagSq)
+//
+// Nearly every vector is far from one degree: decided in float (ot, o, t:
+// the three integers, approximately) when the two sides differ by more than
+// float's error can explain, exactly otherwise.
+bool one_degree(float ot, float o, float t, int64_t otDp, int64_t oMagSq, int64_t tMagSq)
 {
-    if (otDp < 0)
-        return false;
-    // Nearly every vector is far from one degree: decided in float when the
-    // two sides differ by more than float's error can explain, exactly
-    // otherwise.
-    const float ot = approximately(otDp);
     const float left_ = ot * ot;
-    const float right_ = (float(COS_MANTISSA) / 16777216.0) * approximately(oMagSq) * approximately(tMagSq);
+    const float right_ = (float(COS_MANTISSA) / 16777216.0) * o * t;
     if (left_ > right_ * 1.0001)
         return true;
     if (left_ < right_ * 0.9999)
@@ -73,6 +71,26 @@ bool within_one_degree(int64_t otDp, int64_t oMagSq, int64_t tMagSq)
     if (topLeft != topRight)
         return topLeft > topRight;
     return (left << (52 - leftTop)) >= right;
+}
+
+bool within_one_degree(int64_t otDp, int64_t oMagSq, int64_t tMagSq)
+{
+    if (otDp < 0)
+        return false;
+    return one_degree(approximately(otDp), approximately(oMagSq), approximately(tMagSq), otDp, oMagSq, tMagSq);
+}
+
+// The same for 16-bit vectors (o, t: scale 0's bands), in 32-bit words: each
+// product at most 2^30, so otDp within 2^31 and oMagSq, tMagSq at most 2^31,
+// and below 2^32 approximately() is float(uint(v)) (its high word adds
+// 0 * 2^32): the same floats, the same decision.
+bool within_one_degree16(int o0, int o1, int t0, int t1)
+{
+    const int64_t otDp = int64_t(o0 * t0) + int64_t(o1 * t1);
+    if (otDp < 0)
+        return false;
+    const uint oMagSq = uint(o0 * o0) + uint(o1 * o1), tMagSq = uint(t0 * t0) + uint(t1 * t1);
+    return one_degree(float(uint(otDp)), float(oMagSq), float(tMagSq), otDp, int64_t(oMagSq), int64_t(tMagSq));
 }
 
 static const int kAdd[3] = { 16384, 16384, 65535 };

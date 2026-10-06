@@ -80,10 +80,14 @@ void decouple(int from, out int restored[LIMITS][3], out int csfA[LIMITS][3], ou
     int o[3], t[3];
     adm_hvd(refBands, from, SCALE0 != 0, o);
     adm_hvd(disBands, from, SCALE0 != 0, t);
+#if SCALE0
+    const bool aligned = within_one_degree16(o[0], o[1], t[0], t[1]);
+#else
     int64_t otDp = int64_t(o[0]) * t[0] + int64_t(o[1]) * t[1];
     int64_t oMagSq = int64_t(o[0]) * o[0] + int64_t(o[1]) * o[1];
     int64_t tMagSq = int64_t(t[0]) * t[0] + int64_t(t[1]) * t[1];
     bool aligned = within_one_degree(otDp, oMagSq, tMagSq);
+#endif
     const int limits[LIMITS] = { aligned ? GAIN_A : 1, aligned ? GAIN_B : 1 };
     const uint rfactor[3] = RFACTORS;
     for (int b = 0; b < 3; ++b) {
