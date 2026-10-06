@@ -620,7 +620,7 @@ struct vv_context {
     int build_passes_v1();
     // adm_fused.slang's parameters per scale (kAdmParams words each).
     // adm_fused.slang's BAND (scale 0's; 16 at the others, which are small) and OWN.
-    enum { kAdmParams = 52, kAdmBandRows = 32, kAdmBandRowsSmall = 8, kAdmOwnColumns = 126 };
+    enum { kAdmParams = 56, kAdmBandRows = 32, kAdmBandRowsSmall = 8, kAdmOwnColumns = 126 };
     Buffer admParams, admPartial;
     VkDeviceSize admPartialWords = 0;  // its int64s: every row's sums per workgroup, of the largest scale
     std::vector<int32_t> admParamValues;
@@ -1294,13 +1294,11 @@ int vv_context::build_passes_v1()
 
         static const int kV[4][2] = { { 0, 0 }, { 0, 0 }, { 16, 32768 }, { 16, 32768 } };
         static const int kH[4][2] = { { 16, 32768 }, { 15, 16384 }, { 16, 32768 }, { 15, 16384 } };
-        if (scale > 0) {  // the wavelet transform, as for VMAF v0.6.1 (scale 0's: in the fused pass)
+        if (scale > 1) {  // the wavelet transform, as for VMAF v0.6.1 (scales 0 and 1's: in scale 0's fused pass)
             const int32_t constants[] = { inW, inH, inStride, bandStride, kV[scale][0], kV[scale][1],
                                           kH[scale][0], kH[scale][1] };
-            // Scale 1 reads scale 0's approximation bands, one int32 a position.
-            error = add_pass(scored, scale == 1 ? kShader_adm_dwt_approx : kShader_adm_dwt,
-                             { inRef, inDis, &bandsRef[set], &bandsDis[set] }, constants, sizeof constants,
-                             groups(bw, 16), groups(bh, 8));
+            error = add_pass(scored, kShader_adm_dwt, { inRef, inDis, &bandsRef[set], &bandsDis[set] }, constants,
+                             sizeof constants, groups(bw, 16), groups(bh, 8));
             if (error)
                 break;
         }
@@ -1394,7 +1392,11 @@ int vv_context::build_passes_v1()
             p[48] = 1 << (bpc - 1);
             p[49] = kH[0][0];
             p[50] = kH[0][1];
-            p[51] = bandStride;
+            p[51] = ((w + 1) / 2 + 1) / 2;  // scale 1's bands' stride
+            p[52] = kV[1][0];
+            p[53] = kV[1][1];
+            p[54] = kH[1][0];
+            p[55] = kH[1][1];
         }
         {   // SLIDE: workgroups of kAdmOwnColumns columns down bands of
             // kAdmBandRows rows, each row's sums per workgroup into admPartial;
@@ -1406,12 +1408,12 @@ int vv_context::build_passes_v1()
             const uint32_t constants[] = { (uint32_t)(scale * kAdmParams), chunks };
             if (scale == 0) {
                 error = add_pass(scored, deep ? kShader_adm_fused_0_16 : kShader_adm_fused_0_8,
-                                 { inRef, inDis, &divTable, &admParams, &acc, &bandsRef[set], &bandsDis[set], &admPartial },
+                                 { inRef, inDis, &divTable, &admParams, &acc, &bandsRef[1], &bandsDis[1], &admPartial },
                                  constants, sizeof constants, chunks, groups(rows, kAdmBandRows));
                 if (!error && direct)
                     error = per_slot(scored, [&](Slot &slot) {
                         return std::vector<Bound>{ slot_ref(slot), slot_dis(slot), Bound(&divTable), Bound(&admParams),
-                                                   Bound(&acc), Bound(&bandsRef[set]), Bound(&bandsDis[set]),
+                                                   Bound(&acc), Bound(&bandsRef[1]), Bound(&bandsDis[1]),
                                                    Bound(&admPartial) };
                     });
             } else {

@@ -21,9 +21,9 @@
 //
 // FROM_PICTURE (scale 0): the bands are not read but calculated here from the
 // two pictures, as adm_dwt.slang's SCALE0 calculates them, for each pixel
-// the pass reads; its workgroups cover the whole band image, and write the
-// approximation bands (a) for the next scale's transform, one int32 a
-// position (adm_dwt.slang's A_PLANE reads them).
+// the pass reads; its workgroups cover the whole band image, and do scale
+// 1's wavelet transform of the approximation bands (a) too, as adm_dwt.slang
+// does it, writing scale 1's bands (slide_scale1).
 #include "common.slang"
 
 [[vk::push_constant]] uniform uint pc[4];  // the scale's first word in params
@@ -38,8 +38,8 @@
 [[vk::binding(3, 0)]] StructuredBuffer<int> params;
 [[vk::binding(4, 0)]] RWStructuredBuffer<uint> acc;
 #if FROM_PICTURE
-[[vk::binding(5, 0)]] RWStructuredBuffer<int> refApprox;
-[[vk::binding(6, 0)]] RWStructuredBuffer<int> disApprox;
+[[vk::binding(5, 0)]] RWStructuredBuffer<int> refBands1;  // scale 1's bands: a, h, v, d a position
+[[vk::binding(6, 0)]] RWStructuredBuffer<int> disBands1;
 #endif
 
 // params, from pc[0]:
@@ -84,25 +84,20 @@
 #define ADD_V P(48)
 #define SHIFT_H P(49)
 #define ADD_H P(50)
-#define APPROX_STRIDE P(51)
+#define BANDS1_STRIDE P(51)   // scale 1's bands' positions a row
+#define SHIFT_V1 P(52)         // scale 1's transform (adm_dwt.slang's, not SCALE0)
+#define ADD_V1 P(53)
+#define SHIFT_H1 P(54)
+#define ADD_H1 P(55)
 
 #include "adm_decouple_common.slang"
 
-#define ROWS 2
 #define GROUP 128
-#define SPAN (GROUP + 2)
-#if SLIDE || ROWSUM
 // SLIDE's sums of a row's columns, per row and workgroup (ROWSUM adds them).
 #if FROM_PICTURE
 [[vk::binding(7, 0)]] RWStructuredBuffer<int64_t> partial;
 #else
 [[vk::binding(5, 0)]] RWStructuredBuffer<int64_t> partial;
-#endif
-#else
-// Per pixel of the rows and their neighbours: the bands' csfF summed, and csfRF's.
-groupshared int gSumF[(ROWS + 2) * SPAN];
-groupshared int gSumRF[(ROWS + 2) * SPAN];
-groupshared int64_t gTotals[(GROUP / 32) * ROWS * 9];
 #endif
 
 // A pixel's decoupling (adm_decouple.slang with V1 and VARIANT 0): the
@@ -326,22 +321,22 @@ groupshared int64_t gRow[(GROUP / 32) * 9];
 // Row i at the thread's column j: decoupled into the ring, and (`center`)
 // what the masking of row i itself needs, and its denominator's terms.
 void slide_row(int i, int j, uint local, bool own, inout int restored[3], inout int additive[3],
-               inout int centerA, inout int centerR, inout uint64_t den[3])
+               inout int centerA, inout int centerR, inout uint64_t den[3], out int aRef, out int aDis)
 {
+    aRef = 0;
+    aDis = 0;
     int sumF = 0, sumRF = 0;
     const bool inDen = own && i >= DEN_TOP && i < DEN_BOTTOM && j >= DEN_LEFT && j < DEN_RIGHT;
     for (int b = 0; b < 3; ++b) den[b] = 0;
     // Outside the band (a neighbour only): the pixel the masking reads instead.
     const int ci = cm_neighbour(i, BH), cj = cm_neighbour(j, BW);
 #if FROM_PICTURE
-    const bool approx = own && i >= 0 && i < BH && j >= 0 && j < BW;
-    int o[3], t[3];
-    if (approx || inDen || in_cm_decouple(ci, cj)) {
-        const int aRef = transform(refPicture, ci, cj, o), aDis = transform(disPicture, ci, cj, t);
-        if (approx) {
-            refApprox[i * APPROX_STRIDE + j] = aRef;
-            disApprox[i * APPROX_STRIDE + j] = aDis;
-        }
+    // Everywhere in the band (also outside the masking's region, for scale
+    // 1's transform of a); rows and columns past it as the masking reads them.
+    int o[3] = { 0, 0, 0 }, t[3] = { 0, 0, 0 };
+    if (cj >= 0 && cj < BW) {
+        aRef = transform(refPicture, ci, cj, o);
+        aDis = transform(disPicture, ci, cj, t);
     }
     if (inDen) {
         for (int b = 0; b < 3; ++b)
@@ -374,6 +369,67 @@ void slide_row(int i, int j, uint local, bool own, inout int restored[3], inout 
     gRingRF[ring * GROUP + local] = sumRF;
 }
 
+#if FROM_PICTURE
+groupshared int gScale1[4 * GROUP];  // per column: scale 1's vertical lo and hi, of each picture
+
+// The band row slide step k gives (k = -1 and BH as the masking mirrors them).
+int step_row(int k)
+{
+    return k == -1 ? 1 : (k == BH ? BH - 1 : k);
+}
+
+// Scale 1's vertical transform of the thread's column for its row I (rows
+// indices(I, BH) of a, all among the last four steps' -- s - 3 .. s, a[0..3]),
+// into gScale1 (before the barrier its horizontal transform waits for).
+void scale1_vertical(int I, int s, int aRef[4], int aDis[4], uint local)
+{
+    const int4 rows = indices(I, BH);
+    int64_t lo[2] = { 0, 0 }, hi[2] = { 0, 0 };
+    [unroll] for (int m = 0; m < 4; ++m) {
+        const int r = rows[m];
+        int pick = 3;
+        [unroll] for (int k = 2; k >= 0; --k)
+            if (step_row(s - 3 + k) == r) pick = k;
+        const int vr = pick == 0 ? aRef[0] : pick == 1 ? aRef[1] : pick == 2 ? aRef[2] : aRef[3];
+        const int vd = pick == 0 ? aDis[0] : pick == 1 ? aDis[1] : pick == 2 ? aDis[2] : aDis[3];
+        lo[0] += int64_t(kLo[m]) * int64_t(vr);
+        hi[0] += int64_t(kHi[m]) * int64_t(vr);
+        lo[1] += int64_t(kLo[m]) * int64_t(vd);
+        hi[1] += int64_t(kHi[m]) * int64_t(vd);
+    }
+    gScale1[0 * GROUP + local] = int((lo[0] + ADD_V1) >> SHIFT_V1);
+    gScale1[1 * GROUP + local] = int((hi[0] + ADD_V1) >> SHIFT_V1);
+    gScale1[2 * GROUP + local] = int((lo[1] + ADD_V1) >> SHIFT_V1);
+    gScale1[3 * GROUP + local] = int((hi[1] + ADD_V1) >> SHIFT_V1);
+}
+
+// Scale 1's horizontal transform at (I, J) (J's columns among the
+// workgroup's, its first one c0 - 1 at local 0), its bands written.
+void scale1_horizontal(int I, int J, int c0)
+{
+    const int4 columns = indices(J, BW);
+    [unroll] for (int p = 0; p < 2; ++p) {
+        int64_t a = 0, v = 0, h = 0, d = 0;
+        [unroll] for (int c = 0; c < 4; ++c) {
+            const uint at = uint(columns[c] - c0 + 1);
+            const int lo = gScale1[uint(2 * p) * GROUP + at], hi = gScale1[uint(2 * p + 1) * GROUP + at];
+            a += int64_t(kLo[c]) * lo;
+            v += int64_t(kHi[c]) * lo;
+            h += int64_t(kLo[c]) * hi;
+            d += int64_t(kHi[c]) * hi;
+        }
+        const int out = (I * BANDS1_STRIDE + J) * 4;
+        const int4 bands = int4(int((a + ADD_H1) >> SHIFT_H1), int((h + ADD_H1) >> SHIFT_H1),
+                                int((v + ADD_H1) >> SHIFT_H1), int((d + ADD_H1) >> SHIFT_H1));
+        if (p == 0) {
+            refBands1[out] = bands.x; refBands1[out + 1] = bands.y; refBands1[out + 2] = bands.z; refBands1[out + 3] = bands.w;
+        } else {
+            disBands1[out] = bands.x; disBands1[out + 1] = bands.y; disBands1[out + 2] = bands.z; disBands1[out + 3] = bands.w;
+        }
+    }
+}
+#endif
+
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
@@ -389,12 +445,38 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     int restored[3] = { 0, 0, 0 }, additive[3] = { 0, 0, 0 }, centerA = 0, centerR = 0;
     int nextRestored[3] = { 0, 0, 0 }, nextAdditive[3] = { 0, 0, 0 }, nextA = 0, nextR = 0;
     uint64_t den[3], nextDen[3];
-    slide_row(first - 1, j, local, false, nextRestored, nextAdditive, nextA, nextR, nextDen);
-    slide_row(first, j, local, ownColumn, restored, additive, centerA, centerR, den);
+    // The thread's column's a of the last four steps (s - 3 .. s), each picture's.
+    int aRef[4] = { 0, 0, 0, 0 }, aDis[4] = { 0, 0, 0, 0 };
+    slide_row(first - 1, j, local, false, nextRestored, nextAdditive, nextA, nextR, nextDen, aRef[2], aDis[2]);
+    slide_row(first, j, local, ownColumn, restored, additive, centerA, centerR, den, aRef[3], aDis[3]);
     const uint wave = local / WaveGetLaneCount(), waves = GROUP / WaveGetLaneCount();
     for (int i = first; i < end; ++i) {
-        slide_row(i + 1, j, local, ownColumn && i + 1 < end, nextRestored, nextAdditive, nextA, nextR, nextDen);
+        int newRef, newDis;
+        slide_row(i + 1, j, local, ownColumn && i + 1 < end, nextRestored, nextAdditive, nextA, nextR, nextDen,
+                  newRef, newDis);
+#if FROM_PICTURE
+        aRef[0] = aRef[1]; aRef[1] = aRef[2]; aRef[2] = aRef[3]; aRef[3] = newRef;
+        aDis[0] = aDis[1]; aDis[1] = aDis[2]; aDis[2] = aDis[3]; aDis[3] = newDis;
+        // Scale 1's row I once the step has given its last row of a (2I + 2;
+        // the band's last step for its last row when it is odd), of the I
+        // whose first row 2I is the workgroup's.
+        const int s = i + 1;
+        int I = -1;
+        if ((s & 1) == 0 && s - 2 >= first)
+            I = s / 2 - 1;
+        else if (s == end && end == BH && (BH & 1) != 0)
+            I = (s - 1) / 2;
+        if (I >= 0)
+            scale1_vertical(I, s, aRef, aDis, local);
+#endif
         GroupMemoryBarrierWithGroupSync();
+#if FROM_PICTURE
+        if (I >= 0 && local < uint(OWN / 2)) {
+            const int c0 = int(group.x) * OWN, J = c0 / 2 + int(local);
+            if (J < (BW + 1) / 2)
+                scale1_horizontal(I, J, c0);
+        }
+#endif
         int64_t cm[6] = { 0, 0, 0, 0, 0, 0 };
         if (ownColumn && j >= CM_LEFT && j < CM_RIGHT && i >= CM_TOP && i < CM_BOTTOM) {
             int thresholdA = centerA, thresholdR = centerR;
@@ -456,148 +538,6 @@ void main(uint3 id : SV_DispatchThreadID)
     } else if (i >= DEN_TOP && i < DEN_BOTTOM) {
         const uint64_t sum = (uint64_t(total) + DEN_ADD_ACCUM) >> DEN_SHIFT_ACCUM;
         if (sum != 0) acc_add64(acc, SLOT_DEN + s - 6, sum);
-    }
-}
-#else
-[shader("compute")]
-[numthreads(GROUP, 1, 1)]
-void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
-{
-    const int r0 = FIRST_ROW + int(group.y) * ROWS;
-#if FROM_PICTURE
-    const int colStart = 0, colEnd = BW;  // the approximation bands, all of them
-#else
-    const int colStart = min(CM_LEFT, DEN_LEFT), colEnd = max(CM_RIGHT, DEN_RIGHT);
-#endif
-    // Per row of the workgroup: the cm sums of the two images' three bands, and the denominator's.
-    int64_t cm[ROWS][6];
-    uint64_t den[ROWS][3];
-    [unroll] for (int r = 0; r < ROWS; ++r) {
-        [unroll] for (int s = 0; s < 6; ++s) cm[r][s] = 0;
-        for (int b = 0; b < 3; ++b) den[r][b] = 0;
-    }
-    for (int c0 = colStart; c0 < colEnd; c0 += GROUP) {
-        const int j = c0 + int(local);
-        // The thread's column: its rows' values kept, every row's sums shared.
-        int restored[ROWS][3], additive[ROWS][3], centerA[ROWS], centerR[ROWS];
-        [unroll] for (int rr = 0; rr < ROWS + 2; ++rr) {
-            const int i = r0 - 1 + rr;
-            int sumF = 0, sumRF = 0;
-            const bool own = rr >= 1 && rr <= ROWS;
-            const bool inDen = own && i >= DEN_TOP && i < DEN_BOTTOM && j >= DEN_LEFT && j < DEN_RIGHT;
-#if FROM_PICTURE
-            // The transform once for all three uses: the approximation bands
-            // (the band image's every position), the denominator, the decoupling.
-            const bool approx = own && i < BH && j < BW;
-            int o[3], t[3];
-            if (approx || inDen || in_cm_decouple(i, j)) {
-                const int aRef = transform(refPicture, i, j, o), aDis = transform(disPicture, i, j, t);
-                if (approx) {
-                    refApprox[i * APPROX_STRIDE + j] = aRef;
-                    disApprox[i * APPROX_STRIDE + j] = aDis;
-                }
-            }
-            if (inDen) {
-                for (int b = 0; b < 3; ++b)
-                    den[rr - 1][b] += den_term(o[b]);
-            }
-#endif
-            if (in_cm_decouple(i, j)) {
-#if FROM_PICTURE
-                const Decoupled d = decouple_bands(o, t);
-#else
-                const Decoupled d = decouple(i, j);
-#endif
-                sumF = d.csfF[0] + d.csfF[1] + d.csfF[2];
-                sumRF = d.csfRF[0] + d.csfRF[1] + d.csfRF[2];
-                if (rr >= 1 && rr <= ROWS) {
-                    const int r = rr - 1;
-                    centerA[r] = center_term(abs(d.csfA[0])) + center_term(abs(d.csfA[1])) + center_term(abs(d.csfA[2]));
-                    centerR[r] = center_term(abs(d.csfR[0])) + center_term(abs(d.csfR[1])) + center_term(abs(d.csfR[2]));
-                    for (int b = 0; b < 3; ++b) {
-                        restored[r][b] = d.restored[b];
-                        additive[r][b] = d.additive[b];
-                    }
-                }
-            }
-            gSumF[rr * SPAN + int(local) + 1] = sumF;
-            gSumRF[rr * SPAN + int(local) + 1] = sumRF;
-#if !FROM_PICTURE
-            if (inDen) {
-                const int from = (i * IN_STRIDE + j) * 4;
-                for (int b = 0; b < 3; ++b)
-                    den[rr - 1][b] += den_term(int(refBands[from + 1 + b]));
-            }
-#endif
-        }
-        // The columns either side of the chunk.
-        if (local < 2) {
-            const int jj = local == 0 ? c0 - 1 : c0 + GROUP;
-            const int at = local == 0 ? 0 : SPAN - 1;
-            for (int rr = 0; rr < ROWS + 2; ++rr) {
-                const int i = r0 - 1 + rr;
-                int sumF = 0, sumRF = 0;
-                if (in_cm_decouple(i, jj)) {
-                    const Decoupled d = decouple(i, jj);
-                    sumF = d.csfF[0] + d.csfF[1] + d.csfF[2];
-                    sumRF = d.csfRF[0] + d.csfRF[1] + d.csfRF[2];
-                }
-                gSumF[rr * SPAN + at] = sumF;
-                gSumRF[rr * SPAN + at] = sumRF;
-            }
-        }
-        GroupMemoryBarrierWithGroupSync();
-        if (j >= CM_LEFT && j < CM_RIGHT) {
-            [unroll] for (int r = 0; r < ROWS; ++r) {
-                const int i = r0 + r;
-                if (i < CM_TOP || i >= CM_BOTTOM)
-                    continue;
-                int thresholdA = centerA[r], thresholdR = centerR[r];
-                for (int di = 0; di < 3; ++di) {
-                    for (int dj = 0; dj < 3; ++dj) {
-                        if (di == 1 && dj == 1)
-                            continue;
-                        const int at = (r + di) * SPAN + int(local) + dj;
-                        thresholdA += gSumF[at];
-                        thresholdR += gSumRF[at];
-                    }
-                }
-                for (int b = 0; b < 3; ++b) {
-                    cm[r][b] += masked_term(restored[r][b], thresholdA, b);
-                    cm[r][3 + b] += masked_term(additive[r][b], thresholdR, b);
-                }
-            }
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-    // Each row's sums over the workgroup (wave by wave, then the waves),
-    // rounded as the CPU code rounds a row's.
-    const uint wave = local / WaveGetLaneCount(), waves = GROUP / WaveGetLaneCount();
-    [unroll] for (int r = 0; r < ROWS; ++r) {
-        [unroll] for (int s = 0; s < 6; ++s) {
-            const int64_t total = WaveActiveSum(cm[r][s]);
-            if (WaveIsFirstLane()) gTotals[(wave * ROWS + uint(r)) * 9 + uint(s)] = total;
-        }
-        for (int b = 0; b < 3; ++b) {
-            const uint64_t total = WaveActiveSum(den[r][b]);
-            if (WaveIsFirstLane()) gTotals[(wave * ROWS + uint(r)) * 9 + 6 + uint(b)] = int64_t(total);
-        }
-    }
-    GroupMemoryBarrierWithGroupSync();
-    if (local < uint(ROWS) * 9) {
-        const uint r = local / 9, s = local % 9;
-        const int i = r0 + int(r);
-        int64_t total = 0;
-        for (uint w = 0; w < waves; ++w) total += gTotals[(w * ROWS + r) * 9 + s];
-        if (s < 6) {
-            if (i >= CM_TOP && i < CM_BOTTOM) {
-                const int64_t sum = (total + ADD_INNER) >> SHIFT_INNER;
-                if (sum != 0) acc_add64(acc, (s < 3 ? SLOT_CM0 : SLOT_CM1) + s % 3, uint64_t(sum));
-            }
-        } else if (i >= DEN_TOP && i < DEN_BOTTOM) {
-            const uint64_t sum = (uint64_t(total) + DEN_ADD_ACCUM) >> DEN_SHIFT_ACCUM;
-            if (sum != 0) acc_add64(acc, SLOT_DEN + s - 6, sum);
-        }
     }
 }
 #endif
