@@ -76,8 +76,9 @@ predicts the score with libvmaf (`vmaf_import_feature_score`,
 The engine's exports are in `fast/vulkan/vmaf_vulkan.cpp`'s API section:
 `vv_create` / `vv_create_v1`, `vv_submit` (or `vv_staging` and `vv_commit` to
 write frames in place), `vv_flush`, `vv_features` / `vv_features_v1`,
-`vv_destroy`, and `vv_shared_next` / `vv_export` to share its input buffers
-with a hardware decoder's CUDA, so decoded pictures never leave the GPU.
+`vv_destroy`, and `vv_shared_next` / `vv_export` / `vv_shared_device` to
+share its input buffers with a hardware decoder's CUDA or Vulkan device, so
+decoded pictures never leave the GPU.
 
 ## Releasing
 

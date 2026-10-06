@@ -48,8 +48,9 @@ A GPU's speed depends on where the decoder leaves the frames:
   each one is uploaded to the GPU. Frames from Intel's and AMD's hardware
   decoders reach the engine this way too.
 - **GPU-decoded:** NVIDIA's hardware decoder leaves frames in GPU memory, and
-  they are copied on the GPU. The hand-over uses CUDA, so this is NVIDIA
-  only.
+  they are copied on the GPU. The tables measure NVIDIA's hand-over, which
+  uses CUDA; a decoder on its own Vulkan device (AMD's, in VideoMetricsLab)
+  can take the same way in.
 
 ### VMAF v0.6.1 and VMAF NEG
 
@@ -152,8 +153,10 @@ which would make a bit-exact GPU port much harder.
 ### GPU-decoded frames
 
 The engine's input buffers can be exported (`VK_KHR_external_memory_win32`)
-and imported into CUDA (`cuImportExternalMemory`). So frames from NVIDIA's
-decoder are copied in on the GPU (`vv_export`). For VMAF v1, the planes CAMBI
+and imported into CUDA (`cuImportExternalMemory`), or into another Vulkan
+device on the same GPU and driver, which `vv_shared_device` identifies. So
+frames from NVIDIA's decoder, or AMD's running on Vulkan, are copied in on
+the GPU (`vv_export`). For VMAF v1, the planes CAMBI
 and SpEED read are downloaded straight into libvmaf's page-locked pictures.
 CPU-decoded frames go through `vv_submit`.
 
