@@ -213,10 +213,15 @@ $kernels = @(
     "cl /nologo /c /O2 /MT /W3 /Brepro /arch:AVX2 `"$(Join-Path $x86 'speed_avx2.c')`" /Fo`"$build\speed_avx2.obj`"",
     "if errorlevel 1 exit /b 1",
     "cl /nologo /c /O2 /MT /W3 /Brepro /arch:AVX512 `"$(Join-Path $x86 'speed_avx512.c')`" /Fo`"$build\speed_avx512.obj`"",
+    "if errorlevel 1 exit /b 1",
+    # (and v1_speed_cov.c, their sums four at a time, so with the same flags)
+    "cl /nologo /c /O2 /MT /W3 /Brepro /arch:AVX2 `"$(Join-Path $source 'v1_speed_cov.c')`" /Fo`"$build\cov4_avx2.obj`"",
+    "if errorlevel 1 exit /b 1",
+    "cl /nologo /c /O2 /MT /W3 /Brepro /arch:AVX512 `"$(Join-Path $source 'v1_speed_cov.c')`" /Fo`"$build\cov4_avx512.obj`"",
     "if errorlevel 1 exit /b 1")
 $compile = "cl /nologo /LD /O2 /MT /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4305 /wd4996 /Brepro /I`"$build`" /I`"$(Join-Path $headers 'include')`" " +
     "`"$(Join-Path $source 'vmaf_vulkan.cpp')`" `"$(Join-Path $source 'v1_host.c')`" `"$(Join-Path $source 'v1_speed.c')`" " +
-    "`"$build\speed_avx2.obj`" `"$build\speed_avx512.obj`" /Fo`"$build\\`" /Fe`"$output`" /link /Brepro /IMPLIB:`"$build\vmaf_vulkan.lib`""
+    "`"$build\speed_avx2.obj`" `"$build\speed_avx512.obj`" `"$build\cov4_avx2.obj`" `"$build\cov4_avx512.obj`" /Fo`"$build\\`" /Fe`"$output`" /link /Brepro /IMPLIB:`"$build\vmaf_vulkan.lib`""
 $batch = Join-Path $build 'compile.bat'
 Set-Content -Path $batch -Encoding ascii -Value (@(
     '@echo off',

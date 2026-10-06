@@ -35,6 +35,13 @@ double compute_cov_kernel_avx2(const float *data_x, const float *data_y, size_t 
                                size_t width, double mean_x, double mean_y);
 double compute_cov_kernel_avx512(const float *data_x, const float *data_y, size_t stride_px, size_t height,
                                  size_t width, double mean_x, double mean_y);
+// v1_speed_cov.c: the kernels' sums for one x and four y's at once.
+typedef void (*v1_cov4_fn)(const double *x, const double *const y[4], const double mean_y[4], size_t stride,
+                           size_t height, size_t width, double mean_x, double out[4]);
+void v1_cov4_avx2(const double *x, const double *const y[4], const double mean_y[4], size_t stride,
+                  size_t height, size_t width, double mean_x, double out[4]);
+void v1_cov4_avx512(const double *x, const double *const y[4], const double mean_y[4], size_t stride,
+                    size_t height, size_t width, double mean_x, double out[4]);
 
 // ---- libvmaf/src/feature/speed.c, lines 50-131 (its types), as written
 typedef double (*compute_cov_kernel_fn)(const float *data_x, const float *data_y,
@@ -102,6 +109,10 @@ typedef struct SpeedState {
     SpeedBuffers buffers;
     size_t float_stride;
     compute_cov_kernel_fn compute_cov_kernel;
+    // Not libvmaf's: compute_cov_kernel four at a time (none: one at a time),
+    // and the plane as doubles for it.
+    v1_cov4_fn cov4;
+    double *converted;
 } SpeedState;
 
 #define DEFAULT_BLOCK_SIZE (5)
@@ -755,18 +766,71 @@ static float compute_covariance(SpeedDimensions dim, const float *data,
     return result / (dim.submatrix_width * dim.submatrix_height);
 }
 
-static void compute_covariance_matrix(SpeedDimensions dim, const float *data,
-                                      float *cov_mat, float *means,
-                                      size_t stride_px,
-                                      compute_cov_kernel_fn kernel)
+// NOT as written: compute_covariance_matrix with the block's means summed
+// side by side (each sum compute_mean's, in its order: a row of 5 means as
+// lanes 0-4 of two vectors) and, with s->cov4, four covariances a time (each
+// compute_covariance's: the kernel's sum, divided as it divides it).
+static void v1_covariance_matrix(const SpeedState *s, SpeedDimensions dim, const float *data,
+                                 float *cov_mat, float *means,
+                                 size_t stride_px,
+                                 compute_cov_kernel_fn kernel)
 {
-    for (size_t start_row = 0; start_row < dim.block_size; start_row++) {
-        for (size_t start_col = 0; start_col < dim.block_size; start_col++) {
-            means[start_row * dim.block_size + start_col] =
-                compute_mean(dim, data, stride_px, start_row, start_col);
+    if (dim.block_size != 5) {
+        for (size_t start_row = 0; start_row < dim.block_size; start_row++)
+            for (size_t start_col = 0; start_col < dim.block_size; start_col++)
+                means[start_row * dim.block_size + start_col] =
+                    compute_mean(dim, data, stride_px, start_row, start_col);
+    } else {
+        __m128 lo[5], hi[5];
+        for (int r = 0; r < 5; r++)
+            lo[r] = hi[r] = _mm_setzero_ps();
+        for (size_t i = 0; i < dim.submatrix_height; i++) {
+            for (size_t j = 0; j < dim.submatrix_width; j++) {
+                for (int r = 0; r < 5; r++) {
+                    const float *at = data + (r + i) * stride_px + j;
+                    lo[r] = _mm_add_ps(lo[r], _mm_loadu_ps(at));
+                    hi[r] = _mm_add_ss(hi[r], _mm_load_ss(at + 4));
+                }
+            }
+        }
+        for (int r = 0; r < 5; r++) {
+            float sums[4];
+            _mm_storeu_ps(sums, lo[r]);
+            for (int c = 0; c < 4; c++)
+                means[r * 5 + c] = sums[c] / (dim.submatrix_width * dim.submatrix_height);
+            means[r * 5 + 4] = _mm_cvtss_f32(hi[r]) / (dim.submatrix_width * dim.submatrix_height);
         }
     }
     size_t elements_in_block = dim.block_size * dim.block_size;
+    if (s->cov4) {
+        double *converted = s->converted;
+        for (size_t i = 0; i < dim.truncated_height * stride_px; i++)
+            converted[i] = data[i];
+        for (size_t x_index = 0; x_index < dim.elements_in_block; x_index++) {
+            const size_t row_x = x_index / dim.block_size, col_x = x_index % dim.block_size;
+            const double *x = converted + row_x * stride_px + col_x;
+            const double mean_x = means[row_x * dim.block_size + col_x];
+            for (size_t y_first = 0; y_first <= x_index; y_first += 4) {
+                const double *y[4];
+                double mean_y[4], sums[4];
+                for (size_t k = 0; k < 4; k++) {
+                    // (past x_index: the last y again, its sums not kept)
+                    const size_t y_index = y_first + k <= x_index ? y_first + k : x_index;
+                    const size_t row_y = y_index / dim.block_size, col_y = y_index % dim.block_size;
+                    y[k] = converted + row_y * stride_px + col_y;
+                    mean_y[k] = means[row_y * dim.block_size + col_y];
+                }
+                s->cov4(x, y, mean_y, stride_px, dim.submatrix_height, dim.submatrix_width, mean_x, sums);
+                for (size_t k = 0; k < 4 && y_first + k <= x_index; k++) {
+                    const size_t y_index = y_first + k;
+                    const float covariance = sums[k] / (dim.submatrix_width * dim.submatrix_height);
+                    cov_mat[x_index * elements_in_block + y_index] = covariance;
+                    cov_mat[y_index * elements_in_block + x_index] = covariance;
+                }
+            }
+        }
+        return;
+    }
 
     for (size_t x_index = 0; x_index < dim.elements_in_block; x_index++) {
         for (size_t y_index = 0; y_index <= x_index; y_index++) {
@@ -859,8 +923,8 @@ static int est_params(SpeedState *s, const float *data, float sigma_nn,
     // tests that construct SpeedState via struct literal).
     compute_cov_kernel_fn kernel = s->compute_cov_kernel
         ? s->compute_cov_kernel : compute_cov_kernel_scalar;
-    compute_covariance_matrix(dim, data, s->buffers.cov_mat,
-                              s->buffers.eigenvalues, stride_px, kernel);
+    v1_covariance_matrix(s, dim, data, s->buffers.cov_mat,
+                         s->buffers.eigenvalues, stride_px, kernel);  // NOT as written
 
     // Step 2: Compute the eigenvalues of the covariance matrix
     compute_eigenvalues(s->buffers.cov_mat, s->buffers.eigenvalues,
@@ -1238,13 +1302,18 @@ V1Speed *v1_speed_new(const V1SpeedOptions *options, unsigned w, unsigned h)
     // speed_init's choice of kernel on x86, HAVE_AVX512 as libvmaf is built.
     s->compute_cov_kernel = compute_cov_kernel_scalar;
     const unsigned flags = v1_cpu_flags();
-    if (flags & V1_CPU_AVX2)
+    if (flags & V1_CPU_AVX2) {
         s->compute_cov_kernel = compute_cov_kernel_avx2;
-    if (flags & V1_CPU_AVX512)
+        s->cov4 = v1_cov4_avx2;
+    }
+    if (flags & V1_CPU_AVX512) {
         s->compute_cov_kernel = compute_cov_kernel_avx512;
+        s->cov4 = v1_cov4_avx512;
+    }
+    s->converted = malloc(dim->truncated_height * dim->operating_width * sizeof(double));
     if (!s->buffers.independent_term || !s->buffers.linear_system_sol || !s->buffers.cov_mat ||
         !s->buffers.eigenvalues || !s->buffers.tmp_buffer || !s->ref_results.entropies ||
-        !s->ref_results.variances || !s->dis_results.entropies || !s->dis_results.variances) {
+        !s->ref_results.variances || !s->dis_results.entropies || !s->dis_results.variances || !s->converted) {
         v1_speed_free(speed);
         return NULL;
     }
@@ -1265,6 +1334,7 @@ void v1_speed_free(V1Speed *speed)
     free(s->ref_results.variances);
     free(s->dis_results.entropies);
     free(s->dis_results.variances);
+    free(s->converted);
     free(speed);
 }
 
