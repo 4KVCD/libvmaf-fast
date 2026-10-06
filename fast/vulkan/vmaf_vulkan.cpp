@@ -615,8 +615,9 @@ struct vv_context {
     float rfactorV1[kScales][3] = {};
     int build_passes_v1();
     // adm_fused.slang's parameters per scale (kAdmParams words each).
-    enum { kAdmParams = 52, kAdmFusedRows = 2 };
-    Buffer admParams;
+    enum { kAdmParams = 52, kAdmBandRows = 32, kAdmOwnColumns = 126 };  // adm_fused.slang's BAND and OWN
+    Buffer admParams, admPartial;
+    VkDeviceSize admPartialWords = 0;  // its int64s: every row's sums per workgroup, of the largest scale
     std::vector<int32_t> admParamValues;
     int skip = 0;  // timing tests: 1 = no motion, 2 = no VIF, 4 = no ADM
     int passLimit = 0;  // timing tests: only the first N scored passes
@@ -1223,6 +1224,11 @@ int vv_context::build_passes_v1()
     admParamValues.assign((size_t)kScales * kAdmParams, 0);
     if (int created = create_buffer(admParams, admParamValues.size() * sizeof(int32_t), false))
         return created;
+    {   // scale 0's rows and workgroups across, the most of any scale
+        const VkDeviceSize rows = (VkDeviceSize)(h + 1) / 2, across = (VkDeviceSize)groups((w + 1) / 2, kAdmOwnColumns);
+        if (int created = create_buffer(admPartial, rows * across * 9 * 8, false))
+            return created;
+    }
     int inW = w, inH = h, inStride = strideWords;
     for (int scale = 0; scale < kScales && !error; ++scale) {
         const int set = scale % 2;
@@ -1355,22 +1361,32 @@ int vv_context::build_passes_v1()
             p[50] = kH[0][1];
             p[51] = bandStride;
         }
-        {
-            const uint32_t constants[] = { (uint32_t)(scale * kAdmParams) };
-            const uint32_t rowGroups = (uint32_t)std::max(0, (p[43] - p[42] + kAdmFusedRows - 1) / kAdmFusedRows);
+        {   // SLIDE: workgroups of kAdmOwnColumns columns down bands of
+            // kAdmBandRows rows, each row's sums per workgroup into admPartial;
+            // then ROWSUM adds and rounds each row's.
+            const int colStart = scale == 0 ? 0 : std::min(p[10], p[14]);
+            const int colEnd = scale == 0 ? bw : std::max(p[11], p[15]);
+            const int rows = std::max(0, p[43] - p[42]);
+            const uint32_t chunks = groups(std::max(0, colEnd - colStart), kAdmOwnColumns);
+            const uint32_t constants[] = { (uint32_t)(scale * kAdmParams), chunks };
             if (scale == 0) {
                 error = add_pass(scored, deep ? kShader_adm_fused_0_16 : kShader_adm_fused_0_8,
-                                 { inRef, inDis, &divTable, &admParams, &acc, &bandsRef[set], &bandsDis[set] },
-                                 constants, sizeof constants, 1, rowGroups);
+                                 { inRef, inDis, &divTable, &admParams, &acc, &bandsRef[set], &bandsDis[set], &admPartial },
+                                 constants, sizeof constants, chunks, groups(rows, kAdmBandRows));
                 if (!error && direct)
                     error = per_slot(scored, [&](Slot &slot) {
                         return std::vector<Bound>{ slot_ref(slot), slot_dis(slot), Bound(&divTable), Bound(&admParams),
-                                                   Bound(&acc), Bound(&bandsRef[set]), Bound(&bandsDis[set]) };
+                                                   Bound(&acc), Bound(&bandsRef[set]), Bound(&bandsDis[set]),
+                                                   Bound(&admPartial) };
                     });
             } else {
-                error = add_pass(scored, kShader_adm_fused, { &bandsRef[set], &bandsDis[set], &divTable, &admParams, &acc },
-                                 constants, sizeof constants, 1, rowGroups);
+                error = add_pass(scored, kShader_adm_fused, { &bandsRef[set], &bandsDis[set], &divTable, &admParams, &acc,
+                                 &admPartial }, constants, sizeof constants, chunks, groups(rows, kAdmBandRows));
             }
+            if (!error)
+                error = add_pass(scored, kShader_adm_rowsum, { &bandsRef[set], &bandsDis[set], &divTable, &admParams, &acc,
+                                 &admPartial }, constants, sizeof constants, groups(rows * 9, 256), 1);
+            admPartialWords = std::max<VkDeviceSize>(admPartialWords, (VkDeviceSize)rows * chunks * 9);
         }
         inW = bw;
         inH = bh;

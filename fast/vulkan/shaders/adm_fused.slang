@@ -91,10 +91,19 @@
 #define ROWS 2
 #define GROUP 128
 #define SPAN (GROUP + 2)
+#if SLIDE || ROWSUM
+// SLIDE's sums of a row's columns, per row and workgroup (ROWSUM adds them).
+#if FROM_PICTURE
+[[vk::binding(7, 0)]] RWStructuredBuffer<int64_t> partial;
+#else
+[[vk::binding(5, 0)]] RWStructuredBuffer<int64_t> partial;
+#endif
+#else
 // Per pixel of the rows and their neighbours: the bands' csfF summed, and csfRF's.
 groupshared int gSumF[(ROWS + 2) * SPAN];
 groupshared int gSumRF[(ROWS + 2) * SPAN];
 groupshared int64_t gTotals[(GROUP / 32) * ROWS * 9];
+#endif
 
 // A pixel's decoupling (adm_decouple.slang with V1 and VARIANT 0): the
 // restored and additive values of its three bands, and per band
@@ -279,6 +288,153 @@ bool in_cm_decouple(int i, int j)  // decoupled for the masking: its region and 
     return i >= CM_TOP - 1 && i <= CM_BOTTOM && j >= CM_LEFT - 1 && j <= CM_RIGHT;
 }
 
+#if SLIDE
+// The workgroups slide down the band: 128 threads, a column each -- 126 of
+// the workgroup's own and one either side, which the masking reads -- over
+// BAND rows. Each row is decoupled once (the rows either side of the band
+// once more), and of the three rows the masking reads only what the
+// threshold sums is kept, a ring of three in shared memory. Each row's sums
+// of the workgroup's columns go to `partial`; ROWSUM adds each row's columns
+// and rounds the row as the CPU code does.
+#define BAND 32
+#define OWN (GROUP - 2)
+groupshared int gRingF[3 * GROUP];
+groupshared int gRingRF[3 * GROUP];
+groupshared int64_t gRow[(GROUP / 32) * 9];
+
+// Row i at the thread's column j: decoupled into the ring, and (`center`)
+// what the masking of row i itself needs, and its denominator's terms.
+void slide_row(int i, int j, uint local, bool own, inout int restored[3], inout int additive[3],
+               inout int centerA, inout int centerR, inout uint64_t den[3])
+{
+    int sumF = 0, sumRF = 0;
+    const bool inDen = own && i >= DEN_TOP && i < DEN_BOTTOM && j >= DEN_LEFT && j < DEN_RIGHT;
+    for (int b = 0; b < 3; ++b) den[b] = 0;
+#if FROM_PICTURE
+    const bool approx = own && i >= 0 && i < BH && j >= 0 && j < BW;
+    int o[3], t[3];
+    if (approx || inDen || in_cm_decouple(i, j)) {
+        const int aRef = transform(refPicture, i, j, o), aDis = transform(disPicture, i, j, t);
+        if (approx) {
+            refApprox[i * APPROX_STRIDE + j] = aRef;
+            disApprox[i * APPROX_STRIDE + j] = aDis;
+        }
+    }
+    if (inDen) {
+        for (int b = 0; b < 3; ++b)
+            den[b] = den_term(o[b]);
+    }
+#else
+    if (inDen) {
+        const int from = (i * IN_STRIDE + j) * 4;
+        for (int b = 0; b < 3; ++b)
+            den[b] = den_term(int(refBands[from + 1 + b]));
+    }
+#endif
+    if (in_cm_decouple(i, j)) {
+#if FROM_PICTURE
+        const Decoupled d = decouple_bands(o, t);
+#else
+        const Decoupled d = decouple(i, j);
+#endif
+        sumF = d.csfF[0] + d.csfF[1] + d.csfF[2];
+        sumRF = d.csfRF[0] + d.csfRF[1] + d.csfRF[2];
+        centerA = center_term(abs(d.csfA[0])) + center_term(abs(d.csfA[1])) + center_term(abs(d.csfA[2]));
+        centerR = center_term(abs(d.csfR[0])) + center_term(abs(d.csfR[1])) + center_term(abs(d.csfR[2]));
+        for (int b = 0; b < 3; ++b) {
+            restored[b] = d.restored[b];
+            additive[b] = d.additive[b];
+        }
+    }
+    const uint ring = uint((i + 3) % 3);
+    gRingF[ring * GROUP + local] = sumF;
+    gRingRF[ring * GROUP + local] = sumRF;
+}
+
+[shader("compute")]
+[numthreads(GROUP, 1, 1)]
+void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
+{
+#if FROM_PICTURE
+    const int colStart = 0;  // the approximation bands, all of them
+#else
+    const int colStart = min(CM_LEFT, DEN_LEFT);
+#endif
+    const int j = colStart + int(group.x) * OWN - 1 + int(local);
+    const bool ownColumn = local >= 1 && local <= OWN;
+    const int first = FIRST_ROW + int(group.y) * BAND, end = min(first + BAND, LAST_ROW);
+    int restored[3] = { 0, 0, 0 }, additive[3] = { 0, 0, 0 }, centerA = 0, centerR = 0;
+    int nextRestored[3] = { 0, 0, 0 }, nextAdditive[3] = { 0, 0, 0 }, nextA = 0, nextR = 0;
+    uint64_t den[3], nextDen[3];
+    slide_row(first - 1, j, local, false, nextRestored, nextAdditive, nextA, nextR, nextDen);
+    slide_row(first, j, local, ownColumn, restored, additive, centerA, centerR, den);
+    const uint wave = local / WaveGetLaneCount(), waves = GROUP / WaveGetLaneCount();
+    for (int i = first; i < end; ++i) {
+        slide_row(i + 1, j, local, ownColumn && i + 1 < end, nextRestored, nextAdditive, nextA, nextR, nextDen);
+        GroupMemoryBarrierWithGroupSync();
+        int64_t cm[6] = { 0, 0, 0, 0, 0, 0 };
+        if (ownColumn && j >= CM_LEFT && j < CM_RIGHT && i >= CM_TOP && i < CM_BOTTOM) {
+            int thresholdA = centerA, thresholdR = centerR;
+            for (int di = -1; di <= 1; ++di) {
+                const uint ring = uint((i + di + 3) % 3) * GROUP;
+                for (int dj = -1; dj <= 1; ++dj) {
+                    if (di == 0 && dj == 0)
+                        continue;
+                    thresholdA += gRingF[ring + uint(int(local) + dj)];
+                    thresholdR += gRingRF[ring + uint(int(local) + dj)];
+                }
+            }
+            for (int b = 0; b < 3; ++b) {
+                cm[b] = masked_term(restored[b], thresholdA, b);
+                cm[3 + b] = masked_term(additive[b], thresholdR, b);
+            }
+        }
+        // The row's sums of these columns, wave by wave, then the waves, to `partial`.
+        [unroll] for (int s = 0; s < 6; ++s) {
+            const int64_t total = WaveActiveSum(cm[s]);
+            if (WaveIsFirstLane()) gRow[wave * 9 + uint(s)] = total;
+        }
+        [unroll] for (int b = 0; b < 3; ++b) {
+            const int64_t total = int64_t(WaveActiveSum(ownColumn ? den[b] : 0ull));
+            if (WaveIsFirstLane()) gRow[wave * 9 + 6 + uint(b)] = total;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (local < 9) {
+            int64_t total = 0;
+            for (uint w = 0; w < waves; ++w) total += gRow[w * 9 + local];
+            partial[(uint(i - FIRST_ROW) * pc[1] + group.x) * 9 + local] = total;
+        }
+        restored = nextRestored;
+        additive = nextAdditive;
+        centerA = nextA;
+        centerR = nextR;
+        den = nextDen;
+    }
+}
+#elif ROWSUM
+// Each row's sums: its columns' (adm_fused's SLIDE), added and rounded as the
+// CPU code rounds a row's, then added to the frame's slots.
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    const uint rows = uint(LAST_ROW - FIRST_ROW);
+    if (id.x >= rows * 9) return;
+    const uint r = id.x / 9, s = id.x % 9;
+    const int i = FIRST_ROW + int(r);
+    int64_t total = 0;
+    for (uint chunk = 0; chunk < pc[1]; ++chunk) total += partial[(r * pc[1] + chunk) * 9 + s];
+    if (s < 6) {
+        if (i >= CM_TOP && i < CM_BOTTOM) {
+            const int64_t sum = (total + ADD_INNER) >> SHIFT_INNER;
+            if (sum != 0) acc_add64(acc, (s < 3 ? SLOT_CM0 : SLOT_CM1) + s % 3, uint64_t(sum));
+        }
+    } else if (i >= DEN_TOP && i < DEN_BOTTOM) {
+        const uint64_t sum = (uint64_t(total) + DEN_ADD_ACCUM) >> DEN_SHIFT_ACCUM;
+        if (sum != 0) acc_add64(acc, SLOT_DEN + s - 6, sum);
+    }
+}
+#else
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
@@ -420,3 +576,4 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         }
     }
 }
+#endif
