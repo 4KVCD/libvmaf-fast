@@ -20,10 +20,7 @@ Current features:
   Upstream's native MSVC build is merged too.
 
 **Ready-made tool:** [VideoMetricsLab](https://github.com/4KVCD/VideoMetricsLab)
-is a Windows app for scoring and comparing video encodes. From version 1.5 it
-calculates VMAF, VMAF NEG and VMAF v1 on the GPU with these libraries (on its
-`release/v1.5` branch for now). The current release, 1.4, has GPU VMAF on
-NVIDIA only.
+is a Windows app for scoring and comparing video encodes. Calculate VMAF and VMAF NEG on NVIDIA GPUs, and SSIMULACRA2, Butteraugli and ColorVideo VDP on NVIDIA, AMD and Intel GPUs, alongside PSNR, SSIM and XPSNR. Compare encodes with frame-exact playback that switches between the source and each encode instantly to easily spot differences.
 
 Windows x64 only; not built or tested on Linux. The Vulkan engine needs
 Vulkan 1.1 and 64-bit integers in shaders. It is a DLL with a small C API
