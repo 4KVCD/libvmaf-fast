@@ -49,6 +49,9 @@ struct Params {
 #define TH 2
 #endif
 #define THREADS 160
+#if TW * TH > 255
+#error "group_words packs the sums of at most 255 pixels"
+#endif
 #define TCOLS (TW + FW - 1)    // the columns the tile's horizontal filters read
 // The group's sums: the nine of statistics(), the fourth (num_non_log, 31
 // bits a pixel) as its low and high 16 bits. 512 pixels' worth of each
@@ -60,7 +63,10 @@ groupshared uint gTile[TILE_WORDS];
 // The group's sums, each subgroup's added in (the engine uses this shader
 // only where the GPU has subgroup arithmetic). Integer sums: the same in
 // any order.
-groupshared int gTotals[VALUES];
+// The ten values added up in seven words: the small ones packed, as
+// group_words says.
+#define WORDS 7
+groupshared int gTotals[WORDS];
 
 #include "vif_stats.slang"
 
@@ -204,7 +210,7 @@ void vertical(int x, int y, uint at)
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
     const int x0 = int(group.x) * TW, y0 = int(group.y) * TH;
-    if (local < VALUES)
+    if (local < WORDS)
         gTotals[local] = 0;  // before the barrier below; added to after it
     // The vertical pass for the tile's columns x0 - FW/2 .. x0 + TW - 1 + FW/2,
     // mirrored at the edges as the horizontal filter mirrors them (columns
@@ -280,16 +286,29 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 #endif
     }
 
-    for (int i = 0; i < VALUES; ++i) {
-        const int sum = WaveActiveSum(totals[i]);
+    // Each subgroup's sum of every word, added into the group's: the words'
+    // sums are the values' sums, packed the same way (nothing overflows its
+    // field: see group_words).
+    const int words[WORDS] = { totals[0] + (totals[1] << 13) + (totals[5] << 21), totals[2], totals[3], totals[4],
+                               totals[7], totals[9], totals[6] + (totals[8] << 15) };
+    for (int i = 0; i < WORDS; ++i) {
+        const int sum = WaveActiveSum(words[i]);
         if (WaveIsFirstLane())
             InterlockedAdd(gTotals[i], sum);
     }
     GroupMemoryBarrierWithGroupSync();
     if (local < SUMS) {  // a sum a thread
-        const int64_t value = local < 3 ? int64_t(gTotals[local])
-                              : local == 3 ? int64_t(gTotals[3]) + (int64_t(gTotals[4]) << 16)
-                                           : int64_t(gTotals[local + 1]);
+        // group_words: a group has at most 255 pixels, and a pixel adds
+        // -16..-3 to x, 0 or 1 to num_x and den_non_log, -63..63 to each
+        // limit's x2: x (at least -4080) in the first word's low 13 bits,
+        // num_x and den_non_log (at most 255) 8 bits each above it; the two x2
+        // (within +-16065) in 15 bits each of the last word.
+        const int first = gTotals[0], last = gTotals[6];
+        const int x = (first << 19) >> 19, x2 = (last << 17) >> 17;
+        const int counts = (first - x) >> 13;
+        const int values[SUMS] = { x, counts & 0xFF, gTotals[1], 0, counts >> 8, x2, gTotals[4], (last - x2) >> 15,
+                                   gTotals[5] };
+        const int64_t value = local == 3 ? int64_t(gTotals[2]) + (int64_t(gTotals[3]) << 16) : int64_t(values[local]);
         if (value != 0)
             acc_add64(acc, pc.slot + local, uint64_t(value));
     }
