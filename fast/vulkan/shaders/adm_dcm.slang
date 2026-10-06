@@ -19,6 +19,7 @@
 // Here a row's positions are in several tiles: each tile adds its part of
 // each row's sums to rowSums (64-bit, exact in any order) and adm_rows.slang
 // rounds the rows and adds them up. The integers are the two shaders'.
+import glsl;  // umulExtended, imulExtended
 #include "common.slang"
 
 struct Params {
@@ -87,6 +88,71 @@ struct Params {
 #define COS_MANTISSA 0xFFEC0Au
 #include "adm_decouple_common.slang"
 
+#if !SCALE0
+// Scales 1-3's 64-bit integer arithmetic (the CUDA code's) from 32-bit
+// words. A GPU without 64-bit integers (Intel's) makes each 64-bit multiply,
+// shift and comparison of several instructions; SPIR-V's 32 x 32 -> 64-bit
+// multiplies give a product's two words directly. Each helper is, to the
+// bit, the 64-bit expression its comment gives.
+
+// (int64_t)a * b.
+int64_t mul64(int a, int b)
+{
+    int hi, lo;
+    imulExtended(a, b, hi, lo);
+    return int64_t((uint64_t(uint(hi)) << 32) | uint(lo));
+}
+
+// (int)(((int64_t)r * v + 2^27) >> 28), r unsigned: bits 28..59 of the sum.
+int rfactor_round(uint r, int v)
+{
+    uint hi, lo;
+    umulExtended(r, uint(v), hi, lo);
+    if (v < 0)
+        hi -= r;  // r v = r (v + 2^32) - r 2^32
+    const uint sum = lo + 134217728u;
+    hi += sum < lo ? 1u : 0u;
+    return int((sum >> 28) | (hi << 4));
+}
+
+// (int)(((int64_t)c * a + (int32_t)(1u << 31)) >> 32): the high word of
+// c a - 2^31.
+int high_round(int c, int a)
+{
+    int hi, lo;
+    imulExtended(c, a, hi, lo);
+    return hi - (uint(lo) < 0x80000000u ? 1 : 0);
+}
+
+// saturate32((int64_t)a * b).
+int saturating_mul(int a, int b)
+{
+    int hi, lo;
+    imulExtended(a, b, hi, lo);
+    if (hi != (lo >> 31))
+        return hi < 0 ? int(0x80000000u) : 0x7FFFFFFF;
+    return lo;
+}
+
+// 2^30 / top, top in 1..32768: a float quotient (Vulkan's division is
+// within 2.5 ulp: at most 320 / top off), corrected by its remainder (at
+// most 320 + top in magnitude) divided the same way, to within one, then to
+// the quotient. A GPU without integer division (Intel's) takes many more
+// instructions for the division itself.
+uint div30(uint top)
+{
+    uint q = uint(1073741824.0 / float(top));
+    int r = int(1073741824u - q * top);
+    q = uint(int(q) + int(floor(float(r) / float(top))));
+    r = int(1073741824u - q * top);
+    if (r < 0)
+        q--;
+    else if (r >= int(top))
+        q++;
+    return q;
+}
+#endif
+
 #ifndef TX
 #define TX 16               // the engine's kDcmTile
 #define TY 8
@@ -131,9 +197,9 @@ void decouple(int from, out int restored[LIMITS][3], out int csfA[LIMITS][3], ou
 #if SCALE0
     const bool aligned = within_one_degree16(o[0], o[1], t[0], t[1]);
 #else
-    int64_t otDp = int64_t(o[0]) * t[0] + int64_t(o[1]) * t[1];
-    int64_t oMagSq = int64_t(o[0]) * o[0] + int64_t(o[1]) * o[1];
-    int64_t tMagSq = int64_t(t[0]) * t[0] + int64_t(t[1]) * t[1];
+    int64_t otDp = mul64(o[0], t[0]) + mul64(o[1], t[1]);
+    int64_t oMagSq = mul64(o[0], o[0]) + mul64(o[1], o[1]);
+    int64_t tMagSq = mul64(t[0], t[0]) + mul64(t[1], t[1]);
     bool aligned = within_one_degree(otDp, oMagSq, tMagSq);
 #endif
     const int limits[LIMITS] = { aligned ? GAIN_A : 1, aligned ? GAIN_B : 1 };
@@ -166,26 +232,45 @@ void decouple(int from, out int restored[LIMITS][3], out int csfA[LIMITS][3], ou
             shift = msb32(magnitude) - 14;
             top = ((magnitude + (1u << (shift - 1))) >> shift) & 0xFFFFu;
         }
-        int64_t k = 32768;
+        // k = clamp((2^30 / top * t * sign + 2^(14 + shift)) >> (15 + shift), 0,
+        // 32768), the 64-bit sum as two words: if negative, 0; if 2^32 or more
+        // after the shift, 32768.
+        int k = 32768;
         if (o[b] != 0) {
-            int64_t sign = o[b] < 0 ? -1 : 1;
-            k = (int64_t(1073741824 / int(top)) * t[b] * sign + int64_t(1 << (14 + shift))) >> (15 + shift);
-            k = clamp(k, int64_t(0), int64_t(32768));
+            int hi, lo;
+            imulExtended(int(div30(top)), t[b], hi, lo);
+            if (o[b] < 0) {  // the product negated
+                hi = ~hi + (lo == 0 ? 1 : 0);
+                lo = -lo;
+            }
+            const uint sum = uint(lo) + (1u << uint(14 + shift));
+            hi += sum < uint(lo) ? 1 : 0;
+            const int n = 15 + shift;  // 15..32
+            if (hi < 0)
+                k = 0;
+            else if (n == 32)
+                k = min(hi, 32768);
+            else if ((uint(hi) >> uint(n)) != 0)
+                k = 32768;
+            else
+                k = int(min((sum >> uint(n)) | (uint(hi) << uint(32 - n)), 32768u));
         }
         [ForceUnroll]
         for (int v = 0; v < LIMITS; ++v) {
-            const int rest = int((k * o[b] + 16384) >> 15);
-            int restV = limits[v] == 1 ? rest : saturate32(int64_t(rest) * limits[v]);
+            // (k o + 16384) >> 15, k in 0..32768: k times o's bits above the 15th
+            // exactly, plus the rounded rest.
+            const int rest = k * (o[b] >> 15) + ((k * (o[b] & 32767) + 16384) >> 15);
+            int restV = limits[v] == 1 ? rest : saturating_mul(rest, limits[v]);
             if (aligned && k > 0) {
                 if (o[b] > 0) restV = min(restV, t[b]);
                 if (o[b] < 0) restV = max(restV, t[b]);
             }
             const int additiveV = t[b] - restV;
-            const int filtered = int((int64_t(rfactor[b]) * int64_t(additiveV) + 134217728) >> 28);
+            const int filtered = rfactor_round(rfactor[b], additiveV);
             restored[v][b] = restV;
             csfA[v][b] = filtered;
             // The CUDA kernel's rounding term is (int32_t)(1u << 31): negative.
-            csfF[v][b] = int((int64_t(143165577) * abs(filtered) - 2147483648ll) >> 32);
+            csfF[v][b] = high_round(143165577, abs(filtered));
         }
 #endif
     }
@@ -273,7 +358,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 #if SCALE0
                             threshold += sext16((8738 * center + 2048) >> 12);
 #else
-                            threshold += int((int64_t(286331153) * center - 2147483648ll) >> 32);
+                            threshold += high_round(286331153, center);
 #endif
                         }
                     } else {
@@ -286,7 +371,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 #if SCALE0
                 int value = abs(int(rfactor[b] * uint(source))) - (threshold << kShiftSub[b]);
 #else
-                int value = abs(int((int64_t(source) * int64_t(rfactor[b]) + 134217728) >> 28)) - threshold;
+                int value = abs(rfactor_round(rfactor[b], source)) - threshold;
 #endif
                 value = max(value, 0);
                 int square = int((int64_t(value) * value + (1ll << (kShiftSq[b] - 1))) >> kShiftSq[b]);
