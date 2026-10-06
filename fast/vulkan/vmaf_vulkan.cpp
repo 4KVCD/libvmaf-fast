@@ -44,7 +44,14 @@
 #include <string.h>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -186,7 +193,6 @@ struct FrameSums {
     uint64_t slots[kSlots] = {};
     double cambiPooled[V1_CAMBI_SCALES] = {};  // spatial_pooling on the CPU, where the GPU's top k was not exact
     unsigned cambiPooledScales = 0;           // which scales those are (bits)
-    double speed[3] = { NAN, NAN, NAN };      // SpEED chroma's u, v and uv scores
 };
 
 // As libvmaf: write_scores() of integer_vif_cuda.c.
@@ -446,6 +452,129 @@ struct V1Options {
     bool movingAverage = false;
 };
 
+// SpEED's est_params and get_speed_score (v1_speed.c) on worker threads, a
+// frame's four filtered planes a job, each thread with its own libvmaf
+// state: the same code on the same values whichever thread takes a frame.
+// A few milliseconds a frame at 4K, which the thread that submits the
+// frames would otherwise spend.
+class SpeedPool {
+public:
+    ~SpeedPool() { stop(); }
+
+    bool start(const V1SpeedOptions &options, unsigned w, unsigned h, size_t planeFloats, int count)
+    {
+        floats = planeFloats * 4;
+        for (int i = 0; i < count; ++i) {
+            V1Speed *state = v1_speed_new(&options, w, h);
+            if (!state)
+                return false;
+            states.push_back(state);
+        }
+        try {
+            for (V1Speed *state : states)
+                threads.emplace_back([this, state] { run(state); });
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
+
+    // A frame's filtered planes (ref U, ref V, dis U, dis V), copied.
+    void submit(unsigned index, const float *planes)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        done.wait(lock, [this] { return queue.size() < kMaxQueued; });
+        std::vector<float> buffer;
+        if (!spare.empty()) {
+            buffer = std::move(spare.back());
+            spare.pop_back();
+        }
+        buffer.assign(planes, planes + floats);
+        queue.emplace_back(index, std::move(buffer));
+        ++pending;
+        work.notify_one();
+    }
+
+    void wait()
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        done.wait(lock, [this] { return pending == 0; });
+    }
+
+    // A frame's u, v and uv scores; false for a frame that was not scored.
+    bool result(unsigned index, double out[3])
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto found = results.find(index);
+        if (found == results.end())
+            return false;
+        memcpy(out, found->second.data(), 3 * sizeof(double));
+        return true;
+    }
+
+    double busyNs = 0.0;  // the workers' time, summed (the profile)
+    uint64_t jobs = 0;
+
+private:
+    enum { kMaxQueued = 64 };
+
+    void run(V1Speed *state)
+    {
+        for (;;) {
+            std::pair<unsigned, std::vector<float>> job;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                work.wait(lock, [this] { return stopping || !queue.empty(); });
+                if (queue.empty())
+                    return;
+                job = std::move(queue.front());
+                queue.pop_front();
+            }
+            const auto started = std::chrono::steady_clock::now();
+            const size_t n = floats / 4;
+            float *data = job.second.data();
+            float *planes[4] = { data, data + 2 * n, data + n, data + 3 * n };  // ref U, dis U, ref V, dis V
+            std::array<double, 3> scores;
+            v1_speed_chroma(state, planes, scores.data());
+            const double ns = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count();
+            std::lock_guard<std::mutex> lock(mutex);
+            results[job.first] = scores;
+            spare.push_back(std::move(job.second));
+            busyNs += ns;
+            ++jobs;
+            --pending;
+            done.notify_all();
+        }
+    }
+
+    void stop()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+            queue.clear();
+        }
+        work.notify_all();
+        for (std::thread &thread : threads)
+            thread.join();
+        threads.clear();
+        for (V1Speed *state : states)
+            v1_speed_free(state);
+        states.clear();
+    }
+
+    std::mutex mutex;
+    std::condition_variable work, done;
+    std::deque<std::pair<unsigned, std::vector<float>>> queue;
+    std::vector<std::vector<float>> spare;
+    std::unordered_map<unsigned, std::array<double, 3>> results;
+    std::vector<std::thread> threads;
+    std::vector<V1Speed *> states;
+    size_t floats = 0, pending = 0;
+    bool stopping = false;
+};
+
 } // namespace
 
 struct vv_context {
@@ -513,10 +642,9 @@ struct vv_context {
     bool speed = false;
     V1SpeedOptions speedOptions = {};
     V1SpeedFilters speedFilters = {};
-    V1Speed *speedState = nullptr;
+    SpeedPool speedPool;
     uint32_t chromaW = 0, chromaH = 0, chromaStrideBytes = 0, chromaPlaneBytes = 0;
     Buffer speedFilterTaps, speedOperating, speedScaling;
-    std::vector<float> speedPlanes;  // a frame's filtered planes, out of the slot's buffer
     int enable_speed(const double *values);
 
     // Profiling (vv_profile, for the speed work): the GPU's time per pass,
@@ -559,7 +687,6 @@ struct vv_context {
 
 vv_context::~vv_context()
 {
-    v1_speed_free(speedState);
     if (!device)
         return;
     vk.vkDeviceWaitIdle(device);
@@ -1706,10 +1833,9 @@ int vv_context::enable_speed(const double *values)
             return error;
         slot.speedPasses.back().groups[2] = 4;
     }
-    speedState = v1_speed_new(&o, chromaW, chromaH);
-    if (!speedState)
-        return fail(-2, "SpEED: out of memory");
-    speedPlanes.resize((size_t)operating * 4);
+    const int workers = (int)std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u);
+    if (!speedPool.start(o, chromaW, chromaH, (size_t)operating, workers))
+        return fail(-2, "SpEED: its threads could not be started");
     speed = true;
     return 0;
 }
@@ -1796,22 +1922,12 @@ int vv_context::collect(Slot &slot)
             frame.cambiPooledScales |= 1u << scale;
         }
     }
-    const double speedStart = profile ? now_ns() : 0.0;
     if (profile) {
-        cpuNs[kCpuCambiPool] += speedStart - tailStart;
+        cpuNs[kCpuCambiPool] += now_ns() - tailStart;
         ++cpuCount[kCpuCambiPool];
     }
-    if (speed && slot.scored) {
-        // Out of the slot's buffer first: est_params reads each value hundreds of times.
-        memcpy(speedPlanes.data(), slot.speedKeep.mapped, speedPlanes.size() * sizeof(float));
-        const size_t n = speedPlanes.size() / 4;
-        float *planes[4] = { &speedPlanes[0], &speedPlanes[2 * n], &speedPlanes[n], &speedPlanes[3 * n] };  // ref U, dis U, ref V, dis V
-        v1_speed_chroma(speedState, planes, frame.speed);
-        if (profile) {
-            cpuNs[kCpuSpeed] += now_ns() - speedStart;
-            ++cpuCount[kCpuSpeed];
-        }
-    }
+    if (speed && slot.scored)  // est_params on the pool's threads, from a copy of the planes
+        speedPool.submit(slot.index, (const float *)slot.speedKeep.mapped);
     return 0;
 }
 
@@ -2016,6 +2132,8 @@ int vv_context::flush()
         if (int slotError = collect(slot))
             error = error ? error : slotError;
     }
+    if (speed)
+        speedPool.wait();
     return error;
 }
 
@@ -2259,10 +2377,13 @@ VV_EXPORT int vv_v1_speed_scores(vv_context *context, double *out, unsigned fram
 {
     if (!context->speed)
         return fail(-3, "SpEED is not calculated in this context");
+    context->speedPool.wait();
     const std::vector<FrameSums> &sums = context->sums;
     const unsigned n = (unsigned)std::min<size_t>(frames, sums.size());
-    for (unsigned i = 0; i < n; ++i)
-        memcpy(out + 3 * (size_t)i, sums[i].speed, sizeof sums[i].speed);
+    for (unsigned i = 0; i < n; ++i) {
+        if (!context->speedPool.result(i, out + 3 * (size_t)i))
+            out[3 * (size_t)i] = out[3 * (size_t)i + 1] = out[3 * (size_t)i + 2] = NAN;
+    }
     return (int)sums.size();
 }
 
@@ -2285,7 +2406,9 @@ VV_EXPORT int vv_profile_text(vv_context *context, char *out, int bytes)
                  (unsigned long long)context->gpuCount[i]);
         text += line;
     }
-    static const char *const steps[vv_context::kCpuSteps] = { "copy", "record", "wait", "speed", "cambi_pool" };
+    context->cpuNs[vv_context::kCpuSpeed] = context->speedPool.busyNs;  // on its threads
+    context->cpuCount[vv_context::kCpuSpeed] = context->speedPool.jobs;
+    static const char *const steps[vv_context::kCpuSteps] = { "copy", "record", "wait", "speed_threads", "cambi_pool" };
     for (int i = 0; i < vv_context::kCpuSteps; ++i) {
         snprintf(line, sizeof line, "cpu %s %.3f %llu\n", steps[i], context->cpuNs[i] / 1e6,
                  (unsigned long long)context->cpuCount[i]);
