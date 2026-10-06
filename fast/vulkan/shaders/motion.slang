@@ -50,6 +50,19 @@ void main(uint3 group : SV_GroupID, uint3 lid : SV_GroupThreadID, uint local : S
     // Each sample of the tile read once, not 25 times: the kernel's sums of
     // the same samples, in the same order.
     const int x0 = int(group.x) * TW, y0 = int(group.y) * TH;
+#if BPC16
+    // A tile inside the picture, its samples and those around it (columns
+    // from x0 - REACH: even, a word's first sample): a word, two samples, a
+    // load, nothing mirrored.
+    if (x0 >= REACH && x0 + TW + REACH <= pc.w && y0 >= REACH && y0 + TH + REACH <= pc.h) {
+        for (uint e = local; e < uint(IN_W / 2 * IN_H); e += uint(TW / 2 * TH)) {
+            const uint row = e / uint(IN_W / 2), pair = e % uint(IN_W / 2);
+            const uint word = src[(y0 - REACH + int(row)) * pc.strideWords + (x0 - REACH) / 2 + int(pair)];
+            gIn[row * uint(IN_W) + 2 * pair] = word & 0xFFFFu;
+            gIn[row * uint(IN_W) + 2 * pair + 1] = word >> 16;
+        }
+    } else
+#endif
     for (uint e = local; e < uint(IN_W * IN_H); e += uint(TW / 2 * TH)) {
         // Positions only pixels beyond the picture read are clamped into
         // it, and unused.
