@@ -68,6 +68,20 @@ $shaders = [ordered]@{
     'adm_decouple_0_v5' = 'adm_decouple', 'SCALE0=1', 'BPC16=0', 'V1=0', 'VARIANT=5'
     'adm_decouple_0_v6' = 'adm_decouple', 'SCALE0=1', 'BPC16=0', 'V1=0', 'VARIANT=6'
     'adm_decouple_0_v7' = 'adm_decouple', 'SCALE0=1', 'BPC16=0', 'V1=0', 'VARIANT=7'
+    # VMAF v1's CAMBI (shaders/cambi.slang), a step per STAGE.
+    'cambi_pre_8'       = 'cambi', 'STAGE=1', 'BPC16=0'
+    'cambi_pre_16'      = 'cambi', 'STAGE=1', 'BPC16=1'
+    'cambi_deriv'       = 'cambi', 'STAGE=2', 'BPC16=0'
+    'cambi_mask'        = 'cambi', 'STAGE=3', 'BPC16=0'
+    'cambi_decimate'    = 'cambi', 'STAGE=4', 'BPC16=0'
+    'cambi_mode'        = 'cambi', 'STAGE=5', 'BPC16=0'
+    'cambi_cvalues'     = 'cambi', 'STAGE=6', 'BPC16=0'
+    'cambi_clear'       = 'cambi', 'STAGE=7', 'BPC16=0'
+    'cambi_hist'        = 'cambi', 'STAGE=8', 'BPC16=0'
+    'cambi_select'      = 'cambi', 'STAGE=9', 'BPC16=0'
+    'cambi_sum'         = 'cambi', 'STAGE=10', 'BPC16=0'
+    'cambi_args'        = 'cambi', 'STAGE=11', 'BPC16=0'
+    'cambi_keep'        = 'cambi', 'STAGE=12', 'BPC16=0'
 }
 
 function Invoke-Checked([string]$what, [scriptblock]$command) {
@@ -141,7 +155,7 @@ $visualStudio = & $vswhere -latest -products * -requires Microsoft.VisualStudio.
 if (-not $visualStudio) { throw 'Visual Studio with the C++ tools was not found' }
 New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 $compile = "cl /nologo /LD /O2 /MT /EHsc /std:c++17 /W3 /wd4244 /wd4305 /wd4996 /Brepro /I`"$build`" /I`"$(Join-Path $headers 'include')`" " +
-    "`"$(Join-Path $source 'vmaf_vulkan.cpp')`" /Fo`"$build\\`" /Fe`"$output`" /link /Brepro /IMPLIB:`"$build\vmaf_vulkan.lib`""
+    "`"$(Join-Path $source 'vmaf_vulkan.cpp')`" `"$(Join-Path $source 'v1_host.c')`" /Fo`"$build\\`" /Fe`"$output`" /link /Brepro /IMPLIB:`"$build\vmaf_vulkan.lib`""
 $batch = Join-Path $build 'compile.bat'
 Set-Content -Path $batch -Encoding ascii -Value @(
     '@echo off',

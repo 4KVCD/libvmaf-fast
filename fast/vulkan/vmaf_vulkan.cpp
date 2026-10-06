@@ -50,6 +50,8 @@
 #include <vulkan/vulkan.h>
 
 #include "shaders_spv.h"
+#include "v1_host.h"
+#include "cambi_lut.h"
 
 #define VV_EXPORT extern "C" __declspec(dllexport)
 
@@ -69,7 +71,7 @@
     X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) \
     X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCreateCommandPool) X(vkDestroyCommandPool) \
     X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkResetCommandBuffer) \
-    X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) \
+    X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdDispatchIndirect) \
     X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCreateFence) X(vkDestroyFence) \
     X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) X(vkDeviceWaitIdle)
 
@@ -157,7 +159,12 @@ enum {
     kSlotVif = 1,                               // [scale][kVifSums]
     kSlotCsfDen = kSlotVif + kScales * kVifSums, // [scale][band]
     kSlotCm = kSlotCsfDen + kScales * 3,         // [limit][scale][band]
-    kSlots = kSlotCm + 2 * kScales * 3
+    // VMAF v1's CAMBI (vv_v1_cambi), per scale: the top k's sum above its
+    // k-th largest value (units of 2^-24), that value's bits, how many of it
+    // are in the top k, and whether a value was not a whole number of units.
+    kSlotCambi = kSlotCm + 2 * kScales * 3,
+    kSlotCambiInvalid = kSlotCambi + V1_CAMBI_SCALES * 4,  // a sample above its bit depth's largest
+    kSlots = kSlotCambiInvalid + 1
 };
 
 // What vv_features returns per frame.
@@ -174,6 +181,8 @@ enum {
 struct FrameSums {
     bool scored = false;
     uint64_t slots[kSlots] = {};
+    double cambiPooled[V1_CAMBI_SCALES] = {};  // spatial_pooling on the CPU, where the GPU's top k was not exact
+    unsigned cambiPooledScales = 0;           // which scales those are (bits)
 };
 
 // As libvmaf: write_scores() of integer_vif_cuda.c.
@@ -400,10 +409,14 @@ struct Pass {
     uint32_t constants[32];
     uint32_t constantBytes;
     uint32_t groups[3];
+    VkBuffer indirect;                // dispatched with the sizes the GPU wrote here, when set
+    VkDeviceSize indirectOffset;
 };
 
 struct Slot {
     Buffer staging, result;
+    Buffer cambiKeep;                 // VMAF v1's CAMBI: the c-values of scales the CPU pools (host-visible)
+    std::vector<Pass> cambiKeepPasses;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool busy = false;
@@ -467,7 +480,20 @@ struct vv_context {
     Buffer bandsRef[2], bandsDis[2], admR, admA, admF, acc;
 
     std::vector<Pass> motion[2];  // by frame parity
-    std::vector<Pass> scored;     // VIF and ADM
+    std::vector<Pass> scored;     // VIF and ADM (and VMAF v1's CAMBI)
+
+    // VMAF v1's CAMBI on the GPU (vv_v1_cambi): what cambi.c's init works
+    // out, and the buffers its passes use.
+    bool cambi = false;
+    bool cambiPoolOnCpu = false;  // every scale pooled by v1_host (the tests of that)
+    Buffer cambiArgs;             // the KEEP passes' dispatch sizes
+    VkDeviceSize cambiKeepOffset[V1_CAMBI_SCALES] = {};  // each scale's place in a slot's cambiKeep (words)
+    V1CambiOptions cambiOptions = {};
+    V1CambiConstants cambiConst = {};
+    Buffer cambiImage, cambiZero, cambiMaskFull, cambiReciprocal, cambiHist, cambiState;
+    Buffer cambiRaw[V1_CAMBI_SCALES], cambiFiltered[V1_CAMBI_SCALES], cambiMask[V1_CAMBI_SCALES],
+        cambiC[V1_CAMBI_SCALES];
+    int enable_cambi(const double *values);
 
     std::vector<Slot> slots;
     unsigned nextSlot = 0;
@@ -661,7 +687,7 @@ void barrier(const DeviceApi &vk, VkCommandBuffer commands, VkPipelineStageFlags
     VkMemoryBarrier memory = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     memory.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     memory.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-                           VK_ACCESS_TRANSFER_WRITE_BIT;
+                           VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
     vk.vkCmdPipelineBarrier(commands, from, to, 0, 1, &memory, 0, nullptr, 0, nullptr);
 }
 
@@ -1300,9 +1326,9 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     poolInfo.queueFamilyIndex = queueFamily;
     if (vk.vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS)
         return fail(-1, "vkCreateCommandPool failed");
-    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 * kMaxBindings };
+    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256 * kMaxBindings };  // VMAF v1 with CAMBI: about 150 passes
     VkDescriptorPoolCreateInfo descriptorInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    descriptorInfo.maxSets = 64;
+    descriptorInfo.maxSets = 256;
     descriptorInfo.poolSizeCount = 1;
     descriptorInfo.pPoolSizes = &poolSize;
     if (vk.vkCreateDescriptorPool(device, &descriptorInfo, nullptr, &descriptorPool) != VK_SUCCESS)
@@ -1391,6 +1417,168 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     return build_passes();
 }
 
+// CAMBI's passes, after VMAF v1's (scored frames only), from the distorted
+// luma (picDis): the steps of cambi_score, one shader stage each
+// (shaders/cambi.slang), and spatial_pooling's top k found by a radix
+// select over the c-values' bits, three levels of 12, 12 and 8 bits.
+int vv_context::enable_cambi(const double *values)
+{
+    if (!v1)
+        return fail(-3, "CAMBI is calculated in a VMAF v1 context only");
+    if (frames || cambi)
+        return fail(-3, "CAMBI is started before the first frame");
+    V1CambiOptions &o = cambiOptions;
+    o.high_res_speedup = (int)values[0];
+    o.vis_lum_threshold = values[1];
+    o.max_val = values[2];
+    o.topk = values[3];
+    o.window_size = (int)values[4];
+    o.tvi_threshold = values[5];
+    o.max_log_contrast = (int)values[6];
+    o.eotf = (int)values[7];
+    cambiPoolOnCpu = values[8] != 0;
+    if (int error = v1_cambi_constants(&o, (unsigned)w, (unsigned)h, &cambiConst))
+        return fail(error, "CAMBI: cambi.c's init refuses this picture or these options");
+    const V1CambiConstants &c = cambiConst;
+    if (c.num_diffs != 4)
+        return fail(-4, "CAMBI: only max_log_contrast 2 (4 contrasts) is calculated on the GPU");
+    if (c.window_size * c.window_size >= CAMBI_RECIPROCAL_LUT_SIZE)
+        return fail(-3, "CAMBI: the window is larger than the reciprocal table");
+
+    const VkDeviceSize pixels = (VkDeviceSize)w * h;
+    const int histWords = V1_CAMBI_SCALES * 3 * 4096;
+    struct { Buffer *buffer; VkDeviceSize bytes; } sized[] = {
+        { &cambiImage, pixels * 4 }, { &cambiZero, pixels * 4 }, { &cambiMaskFull, pixels * 4 },
+        { &cambiReciprocal, sizeof kCambiReciprocal }, { &cambiHist, (VkDeviceSize)histWords * 4 },
+        { &cambiState, V1_CAMBI_SCALES * 2 * 4 },
+    };
+    for (auto &entry : sized) {
+        if (int error = create_buffer(*entry.buffer, entry.bytes, false))
+            return error;
+    }
+    for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
+        const VkDeviceSize n = (VkDeviceSize)c.scale_w[scale] * c.scale_h[scale];
+        const bool decimated = scale > 0 || c.speedup;
+        if (int error = create_buffer(cambiFiltered[scale], n * 4, false))
+            return error;
+        if (int error = create_buffer(cambiC[scale], n * 4, false))
+            return error;
+        if (decimated) {
+            if (int error = create_buffer(cambiRaw[scale], n * 4, false))
+                return error;
+            if (int error = create_buffer(cambiMask[scale], n * 4, false))
+                return error;
+        }
+    }
+    if (int error = upload(cambiReciprocal, kCambiReciprocal, sizeof kCambiReciprocal))
+        return error;
+    if (int error = create_buffer(cambiArgs, V1_CAMBI_SCALES * 3 * 4, false))
+        return error;
+    VkDeviceSize keepWords = 0;
+    for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
+        cambiKeepOffset[scale] = keepWords;
+        keepWords += (VkDeviceSize)c.scale_w[scale] * c.scale_h[scale];
+    }
+    for (Slot &slot : slots) {
+        if (int error = create_buffer(slot.cambiKeep, keepWords * 4, true))
+            return error;
+    }
+
+    int error = 0;
+    {
+        const uint32_t constants[] = { (uint32_t)histWords };
+        error = add_pass(scored, kShader_cambi_clear, { &cambiHist }, constants, sizeof constants,
+                         groups(histWords, 256), 1);
+    }
+    if (!error) {
+        const uint32_t constants[] = { (uint32_t)w, (uint32_t)h, strideBytes / 4, (uint32_t)bpc,
+                                       bpc < 10 ? 1u : 0u, (uint32_t)kSlotCambiInvalid };
+        error = add_pass(scored, bpc > 8 ? kShader_cambi_pre_16 : kShader_cambi_pre_8,
+                         { &picDis, &cambiImage, &acc }, constants, sizeof constants, groups(w, 16), groups(h, 16));
+    }
+    if (!error) {
+        const uint32_t constants[] = { (uint32_t)w, (uint32_t)h };
+        error = add_pass(scored, kShader_cambi_deriv, { &cambiImage, &cambiZero }, constants, sizeof constants,
+                         groups(w, 16), groups(h, 16));
+    }
+    if (!error) {
+        const uint32_t constants[] = { (uint32_t)w, (uint32_t)h, (uint32_t)c.mask_index };
+        error = add_pass(scored, kShader_cambi_mask, { &cambiZero, &cambiMaskFull }, constants, sizeof constants,
+                         groups(w, 16), groups(h, 16));
+    }
+    Buffer *image = &cambiImage, *mask = &cambiMaskFull;
+    int inW = w;
+    for (int scale = 0; scale < V1_CAMBI_SCALES && !error; ++scale) {
+        const int sw = c.scale_w[scale], sh = c.scale_h[scale];
+        if (scale > 0 || c.speedup) {
+            const uint32_t constants[] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)inW };
+            error = add_pass(scored, kShader_cambi_decimate, { image, mask, &cambiRaw[scale], &cambiMask[scale] },
+                             constants, sizeof constants, groups(sw, 16), groups(sh, 16));
+            image = &cambiRaw[scale];
+            mask = &cambiMask[scale];
+        }
+        if (!error) {
+            const uint32_t constants[] = { (uint32_t)sw, (uint32_t)sh };
+            error = add_pass(scored, kShader_cambi_mode, { image, &cambiFiltered[scale] }, constants, sizeof constants,
+                             groups(sw, 16), groups(sh, 16));
+        }
+        if (!error) {
+            uint32_t constants[14] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)(c.window_size >> 1),
+                                       (uint32_t)c.vlt_luma, (uint32_t)c.v_band_base, (uint32_t)c.v_band_size };
+            for (int d = 0; d < 4; ++d) {
+                constants[6 + d] = (uint32_t)c.tvi_for_diff[d];
+                constants[10 + d] = (uint32_t)c.diff_weights[d];
+            }
+            error = add_pass(scored, kShader_cambi_cvalues, { &cambiFiltered[scale], mask, &cambiC[scale],
+                             &cambiReciprocal }, constants, sizeof constants, groups(sw, 16), groups(sh, 16));
+        }
+        const uint32_t n = (uint32_t)(sw * sh);
+        const uint32_t histGroups = std::min<uint32_t>(groups((int)n, 256), 128);
+        const uint32_t slot = (uint32_t)(kSlotCambi + scale * 4);
+        for (uint32_t level = 0; level < 3 && !error; ++level) {
+            const uint32_t histOffset = (uint32_t)((scale * 3 + (int)level) * 4096), stateOffset = (uint32_t)(scale * 2);
+            const uint32_t histConstants[] = { n, level, histGroups, histOffset, stateOffset };
+            error = add_pass(scored, kShader_cambi_hist, { &cambiC[scale], &cambiHist, &cambiState }, histConstants,
+                             sizeof histConstants, histGroups, 1);
+            if (!error) {
+                const uint32_t selectConstants[] = { level, (uint32_t)c.topk_elements[scale], slot + 1, slot + 2,
+                                                     histOffset, stateOffset };
+                error = add_pass(scored, kShader_cambi_select, { &cambiHist, &cambiState, &acc }, selectConstants,
+                                 sizeof selectConstants, 1, 1);
+            }
+        }
+        if (!error) {
+            const uint32_t constants[] = { n, histGroups, slot, slot + 3, (uint32_t)(scale * 2) };
+            error = add_pass(scored, kShader_cambi_sum, { &cambiC[scale], &cambiState, &acc }, constants,
+                             sizeof constants, histGroups, 1);
+        }
+        inW = sw;
+        image = &cambiFiltered[scale];
+    }
+    if (!error) {
+        uint32_t constants[7] = { cambiPoolOnCpu ? 1u : 0u, (uint32_t)kSlotCambi };
+        for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale)
+            constants[2 + scale] = groups(c.scale_w[scale] * c.scale_h[scale], 256);
+        error = add_pass(scored, kShader_cambi_args, { &acc, &cambiArgs }, constants, sizeof constants, 1, 1);
+    }
+    for (Slot &slot : slots) {
+        for (int scale = 0; scale < V1_CAMBI_SCALES && !error; ++scale) {
+            const uint32_t constants[] = { (uint32_t)(c.scale_w[scale] * c.scale_h[scale]),
+                                           (uint32_t)cambiKeepOffset[scale] };
+            error = add_pass(slot.cambiKeepPasses, kShader_cambi_keep, { &cambiC[scale], &slot.cambiKeep }, constants,
+                             sizeof constants, 1, 1);
+            if (!error) {
+                slot.cambiKeepPasses.back().indirect = cambiArgs.buffer;
+                slot.cambiKeepPasses.back().indirectOffset = (VkDeviceSize)scale * 3 * 4;
+            }
+        }
+    }
+    if (error)
+        return error;
+    cambi = true;
+    return 0;
+}
+
 int vv_context::collect(Slot &slot)
 {
     if (!slot.busy)
@@ -1408,6 +1596,17 @@ int vv_context::collect(Slot &slot)
     const uint32_t *words = (const uint32_t *)slot.result.mapped;
     for (int i = 0; i < kSlots; ++i)
         frame.slots[i] = (uint64_t)words[2 * i] | ((uint64_t)words[2 * i + 1] << 32);
+    if (cambi && slot.scored) {
+        const float *kept = (const float *)slot.cambiKeep.mapped;
+        for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
+            if (!(frame.slots[kSlotCambi + scale * 4 + 3] & 2))
+                continue;
+            const int sw = cambiConst.scale_w[scale], sh = cambiConst.scale_h[scale];
+            std::vector<float> values(kept + cambiKeepOffset[scale], kept + cambiKeepOffset[scale] + (size_t)sw * sh);
+            frame.cambiPooled[scale] = v1_cambi_pool(values.data(), cambiOptions.topk, (unsigned)sw, (unsigned)sh);
+            frame.cambiPooledScales |= 1u << scale;
+        }
+    }
     return 0;
 }
 
@@ -1478,9 +1677,10 @@ int vv_context::commit(bool score)
         vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picDis.buffer, 1, &copy);
     }
     vk.vkCmdFillBuffer(cb, acc.buffer, 0, VK_WHOLE_SIZE, 0);
-    barrier(vk, cb, kTransfer, kCompute);
+    barrier(vk, cb, kTransfer, kCompute | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
-    const std::vector<Pass> *lists[2] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr };
+    const std::vector<Pass> *lists[3] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
+                                          score && cambi ? &slot.cambiKeepPasses : nullptr };
     for (const std::vector<Pass> *list : lists) {
         if (!list)
             continue;
@@ -1494,8 +1694,11 @@ int vv_context::commit(bool score)
             vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
             vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &pass.set, 0, nullptr);
             vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pass.constantBytes, pass.constants);
-            vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], pass.groups[2]);
-            barrier(vk, cb, kCompute, kCompute | kTransfer);
+            if (pass.indirect)
+                vk.vkCmdDispatchIndirect(cb, pass.indirect, pass.indirectOffset);
+            else
+                vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], pass.groups[2]);
+            barrier(vk, cb, kCompute, kCompute | kTransfer | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
         }
     }
     if (v1) {
@@ -1659,6 +1862,69 @@ VV_EXPORT int vv_shared_device(vv_context *context, uint8_t *deviceUuid, uint8_t
 
 // Waits for every submitted frame.
 VV_EXPORT int vv_flush(vv_context *context) { return context->flush(); }
+
+// VMAF v1's CAMBI of the distorted frames on the GPU, for a context made by
+// vv_create_v1, before its first frame. `options`: cambi_high_res_speedup,
+// cambi_vis_lum_threshold, cambi_max_val, the topk in effect, window_size,
+// tvi_threshold, max_log_contrast, the eotf in effect (0 bt1886, 1 pq), and
+// 1 to pool every scale on the CPU (the tests of that; 0 pools only where the
+// GPU's sum is not exact in a double): nine doubles. -4 for options it does
+// not calculate (max_log_contrast other than 2).
+VV_EXPORT int vv_v1_cambi(vv_context *context, const double *options)
+{
+    return context->enable_cambi(options);
+}
+
+namespace {
+
+// A c-value's bits as units of 2^-24, false when it is not a whole number of them.
+bool cambi_units(uint32_t bits, uint64_t &units)
+{
+    if (bits == 0) { units = 0; return true; }
+    const uint32_t e = bits >> 23;
+    const uint64_t mantissa = (bits & 0x7FFFFFu) | 0x800000u;
+    if (e < 126 || e >= 142) return false;
+    units = mantissa << (e - 126);
+    return true;
+}
+
+}  // namespace
+
+// Every frame's CAMBI score (cambi.c's, with cambi_max_val), after vv_flush;
+// NaN for a frame that was not scored. Returns the number of frames, or -5
+// when a frame has a sample above its bit depth's largest (as cambi.c fails).
+VV_EXPORT int vv_v1_cambi_scores(vv_context *context, double *out, unsigned frames)
+{
+    if (!context->cambi)
+        return fail(-3, "CAMBI is not calculated in this context");
+    const std::vector<FrameSums> &sums = context->sums;
+    const V1CambiConstants &c = context->cambiConst;
+    const unsigned n = (unsigned)std::min<size_t>(frames, sums.size());
+    for (unsigned i = 0; i < n; ++i) {
+        out[i] = NAN;
+        if (!sums[i].scored)
+            continue;
+        const uint64_t *slots = sums[i].slots;
+        if (slots[kSlotCambiInvalid] & 1)
+            return fail(-5, "CAMBI: frame " + std::to_string(i) + " has a sample above its bit depth's largest");
+        double scores[V1_CAMBI_SCALES];
+        for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
+            if (sums[i].cambiPooledScales & (1u << scale)) {  // pooled on the CPU when the frame was done
+                scores[scale] = sums[i].cambiPooled[scale];
+                continue;
+            }
+            const uint64_t *s = &slots[kSlotCambi + scale * 4];
+            uint64_t threshold;
+            const bool exact = (s[3] & 1) == 0 && cambi_units((uint32_t)s[1], threshold);
+            const uint64_t total = exact ? s[0] + s[2] * threshold : 0;
+            if (!exact || total >= (1ull << 53))
+                return fail(-6, "CAMBI: frame " + std::to_string(i) + "'s top k is not exact in a double");
+            scores[scale] = (double)total * (1.0 / 16777216.0) / c.topk_elements[scale];
+        }
+        out[i] = v1_cambi_score(scores, c.pixels_in_window, context->cambiOptions.max_val);
+    }
+    return (int)sums.size();
+}
 
 // A frame's features (kFeatures doubles), after vv_flush. Returns 1 when
 // the frame was scored, 0 when only its motion was (the others are 0 then).
