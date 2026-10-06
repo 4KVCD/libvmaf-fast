@@ -541,6 +541,7 @@ struct vv_context {
     // the last one's end (the difference: the GPU idle between pairs).
     VkQueryPool timePool = VK_NULL_HANDLE;
     std::string timeFile;
+    std::string statsFile;  // VV_PIPELINE_STATS
     double timestampNs = 0, gpuNs = 0;
     uint64_t firstStart = 0, lastEnd = 0;
     unsigned timed = 0;
@@ -552,6 +553,7 @@ struct vv_context {
     int create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported = false);
     void destroy_last_buffer(Buffer &buffer);
     int create_pipeline(int shader, uint32_t bindings);
+    void write_pipeline_stats(const char *name, VkPipeline pipeline);
     int add_pass(std::vector<Pass> &list, int shader, std::initializer_list<Buffer *> bound,
                  const void *constants, uint32_t constantBytes, uint32_t gx, uint32_t gy);
     int upload(Buffer &target, const void *data, size_t bytes);
@@ -728,9 +730,77 @@ int vv_context::create_pipeline(int shader, uint32_t bindings)
         info.stage.pNext = &required;
     }
     info.layout = pipeline.layout;
+    if (!statsFile.empty())
+        info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
     if (vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline.pipeline) != VK_SUCCESS)
         return fail(-1, std::string("the GPU driver could not compile the shader ") + kShaders[shader].name);
+    if (!statsFile.empty())
+        write_pipeline_stats(kShaders[shader].name, pipeline.pipeline);
     return 0;
+}
+
+void vv_context::write_pipeline_stats(const char *name, VkPipeline pipeline)
+{
+    auto properties = (PFN_vkGetPipelineExecutablePropertiesKHR)api->vkGetDeviceProcAddr(
+        device, "vkGetPipelineExecutablePropertiesKHR");
+    auto statistics = (PFN_vkGetPipelineExecutableStatisticsKHR)api->vkGetDeviceProcAddr(
+        device, "vkGetPipelineExecutableStatisticsKHR");
+    FILE *file = fopen(statsFile.c_str(), "a");
+    if (!properties || !statistics || !file) {
+        if (file) fclose(file);
+        return;
+    }
+    VkPipelineInfoKHR info = { VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR };
+    info.pipeline = pipeline;
+    uint32_t count = 0;
+    properties(device, &info, &count, nullptr);
+    std::vector<VkPipelineExecutablePropertiesKHR> executables(count, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR });
+    properties(device, &info, &count, executables.data());
+    for (uint32_t i = 0; i < count; ++i) {
+        fprintf(file, "%s [%s] subgroup %u:", name, executables[i].name, executables[i].subgroupSize);
+        VkPipelineExecutableInfoKHR executable = { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR };
+        executable.pipeline = pipeline;
+        executable.executableIndex = i;
+        uint32_t n = 0;
+        statistics(device, &executable, &n, nullptr);
+        std::vector<VkPipelineExecutableStatisticKHR> values(n, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR });
+        statistics(device, &executable, &n, values.data());
+        for (const VkPipelineExecutableStatisticKHR &value : values) {
+            fprintf(file, " | %s=", value.name);
+            switch (value.format) {
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: fprintf(file, "%u", value.value.b32); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: fprintf(file, "%lld", (long long)value.value.i64); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: fprintf(file, "%llu", (unsigned long long)value.value.u64); break;
+            default: fprintf(file, "%g", value.value.f64); break;
+            }
+        }
+        fprintf(file, "\n");
+        // And what the driver shows of the compiled code (its internal
+        // representations), each in a file of its own beside statsFile.
+        auto representations = (PFN_vkGetPipelineExecutableInternalRepresentationsKHR)api->vkGetDeviceProcAddr(
+            device, "vkGetPipelineExecutableInternalRepresentationsKHR");
+        uint32_t m = 0;
+        if (representations && representations(device, &executable, &m, nullptr) == VK_SUCCESS && m) {
+            std::vector<VkPipelineExecutableInternalRepresentationKHR> texts(
+                m, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR });
+            representations(device, &executable, &m, texts.data());
+            std::vector<std::vector<char>> data(m);
+            for (uint32_t k = 0; k < m; ++k) {
+                data[k].resize(texts[k].dataSize + 1);
+                texts[k].pData = data[k].data();
+            }
+            representations(device, &executable, &m, texts.data());
+            for (uint32_t k = 0; k < m; ++k) {
+                const std::string path = statsFile + "." + name + "." + std::to_string(k) + ".txt";
+                if (FILE *out = fopen(path.c_str(), "wb")) {
+                    fprintf(out, "%s: %s\n", texts[k].name, texts[k].description);
+                    fwrite(data[k].data(), 1, texts[k].dataSize, out);
+                    fclose(out);
+                }
+            }
+        }
+    }
+    fclose(file);
 }
 
 int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_list<Buffer *> bound,
@@ -1552,8 +1622,21 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     VkPhysicalDeviceFeatures enabled = {};
     enabled.shaderInt64 = VK_TRUE;
     enabled.shaderFloat64 = nativeDouble ? VK_TRUE : VK_FALSE;
+    // Experiments (VV_PIPELINE_STATS=<file>): what the driver's compiler made
+    // of each shader, appended to the file as its pipeline is made.
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executables = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+    if (const char *file = getenv("VV_PIPELINE_STATS"); file && *file
+        && has(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+        extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+        executables.pipelineExecutableInfo = VK_TRUE;
+        executables.pNext = subgroupSizeControl ? &sizeControl : nullptr;
+        statsFile = file;
+    }
     VkDeviceCreateInfo deviceInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
-    if (subgroupSizeControl)
+    if (!statsFile.empty())
+        deviceInfo.pNext = &executables;
+    else if (subgroupSizeControl)
         deviceInfo.pNext = &sizeControl;
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
