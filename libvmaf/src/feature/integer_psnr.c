@@ -107,6 +107,17 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
     return 0;
 }
 
+/* libvmaf-fast: whether a psnr context needs its frames in order, on itself
+ * (VMAF_FEATURE_EXTRACTOR_TEMPORAL): only to add up APSNR's errors over the
+ * whole video. Without APSNR, vmaf_feature_extractor_context_create drops
+ * the flag: its frames go to the thread pool like any other extractor's,
+ * not to the thread that feeds the pictures. */
+bool vmaf_psnr_in_order(const VmafFeatureExtractor *fex)
+{
+    const PsnrState *s = fex->priv;
+    return s && s->enable_apsnr;
+}
+
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 

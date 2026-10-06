@@ -183,11 +183,35 @@ static char *test_feature_extractor_initialization_options()
     return NULL;
 }
 
+/* libvmaf-fast: psnr's frames go to the thread pool unless APSNR, which
+ * adds up the whole video's errors in one context, needs them in order. */
+static char *test_psnr_is_in_order_for_apsnr_alone()
+{
+    VmafFeatureExtractor *fex = vmaf_get_feature_extractor_by_name("psnr");
+    VmafFeatureExtractorContext *fex_ctx;
+    int err = vmaf_feature_extractor_context_create(&fex_ctx, fex, NULL);
+    mu_assert("problem during vmaf_feature_extractor_context_create", !err);
+    mu_assert("psnr without APSNR is in order",
+              !(fex_ctx->fex->flags & VMAF_FEATURE_EXTRACTOR_TEMPORAL));
+    mu_assert("the extractor itself was changed", fex->flags & VMAF_FEATURE_EXTRACTOR_TEMPORAL);
+    vmaf_feature_extractor_context_destroy(fex_ctx);
+
+    VmafDictionary *opts_dict = NULL;
+    err = vmaf_dictionary_set(&opts_dict, "enable_apsnr", "true", 0);
+    mu_assert("problem during vmaf_dictionary_set", !err);
+    err = vmaf_feature_extractor_context_create(&fex_ctx, fex, opts_dict);
+    mu_assert("problem during vmaf_feature_extractor_context_create", !err);
+    mu_assert("psnr with APSNR is not in order", fex_ctx->fex->flags & VMAF_FEATURE_EXTRACTOR_TEMPORAL);
+    vmaf_feature_extractor_context_destroy(fex_ctx);
+    return NULL;
+}
+
 char *run_tests()
 {
     mu_run_test(test_get_feature_extractor_by_name_and_feature_name);
     mu_run_test(test_feature_extractor_context_pool);
     mu_run_test(test_feature_extractor_flush);
     mu_run_test(test_feature_extractor_initialization_options);
+    mu_run_test(test_psnr_is_in_order_for_apsnr_alone);
     return NULL;
 }

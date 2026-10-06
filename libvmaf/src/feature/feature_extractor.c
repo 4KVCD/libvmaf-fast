@@ -135,6 +135,8 @@ static int vmaf_fex_ctx_parse_options(VmafFeatureExtractorContext *fex_ctx)
     return 0;
 }
 
+bool vmaf_psnr_in_order(const VmafFeatureExtractor *fex);  // integer_psnr.c
+
 int vmaf_feature_extractor_context_create(VmafFeatureExtractorContext **fex_ctx,
                                           VmafFeatureExtractor *fex,
                                           VmafDictionary *opts_dict)
@@ -160,6 +162,13 @@ int vmaf_feature_extractor_context_create(VmafFeatureExtractorContext **fex_ctx,
         int err = vmaf_fex_ctx_parse_options(f);
         if (err) return err;
     }
+
+    // libvmaf-fast: psnr is in order for APSNR alone. Without it, a context
+    // made in vmaf_use_feature, and the threads' copies of it, score its
+    // frames on the thread pool: on the thread feeding the pictures it took
+    // 3-4 ms of a 4K pair there, and kept others waiting.
+    if (!strcmp(f->fex->name, "psnr") && !vmaf_psnr_in_order(f->fex))
+        f->fex->flags &= ~(uint64_t) VMAF_FEATURE_EXTRACTOR_TEMPORAL;
 
     return 0;
 

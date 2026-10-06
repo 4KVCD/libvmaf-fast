@@ -18,7 +18,9 @@
  * every rounding is FFmpeg's: the same score, to the last bit, for a picture
  * of an even size, or of any size up to 2048x1152 pixels. FFmpeg's filter
  * reads and writes beyond the picture for an odd width or height above
- * that, which init refuses, as it does more than 12 bits.
+ * that, which init refuses, as it does more than 12 bits. Option "psnr":
+ * psnr_y as well, the psnr extractor's, from the squared errors summed here
+ * anyway.
  *
  * This file is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -62,10 +64,12 @@
 
 #define XPSNR_GAMMA 2
 #define XPSNR_MAX(a, b) ((a) > (b) ? (a) : (b))
+#define XPSNR_MIN(a, b) ((a) < (b) ? (a) : (b))
 
 typedef struct XpsnrState {
     int frame_rate;
     bool weights_from_dist;
+    bool psnr;
     uint32_t w, h;
     unsigned bpc;
     /* block size, blocks a row and a column, FFmpeg's b_val */
@@ -88,10 +92,11 @@ typedef struct XpsnrPlanes {
 static const VmafOption options[] = {
     {
         .name = "frame_rate",
-        .help = "whole frames a second of the reference video, as FFmpeg's "
-                "xpsnr filter takes it from its reference input: below 32 "
-                "the temporal activity is the difference from the frame "
-                "before, else the difference of the two differences before",
+        .help = "whole frames a second, as FFmpeg's xpsnr filter takes it "
+                "from its second input (the distorted video, the original "
+                "being first): below 32 the temporal activity is the "
+                "difference from the frame before, else the difference of "
+                "the two differences before",
         .offset = offsetof(XpsnrState, frame_rate),
         .type = VMAF_OPT_TYPE_INT,
         .default_val.i = 0,
@@ -105,6 +110,15 @@ static const VmafOption options[] = {
                 "its first input, which a command built as for its libvmaf "
                 "filter makes the distorted video",
         .offset = offsetof(XpsnrState, weights_from_dist),
+        .type = VMAF_OPT_TYPE_BOOL,
+        .default_val.b = false,
+    },
+    {
+        .name = "psnr",
+        .help = "psnr_y too, as the psnr extractor gives it with its default "
+                "options, from the squared errors XPSNR sums anyway: a pass "
+                "over both pictures saved, where psnr is not registered",
+        .offset = offsetof(XpsnrState, psnr),
         .type = VMAF_OPT_TYPE_BOOL,
         .default_val.b = false,
     },
@@ -192,18 +206,22 @@ static void smooth_weights(const XpsnrState *s, double *weights)
     }
 }
 
-/* FFmpeg's get_wsse for the luma plane. */
-static uint64_t wsse_luma(XpsnrState *s, const XpsnrPlanes *p)
+/* FFmpeg's get_wsse for the luma plane; *sse, the plane's sum of squared
+ * errors. */
+static uint64_t wsse_luma(XpsnrState *s, const XpsnrPlanes *p, uint64_t *sse)
 {
     const uint32_t b = s->b, w = s->w, h = s->h;
 
-    if (b < 4) /* picture is too small for XPSNR, calculate nonweighted PSNR */
-        return s->bpc == 8 ? sse_block_8(p->org, p->so, p->rec, p->sr, w, h)
+    if (b < 4) { /* picture is too small for XPSNR, calculate nonweighted PSNR */
+        *sse = s->bpc == 8 ? sse_block_8(p->org, p->so, p->rec, p->sr, w, h)
                            : sse_block_16(p->org, p->so, p->rec, p->sr, w, h);
+        return *sse;
+    }
 
     double *const sse_luma = s->sse_luma;
     double *const weights = s->weights;
     uint32_t idx_blk = 0;
+    *sse = 0;
 
     for (uint32_t y = 0; y < h; y += b) { /* calculate block SSE and perceptual weights */
         const uint32_t block_height = (y + b > h ? h - y : b);
@@ -212,9 +230,11 @@ static uint64_t wsse_luma(XpsnrState *s, const XpsnrPlanes *p)
             const uint32_t block_width = (x + b > w ? w - x : b);
             double ms_act = 1.0;
 
-            sse_luma[idx_blk] = s->bpc == 8
+            const uint64_t block_sse = s->bpc == 8
                 ? block_8(s, p, x, y, block_width, block_height, &ms_act)
                 : block_16(s, p, x, y, block_width, block_height, &ms_act);
+            sse_luma[idx_blk] = (double) block_sse;
+            *sse += block_sse;
             weights[idx_blk] = 1.0 / sqrt(ms_act);
         }
     }
@@ -257,7 +277,8 @@ static int extract(VmafFeatureExtractor *fex,
         .s2 = m2->ref ? m2->stride[0] / bytes : 0,
     };
 
-    const uint64_t wsse64 = wsse_luma(s, &p);
+    uint64_t sse;
+    const uint64_t wsse64 = wsse_luma(s, &p, &sse);
     /* FFmpeg's get_avg_xpsnr of a single frame */
     const double sqrt_wsse = sqrt((double) wsse64);
     double xpsnr = INFINITY;
@@ -266,7 +287,17 @@ static int extract(VmafFeatureExtractor *fex,
         xpsnr = 10.0 * log10((double) s->num64 / ((double) avg_dist * (double) avg_dist));
     }
 
-    return vmaf_feature_collector_append(feature_collector, "xpsnr_y", xpsnr, index);
+    int err = vmaf_feature_collector_append(feature_collector, "xpsnr_y", xpsnr, index);
+    if (s->psnr && !err) {
+        /* integer_psnr.c's psnr_y, its default options: every product and
+         * quotient as it makes them */
+        const uint32_t peak = (1u << s->bpc) - 1;
+        const double mse = ((double) sse) / (s->w * s->h);
+        const double psnr_max = (6 * s->bpc) + 12;
+        const double psnr = XPSNR_MIN(10. * log10(peak * peak / XPSNR_MAX(mse, 1e-16)), psnr_max);
+        err = vmaf_feature_collector_append(feature_collector, "psnr_y", psnr, index);
+    }
+    return err;
 }
 
 static int close(VmafFeatureExtractor *fex)

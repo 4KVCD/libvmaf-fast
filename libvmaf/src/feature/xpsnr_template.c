@@ -97,8 +97,9 @@ static uint64_t FN(diff2nd)(const uint32_t w_act, const uint32_t h_act, const T 
     return (ta_act * XPSNR_GAMMA);
 }
 
-/* FFmpeg's calc_squared_error_and_weight. */
-static double FN(block)(const XpsnrState *s, const XpsnrPlanes *p, const uint32_t offset_x,
+/* FFmpeg's calc_squared_error_and_weight; the sum of squared errors as the
+ * integer it is (the plane's, for psnr_y, is theirs added up). */
+static uint64_t FN(block)(const XpsnrState *s, const XpsnrPlanes *p, const uint32_t offset_x,
                         const uint32_t offset_y, const uint32_t block_width, const uint32_t block_height,
                         double *ms_act)
 {
@@ -113,7 +114,7 @@ static double FN(block)(const XpsnrState *s, const XpsnrPlanes *p, const uint32_
     const int w_act = (offset_x + block_width  < s->w ? (int) block_width  : (int) block_width  - b_val);
     const int h_act = (offset_y + block_height < s->h ? (int) block_height : (int) block_height - b_val);
 
-    const double sse = (double) FN(sse_block)(o_m0, o, r_m0, p->sr, block_width, block_height);
+    const uint64_t sse = FN(sse_block)(o_m0, o, r_m0, p->sr, block_width, block_height);
     uint64_t sa_act = 0;  /* spatial abs. activity */
     uint64_t ta_act = 0; /* temporal abs. activity */
 

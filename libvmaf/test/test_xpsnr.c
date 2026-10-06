@@ -382,7 +382,12 @@ static int run_case(const Case *c)
     snprintf(rate, sizeof(rate), "%d", c->frame_rate);
     err |= vmaf_feature_dictionary_set(&opts, "frame_rate", rate);
     err |= vmaf_feature_dictionary_set(&opts, "weights_from_dist", c->weights_from_dist ? "true" : "false");
+    err |= vmaf_feature_dictionary_set(&opts, "psnr", "true");
     err |= vmaf_use_feature(vmaf, "xpsnr", opts);
+    /* the psnr extractor beside it, for the psnr_y xpsnr gives too */
+    VmafContext *psnr = NULL;
+    err |= vmaf_init(&psnr, cfg);
+    err |= vmaf_use_feature(psnr, "psnr", NULL);
     int bad = err ? -1 : 0;
 
     for (int t = 0; t < c->frames && !bad; t++) {
@@ -393,13 +398,16 @@ static int run_case(const Case *c)
             memcpy(dis, ref, n * sizeof(int16_t));
         /* the filter's original is its first input */
         want[t] = c->weights_from_dist ? ffmpeg_frame(&s, dis, ref) : ffmpeg_frame(&s, ref, dis);
-        VmafPicture rp, dp;
+        VmafPicture rp, dp, rq, dq;
         if (to_picture(&rp, ref, c->w, c->h, c->bpc, c->pix_fmt) ||
             to_picture(&dp, dis, c->w, c->h, c->bpc, c->pix_fmt) ||
-            vmaf_read_pictures(vmaf, &rp, &dp, (unsigned) t))
+            vmaf_read_pictures(vmaf, &rp, &dp, (unsigned) t) ||
+            to_picture(&rq, ref, c->w, c->h, c->bpc, c->pix_fmt) ||
+            to_picture(&dq, dis, c->w, c->h, c->bpc, c->pix_fmt) ||
+            vmaf_read_pictures(psnr, &rq, &dq, (unsigned) t))
             bad = -1;
     }
-    if (!bad && vmaf_read_pictures(vmaf, NULL, NULL, 0))
+    if (!bad && (vmaf_read_pictures(vmaf, NULL, NULL, 0) || vmaf_read_pictures(psnr, NULL, NULL, 0)))
         bad = -1;
     for (int t = 0; t < c->frames && !bad; t += c->n_subsample > 1 ? c->n_subsample : 1) {
         double got;
@@ -409,8 +417,17 @@ static int run_case(const Case *c)
                     c->w, c->h, c->bpc, c->frame_rate, t, got, want[t]);
             bad = t + 1;
         }
+        double psnr_y, want_psnr;
+        if (!bad && (vmaf_feature_score_at_index(vmaf, "psnr_y", &psnr_y, (unsigned) t) ||
+                     vmaf_feature_score_at_index(psnr, "psnr_y", &want_psnr, (unsigned) t) ||
+                     memcmp(&psnr_y, &want_psnr, sizeof(double)) != 0)) {
+            fprintf(stderr, "%ux%u %u-bit, frame %d: psnr_y %.17g, the psnr extractor's %.17g\n",
+                    c->w, c->h, c->bpc, t, psnr_y, want_psnr);
+            bad = t + 1;
+        }
     }
     vmaf_close(vmaf);
+    vmaf_close(psnr);
     free(ref); free(dis); free(s.buf_org_m1); free(s.buf_org_m2); free(s.sse_luma); free(s.weights); free(want);
     return bad;
 }
