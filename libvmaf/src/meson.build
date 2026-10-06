@@ -512,6 +512,7 @@ vmaf_include = include_directories(
 libvmaf_feature_sources = [
     feature_src_dir + 'picture_copy.c',
     feature_src_dir + 'integer_psnr.c',
+    feature_src_dir + 'xpsnr.c',
     feature_src_dir + 'third_party/xiph/psnr_hvs.c',
     feature_src_dir + 'feature_extractor.c',
     feature_src_dir + 'feature_name.c',

@@ -141,6 +141,13 @@ test_ssim_decimated = executable('test_ssim_decimated',
     link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
 )
 
+test_xpsnr = executable('test_xpsnr',
+    ['test.c', 'test_xpsnr.c'],
+    include_directories : [libvmaf_inc, test_inc, include_directories('../src/')],
+    dependencies: [thread_lib, stdatomic_dependency, math_lib],
+    link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
+)
+
 test_framesync = executable('test_framesync',
     ['test.c', 'test_framesync.c'],
     include_directories : [libvmaf_inc, test_inc, include_directories('../src/')],
@@ -313,6 +320,7 @@ test('test_luminance_tools', test_luminance_tools)
 test('test_cli_parse', test_cli_parse)
 test('test_psnr', test_psnr)
 test('test_ssim_decimated', test_ssim_decimated)
+test('test_xpsnr', test_xpsnr, timeout : 120)
 test('test_framesync', test_framesync)
 test('test_propagate_metadata', test_propagate_metadata)
 test('test_adm_csf', test_adm_csf)

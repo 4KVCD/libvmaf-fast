@@ -39,6 +39,13 @@ enum VmafFeatureExtractorFlags {
     VMAF_FEATURE_EXTRACTOR_CUDA = 1 << 1,
     VMAF_FEATURE_FRAME_SYNC = 1 << 2,
     VMAF_FEATURE_EXTRACTOR_PREV_REF = 1 << 3,
+    /* libvmaf-fast: prev_ref, prev_prev_ref, prev_dist and prev_prev_dist
+     * are set by the framework, in threaded runs too; unlike PREV_REF the
+     * extractor is subsampled as any other (a frame's score is its
+     * pictures' and theirs alone). The two dist pictures before are then
+     * kept besides the two ref pictures: a pool of preallocated pictures
+     * needs a pair more. */
+    VMAF_FEATURE_EXTRACTOR_PREV_PICTURES = 1 << 4,
 };
 
 typedef struct VmafFeatureExtractor {
@@ -100,6 +107,8 @@ typedef struct VmafFeatureExtractor {
     VmafFrameSyncContext *framesync;
     VmafPicture prev_ref; ///< Previous reference picture (n-1), set by framework.
     VmafPicture prev_prev_ref; ///< Reference picture from two frames ago (n-2), set by framework.
+    VmafPicture prev_dist; ///< Previous distorted picture (n-1), set by framework (PREV_PICTURES).
+    VmafPicture prev_prev_dist; ///< Distorted picture from two frames ago (n-2), set by framework (PREV_PICTURES).
 
 } VmafFeatureExtractor;
 

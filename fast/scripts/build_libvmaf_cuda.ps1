@@ -135,6 +135,12 @@ try {
     New-Item -ItemType Directory -Path $licenses -Force | Out-Null
     Copy-Item (Join-Path $vmaf 'LICENSE') (Join-Path $licenses 'LICENSE.libvmaf.txt')
     Copy-Item (Join-Path $vmaf 'libvmaf/subprojects/pthread-win32/docs/LICENSE.md') (Join-Path $licenses 'LICENSE.pthreads4w.txt')
+    # The xpsnr extractor is a port of FFmpeg's filter, under its licence.
+    Set-Content -Path (Join-Path $licenses 'LICENSE.xpsnr.txt') -Encoding ascii -Value (
+        @('libvmaf/src/feature/xpsnr.c and xpsnr_template.c, ported from FFmpeg''s libavfilter/vf_xpsnr.c',
+          '(Copyright (c) 2024 Christian R. Helmrich, Christian Lehmann, Christian Stoffers), are under the',
+          'GNU Lesser General Public License, version 2.1 or later; the rest of libvmaf under BSD+Patent', '') +
+        (Get-Content (Join-Path $vmaf 'libvmaf/COPYING.LGPLv2.1')))
     # nv-codec-headers' CUDA loader is compiled in; its MIT notice is the
     # comment its headers open with.
     $loader = Get-Content (Join-Path $nvInclude 'ffnvcodec/dynlink_loader.h')
