@@ -6,6 +6,7 @@ libvmaf's own numbers:
 
 ******Upcoming release will have extremely optimized VMAF v0.6.1 and v1 on Vulkan. It will be several times faster than the official CUDA VMAF v0.6.1. PSNR, SSIM, and XPSNR will also speed up several times******
 
+Current features: 
 - **VMAF v0.6.1 and VMAF NEG on any GPU with Vulkan.** The features are
   bit-identical to libvmaf's CUDA code, which is upstream's only GPU code and
   runs on NVIDIA GPUs only. libvmaf predicts the score from them on the CPU,
