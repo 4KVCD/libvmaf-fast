@@ -211,6 +211,18 @@ void vertical(int x, int y, uint at)
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
     const int x0 = int(group.x) * TW, y0 = int(group.y) * TH;
+#if LOG_VERIFY && FAST_LOG
+    if (group.x == 0 && group.y == 0 && local == 0) {  // every entry, once a pass
+        uint wrong = 0;
+        for (uint i = 0; i < 32768u; ++i) {
+            uint value;
+            if (fast_log(i, value) && value != log_table(i))
+                ++wrong;
+        }
+        if (wrong != 0)
+            InterlockedAdd(acc[2 * LOG_VERIFY], wrong);
+    }
+#endif
     if (local < WORDS)
         gTotals[local] = 0;  // before the barrier below; added to after it
     // The vertical pass for the tile's columns x0 - FW/2 .. x0 + TW - 1 + FW/2,

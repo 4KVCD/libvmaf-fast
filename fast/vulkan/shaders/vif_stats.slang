@@ -16,10 +16,51 @@
 // log_generate(32768 + i) for i = v & 0x7FFF: two 16-bit entries a word (the
 // values are 30720..32768), half the table a word each would take in the
 // caches.
+uint log_table(uint i)
+{
+    return (logTable[i >> 1] >> ((i & 1u) * 16)) & 0xFFFFu;
+}
+
+#ifndef FAST_LOG
+#define FAST_LOG 0
+#endif
+// Verification builds (fast/tests/check_vif_log.py --gpu): the first of three
+// spare sums for the fast log's disagreements with the table, the second
+// counts its uses.
+#ifndef LOG_VERIFY
+#define LOG_VERIFY 0
+#endif
+// FAST_LOG: the table's entry is CUDA's log2f(32768 + i) * 2048 rounded, and
+// CUDA's log2f is within 0.0011 of the exact value there (all 32768 entries:
+// check_vif_log.py). The GPU's own log2, within 3 ulp as Vulkan requires
+// (0.0059 here), is so within 0.0069 of CUDA's: where it is more than 1/64
+// from halfway between two integers, both round to the same one. Elsewhere
+// (about 3% of the entries) the table. Its reads, at scattered addresses,
+// cost the most at VIF scale 0 (Core Ultra 9 285K's iGPU, 4K: 7.46 -> 7.26
+// ms; scales 1-3 were no faster).
+bool fast_log(uint i, out uint value)
+{
+    const float c = log2(float(32768u + i)) * 2048.0;
+    const float whole = floor(c), fraction = c - whole;
+    value = uint(whole) + (fraction > 0.5 ? 1u : 0u);
+    return abs(fraction - 0.5) > 0.015625;
+}
+
 uint log_generate(uint v)
 {
     const uint i = v & 0x7FFFu;
-    return (logTable[i >> 1] >> ((i & 1u) * 16)) & 0xFFFFu;
+#if FAST_LOG
+    uint value;
+    if (fast_log(i, value)) {
+#if LOG_VERIFY
+        InterlockedAdd(acc[2 * (LOG_VERIFY + 1)], 1u);
+        if (value != log_table(i))
+            InterlockedAdd(acc[2 * LOG_VERIFY], 1u);
+#endif
+        return value;
+    }
+#endif
+    return log_table(i);
 }
 
 // get_best16_from64
