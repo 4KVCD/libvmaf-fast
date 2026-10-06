@@ -45,7 +45,7 @@ BLOCK_WORDS = 256
 WIDTH, HEIGHT = vmaf_vulkan._PROBE_SIZE
 #: vv_read_buffer's buffers: their index and size in bytes for a WIDTH x HEIGHT picture. The
 #: band images hold h, v, d (two words a position at scales 0 and 2, three at 1 and 3) and a
-#: (bandsA*, one word), as common.slang's adm_hvd describes.
+#: (bandsA*, one word; scale 0's 16-bit, two a word), as common.slang's adm_hvd describes.
 _W1, _H1 = (WIDTH + 1) // 2, (HEIGHT + 1) // 2
 _W2, _H2 = (_W1 + 1) // 2, (_H1 + 1) // 2
 BUFFERS = {"admR": (0, _W1 * _H1 * 16), "admA": (1, _W1 * _H1 * 16), "admF": (2, _W1 * _H1 * 16),

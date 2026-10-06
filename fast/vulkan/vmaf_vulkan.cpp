@@ -981,14 +981,17 @@ int vv_context::build_passes()
         const int bw = (inW + 1) / 2, bh = (inH + 1) / 2;
         const int bandStride = set == 0 ? (w + 1) / 2 : ((w + 1) / 2 + 1) / 2;
         const int outStride = (w + 1) / 2;  // of admR, admA, admF
+        const int aStride0 = ((w + 1) / 2 + 1) & ~1;  // scale 0's a, two a word (adm_dwt)
 
         {   // dwt2_8_device / adm_dwt2_16_device / adm_dwt2_s123_combined_device
             static const int kV[4][2] = { { 0, 0 }, { 0, 0 }, { 16, 32768 }, { 16, 32768 } };
             static const int kH[4][2] = { { 16, 32768 }, { 15, 16384 }, { 16, 32768 }, { 15, 16384 } };
             const int32_t constants[] = { inW, inH, inStride, bandStride,
                                           scale == 0 ? bpc : kV[scale][0], scale == 0 ? 1 << (bpc - 1) : kV[scale][1],
-                                          kH[scale][0], kH[scale][1] };
-            const int shader = scale == 0 ? (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8) : kShader_adm_dwt;
+                                          kH[scale][0], kH[scale][1], aStride0 };
+            // Scales 1-3: a shader each, with these shifts (kV, kH) built in.
+            const int shader = scale == 0 ? (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8)
+                                          : kShader_adm_dwt_1 + (scale - 1);
             error = add_pass(scored, shader, { inRef, inDis, &bandsRef[set], &bandsDis[set], &bandsARef[set],
                                                &bandsADis[set] }, constants,
                              sizeof constants, groups(bw, 16), groups(bh, 8));
@@ -1164,7 +1167,7 @@ int vv_context::build_passes()
         }
         inW = bw;
         inH = bh;
-        inStride = bandStride;
+        inStride = scale == 0 ? aStride0 : bandStride;
     }
     return error;
 }
@@ -1244,6 +1247,7 @@ int vv_context::build_passes_v1()
         const int bw = (inW + 1) / 2, bh = (inH + 1) / 2;
         const int bandStride = set == 0 ? (w + 1) / 2 : ((w + 1) / 2 + 1) / 2;
         const int outStride = (w + 1) / 2;
+        const int aStride0 = ((w + 1) / 2 + 1) & ~1;  // scale 0's a, two a word (adm_dwt)
         if (!v1_rfactors(options, scale, rfactorV1[scale]))
             return fail(-3, "VMAF v1: no contrast sensitivity table for this viewing distance and display height");
         const float *rfactor = rfactorV1[scale];
@@ -1272,8 +1276,10 @@ int vv_context::build_passes_v1()
             static const int kH[4][2] = { { 16, 32768 }, { 15, 16384 }, { 16, 32768 }, { 15, 16384 } };
             const int32_t constants[] = { inW, inH, inStride, bandStride,
                                           scale == 0 ? bpc : kV[scale][0], scale == 0 ? 1 << (bpc - 1) : kV[scale][1],
-                                          kH[scale][0], kH[scale][1] };
-            const int shader = scale == 0 ? (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8) : kShader_adm_dwt;
+                                          kH[scale][0], kH[scale][1], aStride0 };
+            // Scales 1-3: a shader each, with these shifts (kV, kH) built in.
+            const int shader = scale == 0 ? (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8)
+                                          : kShader_adm_dwt_1 + (scale - 1);
             error = add_pass(scored, shader, { inRef, inDis, &bandsRef[set], &bandsDis[set], &bandsARef[set],
                                                &bandsADis[set] }, constants,
                              sizeof constants, groups(bw, 16), groups(bh, 8));
@@ -1378,7 +1384,7 @@ int vv_context::build_passes_v1()
         }
         inW = bw;
         inH = bh;
-        inStride = bandStride;
+        inStride = scale == 0 ? aStride0 : bandStride;
     }
     return error;
 }

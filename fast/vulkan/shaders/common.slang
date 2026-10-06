@@ -63,9 +63,10 @@ void store_packed(RWStructuredBuffer<int> buffer, int pixel, int v0, int v1, int
 // scale 0 16-bit, h and v in the low and high half of the first word and d
 // in the second; at the other scales 32-bit, three words. The approximation
 // band a, which only the next scale's transform reads, is in an image of its
-// own (one word a position). Four words a position, a h v d together, made
-// the next scale's transform read four times the memory it needs, and scale
-// 0's readers twice.
+// own: one word a position, or at scale 0, whose a is 16-bit, two positions
+// a word (adm_dwt). Four words a position, a h v d together, made the next
+// scale's transform read four times the memory it needs, and scale 0's
+// readers twice.
 #define ADM_HVD_WORDS0 2
 #define ADM_HVD_WORDS 3
 
