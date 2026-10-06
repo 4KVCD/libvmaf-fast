@@ -631,7 +631,7 @@ struct vv_context {
     VkDeviceSize cambiKeepOffset[V1_CAMBI_SCALES] = {};  // each scale's place in a slot's cambiKeep (words)
     V1CambiOptions cambiOptions = {};
     V1CambiConstants cambiConst = {};
-    Buffer cambiImage, cambiZero, cambiMaskFull, cambiReciprocal, cambiHist, cambiState;
+    Buffer cambiImage, cambiMaskFull, cambiReciprocal, cambiHist, cambiState;
     Buffer cambiRaw[V1_CAMBI_SCALES], cambiFiltered[V1_CAMBI_SCALES], cambiMask[V1_CAMBI_SCALES],
         cambiC[V1_CAMBI_SCALES];
     int enable_cambi(const double *values);
@@ -1611,8 +1611,11 @@ int vv_context::enable_cambi(const double *values)
 
     const VkDeviceSize pixels = (VkDeviceSize)w * h;
     const int histWords = V1_CAMBI_SCALES * 3 * 4096;
+    // The full picture's image and mask only where scale 0 is the full picture
+    // (no speedup): FRONT writes scale 0's decimated ones otherwise.
+    const VkDeviceSize full = c.speedup ? 1 : pixels;
     struct { Buffer *buffer; VkDeviceSize bytes; } sized[] = {
-        { &cambiImage, pixels * 4 }, { &cambiZero, pixels * 4 }, { &cambiMaskFull, pixels * 4 },
+        { &cambiImage, full * 4 }, { &cambiMaskFull, full * 4 },
         { &cambiReciprocal, sizeof kCambiReciprocal }, { &cambiHist, (VkDeviceSize)histWords * 4 },
         { &cambiState, V1_CAMBI_SCALES * 2 * 4 },
     };
@@ -1655,26 +1658,25 @@ int vv_context::enable_cambi(const double *values)
                          groups(histWords, 256), 1);
     }
     if (!error) {
+        // PRE, DERIV and MASK, and scale 0's DECIMATE with the speedup: FRONT.
+        const uint32_t step = c.speedup ? 2 : 1;
+        const uint32_t outW = c.speedup ? (uint32_t)c.scale_w[0] : (uint32_t)w;
+        const uint32_t outH = c.speedup ? (uint32_t)c.scale_h[0] : (uint32_t)h;
         const uint32_t constants[] = { (uint32_t)w, (uint32_t)h, strideBytes / 4, (uint32_t)bpc,
-                                       bpc < 10 ? 1u : 0u, (uint32_t)kSlotCambiInvalid };
-        error = add_pass(scored, bpc > 8 ? kShader_cambi_pre_16 : kShader_cambi_pre_8,
-                         { &picDis, &cambiImage, &acc }, constants, sizeof constants, groups(w, 16), groups(h, 16));
-    }
-    if (!error) {
-        const uint32_t constants[] = { (uint32_t)w, (uint32_t)h };
-        error = add_pass(scored, kShader_cambi_deriv, { &cambiImage, &cambiZero }, constants, sizeof constants,
-                         groups(w, 16), groups(h, 16));
-    }
-    if (!error) {
-        const uint32_t constants[] = { (uint32_t)w, (uint32_t)h, (uint32_t)c.mask_index };
-        error = add_pass(scored, kShader_cambi_mask, { &cambiZero, &cambiMaskFull }, constants, sizeof constants,
-                         groups(w, 16), groups(h, 16));
+                                       bpc < 10 ? 1u : 0u, (uint32_t)kSlotCambiInvalid, (uint32_t)c.mask_index,
+                                       step, outW, outH };
+        error = add_pass(scored, bpc > 8 ? kShader_cambi_front_16 : kShader_cambi_front_8,
+                         { &picDis, c.speedup ? &cambiRaw[0] : &cambiImage, c.speedup ? &cambiMask[0] : &cambiMaskFull,
+                           &acc }, constants, sizeof constants, groups((int)outW, 16), groups((int)outH, 16));
     }
     Buffer *image = &cambiImage, *mask = &cambiMaskFull;
     int inW = w;
     for (int scale = 0; scale < V1_CAMBI_SCALES && !error; ++scale) {
         const int sw = c.scale_w[scale], sh = c.scale_h[scale];
-        if (scale > 0 || c.speedup) {
+        if (scale == 0 && c.speedup) {  // FRONT wrote them
+            image = &cambiRaw[scale];
+            mask = &cambiMask[scale];
+        } else if (scale > 0) {
             const uint32_t constants[] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)inW };
             error = add_pass(scored, kShader_cambi_decimate, { image, mask, &cambiRaw[scale], &cambiMask[scale] },
                              constants, sizeof constants, groups(sw, 16), groups(sh, 16));

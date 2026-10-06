@@ -3,7 +3,7 @@ memory, and shows where the time goes (the engine's vv_profile: each GPU
 pass, summed by shader, and the CPU's steps), per frame.
 
     python fast/tests/bench_vmaf_v1.py REFERENCE DISTORTED [--frames 24] [--count 240]
-        [--model 3d0h] [--bits 10] [--engine] [--no-profile]
+        [--model 3d0h] [--bits 10] [--engine] [--no-profile] [--dll PATH]
 
 --engine: after the first frames, the frames are committed as a decoder
 hands them over (vv_staging / vv_commit, what is in the slots' memory) with
@@ -39,7 +39,10 @@ def main() -> int:
     parser.add_argument("--device", type=int, default=None)
     parser.add_argument("--engine", action="store_true")
     parser.add_argument("--no-profile", action="store_true")
+    parser.add_argument("--dll", help="another build of vmaf_vulkan.dll (an earlier commit's, to compare)")
     arguments = parser.parse_args()
+    if arguments.dll:
+        vmaf_v1_gpu.vmaf_vulkan.LIBRARY_PATH = Path(arguments.dll)
 
     reference, width, height = frames_of.decode(arguments.reference, arguments.start, arguments.frames, None,
                                                 arguments.bits)

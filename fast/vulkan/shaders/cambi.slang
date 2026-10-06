@@ -67,6 +67,99 @@ void main(uint3 id : SV_DispatchThreadID)
     image[y * w + x] = v;
 }
 
+#elif STAGE == 14  // FRONT
+// PRE, DERIV and MASK in one pass, and DECIMATE's choice of pixels (STEP 2:
+// every other row and column, for cambi_high_res_speedup; 1: all): a
+// workgroup takes 16 x 16 of the outputs, their 16 STEP x 16 STEP pixels of
+// the picture, and works in shared memory on those and the 3 + 1 + 1 pixels
+// around them that the mask's window, the derivative and the anti-dithering
+// read. Each picture pixel of the tile is checked against the bit depth once.
+[[vk::binding(0, 0)]] StructuredBuffer<uint> picture;
+[[vk::binding(1, 0)]] RWStructuredBuffer<uint> imageOut;
+[[vk::binding(2, 0)]] RWStructuredBuffer<uint> maskOut;
+[[vk::binding(3, 0)]] RWStructuredBuffer<uint> acc;
+// pc: w, h, strideWords, bpc, antiDither, errorSlot, maskIndex, step, outW, outH
+#define TILE 16
+#define MAX_SPAN (TILE * 2 + 8)  // the pixels a tile reads across, at STEP 2
+
+groupshared uint gTen[MAX_SPAN * MAX_SPAN];   // to10 of the picture; outside it, unused
+groupshared uint gPre[MAX_SPAN * MAX_SPAN];   // PRE's value
+groupshared uint gZero[MAX_SPAN * MAX_SPAN];  // DERIV's flag, 0 outside the picture
+
+uint to10_of(uint v)
+{
+    const uint bpc = pc[3];
+    if (bpc <= 8) return v << (10 - bpc);
+    if (bpc == 9) return v << 1;
+    if (bpc == 10) return v;
+    const uint shift = bpc - 10;
+    return (v + (1u << (shift - 1))) >> shift;
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
+{
+    const int w = int(pc[0]), h = int(pc[1]), step = int(pc[7]);
+    const int core = TILE * step, span = core + 8;
+    // The tile's picture pixels start at (u0, v0); shared memory at (u0 - 3, v0 - 3).
+    const int u0 = int(group.x) * core, v0 = int(group.y) * core;
+    const int ox = u0 - 3, oy = v0 - 3;
+    const uint bpc = pc[3];
+    for (int i = int(local); i < span * span; i += 256) {
+        const int x = ox + i % span, y = oy + i / span;
+        uint ten = 0;
+        if (x >= 0 && x < w && y >= 0 && y < h) {
+            const uint raw = pixel(picture, x, y, int(pc[2]));
+            if (bpc > 8 && bpc < 16 && x >= u0 && x < u0 + core && y >= v0 && y < v0 + core && raw > (1u << bpc) - 1u)
+                InterlockedOr(acc[2 * pc[5]], 1u);
+            ten = to10_of(raw);
+        }
+        gTen[i] = ten;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // PRE: anti_dithering_filter of the converted picture, which it reads ahead of what it wrote.
+    for (int i = int(local); i < span * span; i += 256) {
+        const int lx = i % span, ly = i / span, x = ox + lx, y = oy + ly;
+        uint v = gTen[i];
+        if (pc[4] != 0 && lx + 1 < span && ly + 1 < span && x >= 0 && x < w && y >= 0 && y < h) {
+            if (x < w - 1 && y < h - 1)
+                v = (v + gTen[i + 1] + gTen[i + span] + gTen[i + span + 1]) >> 2;
+            else if (y < h - 1)
+                v = (v + gTen[i + span]) >> 1;
+            else if (x < w - 1)
+                v = (v + gTen[i + 1]) >> 1;
+        }
+        gPre[i] = v;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // DERIV: equal to its right and lower neighbours (the last column and row: always).
+    for (int i = int(local); i < span * span; i += 256) {
+        const int lx = i % span, ly = i / span, x = ox + lx, y = oy + ly;
+        uint zero = 0;
+        if (x >= 0 && x < w && y >= 0 && y < h && lx + 1 < span && ly + 1 < span) {
+            const uint v = gPre[i];
+            const bool across = x == w - 1 || v == gPre[i + 1];
+            const bool down = y == h - 1 || v == gPre[i + span];
+            zero = (across && down) ? 1u : 0u;
+        }
+        gZero[i] = zero;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // MASK at the outputs' pixels: more than maskIndex zero derivatives in the 7 x 7 square.
+    const int tx = int(local) % TILE, ty = int(local) / TILE;
+    const int outX = int(group.x) * TILE + tx, outY = int(group.y) * TILE + ty;
+    if (outX >= int(pc[8]) || outY >= int(pc[9])) return;
+    const int lx = 3 + tx * step, ly = 3 + ty * step;  // the output's picture pixel, in shared memory
+    uint sum = 0;
+    for (int r = -3; r <= 3; ++r)
+        for (int c = -3; c <= 3; ++c)
+            sum += gZero[(ly + r) * span + lx + c];
+    const uint at = uint(outY) * pc[8] + uint(outX);
+    imageOut[at] = gPre[ly * span + lx];
+    maskOut[at] = sum > pc[6] ? 1u : 0u;
+}
+
 #elif STAGE == 2  // DERIV
 [[vk::binding(0, 0)]] StructuredBuffer<uint> image;
 [[vk::binding(1, 0)]] RWStructuredBuffer<uint> zero;
