@@ -657,6 +657,7 @@ struct vv_context {
 
     std::vector<Pass> motion[2];  // by frame parity
     std::vector<Pass> scored;     // VIF and ADM (and VMAF v1's CAMBI)
+    size_t v1AdmEnd = 0;          // VMAF v1: scored's ADM passes, before CAMBI's
 
     // VMAF v1's CAMBI on the GPU (vv_v1_cambi): what cambi.c's init works
     // out, and the buffers its passes use.
@@ -1429,6 +1430,7 @@ int vv_context::build_passes_v1()
         inH = bh;
         inStride = bandStride;
     }
+    v1AdmEnd = scored.size();
     if (!error)
         error = upload(admParams, admParamValues.data(), admParamValues.size() * sizeof(int32_t));
     return error;
@@ -1996,6 +1998,8 @@ int vv_context::enable_cambi(const double *values)
             if (!error) {
                 slot.cambiKeepPasses.back().indirect = cambiArgs.buffer;
                 slot.cambiKeepPasses.back().indirectOffset = (VkDeviceSize)scale * 3 * 4;
+                // (the scales' copies, of their own buffers: side by side)
+                slot.cambiKeepPasses.back().overlapNext = scale + 1 < V1_CAMBI_SCALES;
             }
         }
     }
@@ -2351,7 +2355,62 @@ int vv_context::commit(bool score)
                                                                                 : &slot.speedPasses) : nullptr };
     if (shared)
         slot.chromaFromHost = false;  // the next frame's: from staging unless vv_chroma_staging says
-    for (const std::vector<Pass> *list : lists) {
+    auto record = [&](const Pass &pass) {
+        if (!pass.groups[0] || !pass.groups[1])
+            return;
+        const Pipeline &pipeline = pipelines[pass.shader];
+        vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+        const VkDescriptorSet set = pass.slotSets.empty() ? pass.set : pass.slotSets[slotIndex];
+        vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &set, 0, nullptr);
+        vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pass.constantBytes, pass.constants);
+        if (pass.indirect)
+            vk.vkCmdDispatchIndirect(cb, pass.indirect, pass.indirectOffset);
+        else
+            vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], pass.groups[2]);
+    };
+    if (v1 && !profile && !passLimit) {
+        // VMAF v1's features, independent of each other -- motion, ADM, CAMBI
+        // (and its kept c-values), SpEED -- each a chain of passes that wait
+        // for the one before, recorded in turns: a pass (or passes that
+        // overlap) of each chain, then one barrier, so that each waits for
+        // its own chain's and the others' passes run beside it (the small
+        // ones left the GPU idle between barriers, at 1080p most).
+        std::vector<std::vector<const Pass *>> chains(4);
+        if (moves)
+            for (const Pass &pass : motion[index % 2]) chains[0].push_back(&pass);
+        if (score) {
+            for (size_t i = 0; i < v1AdmEnd && i < scored.size(); ++i) chains[1].push_back(&scored[i]);
+            for (size_t i = v1AdmEnd; i < scored.size(); ++i) chains[2].push_back(&scored[i]);
+            if (cambi)
+                for (const Pass &pass : slot.cambiKeepPasses) chains[2].push_back(&pass);
+        }
+        if (lists[3])
+            for (const Pass &pass : *lists[3]) chains[3].push_back(&pass);
+        size_t at[4] = {};
+        // The stage each chain starts at: CAMBI's first (CLEAR's), the rest after
+        // it (the best of the orders tried on a Radeon 780M, by a few percent).
+        const int offsets[4] = { 1, 1, 0, 2 };
+        int stage = 0;
+        for (bool pending = true; pending; ++stage) {
+            pending = false;
+            bool recorded = false;
+            for (size_t c = 0; c < chains.size(); ++c) {
+                if (at[c] < chains[c].size()) pending = true;
+                if (stage < offsets[c]) continue;
+                while (at[c] < chains[c].size()) {  // the chain's next pass, with those it overlaps
+                    const Pass &pass = *chains[c][at[c]++];
+                    record(pass);
+                    recorded = true;
+                    if (!pass.overlapNext)
+                        break;
+                }
+            }
+            if (recorded)
+                barrier(vk, cb, kCompute, kCompute | kTransfer | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
+        }
+    }
+    for (const std::vector<Pass> *list : (v1 && !profile && !passLimit) ? std::vector<const std::vector<Pass> *>{}
+                                         : std::vector<const std::vector<Pass> *>(lists, lists + 4)) {
         if (!list)
             continue;
         int done = 0;
