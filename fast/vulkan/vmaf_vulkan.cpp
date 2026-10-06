@@ -465,9 +465,13 @@ struct vv_context {
     // VMAF v1: ADM3 and motion3 as libvmaf's CPU code calculates them.
     bool v1 = false;
     V1Options options;
-    Buffer picPrev[2], admAdditive, admCsfR, admCsfRF;
+    Buffer picPrev[2];
     float rfactorV1[kScales][3] = {};
     int build_passes_v1();
+    // adm_fused.slang's parameters per scale (kAdmParams words each).
+    enum { kAdmParams = 44, kAdmFusedRows = 4 };
+    Buffer admParams;
+    std::vector<int32_t> admParamValues;
     int skip = 0;  // timing tests: 1 = no motion, 2 = no VIF, 4 = no ADM
     int passLimit = 0;  // timing tests: only the first N scored passes
     int decoupleVariant = 0;  // adm_decouple_0's VARIANT (shaders/adm_decouple.slang)
@@ -1018,6 +1022,9 @@ int vv_context::build_passes_v1()
     memcpy(&cosBits, &cos_1deg_sq, sizeof cosBits);
     const uint32_t cosMantissa = (cosBits & 0x7FFFFFu) | 0x800000u;  // cos_1deg_sq = mantissa * 2^-24
 
+    admParamValues.assign((size_t)kScales * kAdmParams, 0);
+    if (int created = create_buffer(admParams, admParamValues.size() * sizeof(int32_t), false))
+        return created;
     int inW = w, inH = h, inStride = strideWords;
     for (int scale = 0; scale < kScales && !error; ++scale) {
         const int set = scale % 2;
@@ -1061,6 +1068,9 @@ int vv_context::build_passes_v1()
             if (error)
                 break;
         }
+        // adm_csf_den, adm_decouple, adm_csf and adm_cm of both images in
+        // one pass (shaders/adm_fused.slang), its parameters in admParams.
+        int32_t *p = &admParamValues[(size_t)scale * kAdmParams];
         {   // adm_csf_den_scale / adm_csf_den_s123
             const int left = bw * ADM_BORDER_FACTOR - 0.5;
             const int top = bh * ADM_BORDER_FACTOR - 0.5;
@@ -1081,38 +1091,22 @@ int vv_context::build_passes_v1()
                 shiftAccum = (uint32_t)ceil(log2(bottom - top));
                 addAccum = (uint32_t)pow(2, ((double)shiftAccum - 1));
             }
-            const uint32_t constants[] = { (uint32_t)top, (uint32_t)left, (uint32_t)right, (uint32_t)bandStride,
-                                           shiftSq, addSq, shiftCub, addCub, shiftAccum, addAccum,
-                                           (uint32_t)(kSlotCsfDen + scale * 3) };
-            error = add_pass(scored, scale == 0 ? kShader_adm_csf_den_v1_0 : kShader_adm_csf_den_v1,
-                             { &bandsRef[set], &acc }, constants, sizeof constants, 1,
-                             (uint32_t)std::max(0, bottom - top));
-            if (error)
-                break;
+            p[12] = top;
+            p[13] = bottom;
+            p[14] = left;
+            p[15] = right;
+            p[33] = (int32_t)shiftSq;
+            p[34] = (int32_t)addSq;
+            p[35] = (int32_t)shiftCub;
+            p[36] = (int32_t)addCub;
+            p[37] = (int32_t)shiftAccum;
+            p[38] = (int32_t)addAccum;
+            p[41] = kSlotCsfDen + scale * 3;
         }
-        {   // adm_decouple / adm_decouple_s123, and adm_csf / i4_adm_csf of both images
-            int left = bw * ADM_BORDER_FACTOR - 0.5 - 1;
-            int top = bh * ADM_BORDER_FACTOR - 0.5 - 1;
-            int right = bw - left + 2;
-            int bottom = bh - top + 2;
-            if (left < 0) left = 0;
-            if (right > bw) right = bw;
-            if (top < 0) top = 0;
-            if (bottom > bh) bottom = bh;
-            const uint32_t constants[] = { (uint32_t)top, (uint32_t)bottom, (uint32_t)left, (uint32_t)right,
-                                           (uint32_t)bandStride, (uint32_t)outStride, 1u,
-                                           i_rfactor[0], i_rfactor[1], i_rfactor[2], cosMantissa };
-            error = add_pass(scored, scale == 0 ? kShader_adm_decouple_v1_0 : kShader_adm_decouple_v1,
-                             { &bandsRef[set], &bandsDis[set], &admR, &admA, &admF, &divTable,
-                               &admAdditive, &admCsfR, &admCsfRF }, constants, sizeof constants,
-                             groups(right - left, 16), groups(bottom - top, 8));
-            if (error)
-                break;
-        }
-        // adm_cm / i4_adm_cm: the restored image masked by the additive one,
-        // then (the additive impairment measure) the additive image masked
-        // by the restored one.
-        for (int aim = 0; aim < 2 && !error; ++aim) {
+        {   // adm_cm / i4_adm_cm: the restored image masked by the additive one,
+            // then (the additive impairment measure) the additive image masked
+            // by the restored one. (adm_decouple's region is this one and a
+            // pixel around it.)
             const int left = bw * ADM_BORDER_FACTOR - 0.5;
             const int top = bh * ADM_BORDER_FACTOR - 0.5;
             const int right = bw - left;
@@ -1121,46 +1115,49 @@ int vv_context::build_passes_v1()
             const int end_col = (right < (bw - 1)) ? right : (bw - 1);
             const int start_row = (top > 1) ? top : 1;
             const int end_row = (bottom < (bh - 1)) ? bottom : (bh - 1);
-            struct {
-                int32_t w, h, startRow, startCol, endCol, stride;
-                uint32_t rfactor[3];
-                int32_t shiftSub[3], shiftSq[3], addSq[3], shiftCub[3], addCub[3];
-                int32_t shiftInner, addInner;
-                uint32_t slot;
-            } constants = {};
-            constants.w = bw;
-            constants.h = bh;
-            constants.startRow = start_row;
-            constants.startCol = start_col;
-            constants.endCol = end_col;
-            constants.stride = outStride;
+            p[0] = bw;
+            p[1] = bh;
+            p[2] = bandStride;
+            p[3] = 1;  // adm_enhn_gain_limit
+            for (int band = 0; band < 3; ++band)
+                p[4 + band] = (int32_t)i_rfactor[band];
+            p[7] = (int32_t)cosMantissa;
+            p[8] = start_row;
+            p[9] = end_row;
+            p[10] = start_col;
+            p[11] = end_col;
             static const int shift_sub[3] = { 10, 10, 12 }, fixed_shift[3] = { 4, 4, 3 };
             static const int shift_xsq[3] = { 29, 29, 30 };
             for (int band = 0; band < 3; ++band) {
-                constants.rfactor[band] = i_rfactor[band];
-                constants.shiftSub[band] = scale == 0 ? shift_sub[band] : 0;
-                constants.shiftSq[band] = scale == 0 ? shift_xsq[band] : 30;
-                constants.addSq[band] = 1 << (constants.shiftSq[band] - 1);
+                p[16 + band] = scale == 0 ? shift_sub[band] : 0;
+                p[19 + band] = scale == 0 ? shift_xsq[band] : 30;
+                p[22 + band] = 1 << (p[19 + band] - 1);
                 const uint32_t shift = scale == 0 ? (uint32_t)ceil(log2(bw) - fixed_shift[band])
                                                   : (uint32_t)ceil(log2(bw));
-                constants.shiftCub[band] = (int32_t)shift;
-                constants.addCub[band] = (int32_t)(uint32_t)pow(2, ((double)shift - 1));
+                p[25 + band] = (int32_t)shift;
+                p[28 + band] = (int32_t)(uint32_t)pow(2, ((double)shift - 1));
             }
             const uint32_t shift_inner_accum = (uint32_t)ceil(log2(bh));
-            constants.shiftInner = (int32_t)shift_inner_accum;
-            constants.addInner = (int32_t)(uint32_t)pow(2, ((double)shift_inner_accum - 1));
-            constants.slot = (uint32_t)(kSlotCm + aim * kScales * 3 + scale * 3);
-            error = aim ? add_pass(scored, scale == 0 ? kShader_adm_cm_0 : kShader_adm_cm,
-                                   { &admAdditive, &admCsfR, &admCsfRF, &acc }, &constants, sizeof constants, 1,
-                                   (uint32_t)std::max(0, end_row - start_row))
-                        : add_pass(scored, scale == 0 ? kShader_adm_cm_0 : kShader_adm_cm,
-                                   { &admR, &admA, &admF, &acc }, &constants, sizeof constants, 1,
-                                   (uint32_t)std::max(0, end_row - start_row));
+            p[31] = (int32_t)shift_inner_accum;
+            p[32] = (int32_t)(uint32_t)pow(2, ((double)shift_inner_accum - 1));
+            p[39] = kSlotCm + scale * 3;
+            p[40] = kSlotCm + kScales * 3 + scale * 3;
+            p[42] = std::min(start_row, p[12]);
+            p[43] = std::max(end_row, p[13]);
+        }
+        {
+            const uint32_t constants[] = { (uint32_t)(scale * kAdmParams) };
+            const uint32_t rowGroups = (uint32_t)std::max(0, (p[43] - p[42] + kAdmFusedRows - 1) / kAdmFusedRows);
+            error = add_pass(scored, scale == 0 ? kShader_adm_fused_0 : kShader_adm_fused,
+                             { &bandsRef[set], &bandsDis[set], &divTable, &admParams, &acc }, constants,
+                             sizeof constants, 1, rowGroups);
         }
         inW = bw;
         inH = bh;
         inStride = bandStride;
     }
+    if (!error)
+        error = upload(admParams, admParamValues.data(), admParamValues.size() * sizeof(int32_t));
     return error;
 }
 
@@ -1387,13 +1384,12 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         { &rdRef[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 }, { &rdDis[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 },
         { &rdRef[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 }, { &rdDis[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 },
         { &picPrev[0], planeBytes * only1 + 4 }, { &picPrev[1], planeBytes * only1 + 4 },
-        { &admAdditive, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 }, { &admCsfR, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 },
-        { &admCsfRF, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 },
         { &logTable, 32768 * 4 }, { &divTable, 65536 * 4 },
         { &bandsRef[0], (VkDeviceSize)w1 * h1 * 16 }, { &bandsDis[0], (VkDeviceSize)w1 * h1 * 16 },
         { &bandsRef[1], (VkDeviceSize)w2 * h2 * 16 }, { &bandsDis[1], (VkDeviceSize)w2 * h2 * 16 },
-        { &admR, (VkDeviceSize)w1 * h1 * 16 }, { &admA, (VkDeviceSize)w1 * h1 * 16 },
-        { &admF, (VkDeviceSize)w1 * h1 * 16 }, { &acc, kSlots * 8 },
+        // VMAF v1 passes nothing between ADM's passes (adm_fused.slang): VMAF v0.6.1's images.
+        { &admR, (VkDeviceSize)w1 * h1 * 16 * v0 + 4 }, { &admA, (VkDeviceSize)w1 * h1 * 16 * v0 + 4 },
+        { &admF, (VkDeviceSize)w1 * h1 * 16 * v0 + 4 }, { &acc, kSlots * 8 },
     };
     for (auto &entry : sized) {
         if (int error = create_buffer(*entry.buffer, entry.bytes, false))
@@ -1444,7 +1440,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         vk.vkBeginCommandBuffer(cb, &begin);
         for (Buffer *buffer : { &blur[0], &blur[1], &vifTmp, &rdRef[0], &rdDis[0], &rdRef[1], &rdDis[1],
                                 &bandsRef[0], &bandsDis[0], &bandsRef[1], &bandsDis[1], &admR, &admA, &admF,
-                                &picPrev[0], &picPrev[1], &admAdditive, &admCsfR, &admCsfRF })
+                                &picPrev[0], &picPrev[1] })
             vk.vkCmdFillBuffer(cb, buffer->buffer, 0, VK_WHOLE_SIZE, 0);
         vk.vkEndCommandBuffer(cb);
         VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
