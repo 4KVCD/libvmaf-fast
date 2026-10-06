@@ -541,6 +541,10 @@ struct vv_context {
     // pass-limited (diagnosis) runs. VV_ADM_FUSED=0 for the separate passes.
     Buffer admRows;
     bool admFused = true;
+    // The GPU reads 16-bit integers from storage buffers (storageBuffer16BitAccess
+    // and shaderInt16, both enabled): VIF scale 0 reads 16-bit samples so
+    // (vif_fused_0_16s; Core Ultra 9 285K's iGPU, 4K: 7.63 -> 7.46 ms).
+    bool samples16 = false;
 
     std::vector<Pass> motion[2];  // by frame parity
     std::vector<Pass> scored;     // VIF and ADM
@@ -1077,7 +1081,9 @@ int vv_context::build_passes()
                                            shiftVP, addVP, shiftSq, addSq, (uint32_t)nextStride,
                                            (uint32_t)(kSlotVif + scale * kVifSums),
                                            (uint32_t)epsilon, (uint32_t)(epsilon >> 32) };
-                const int shader = scale == 0 ? (deep ? kShader_vif_fused_0_16 : kShader_vif_fused_0_8)
+                // 16-bit samples read as such where the GPU can (samples16).
+                const int shader = scale == 0 ? (!deep ? kShader_vif_fused_0_8
+                                                 : samples16 ? kShader_vif_fused_0_16s : kShader_vif_fused_0_16)
                                               : kShader_vif_fused_1 + (scale - 1);
                 error = add_pass(scored, shader, { inRef, inDis, &rdRef[scale % 2], &rdDis[scale % 2], &acc, &logTable },
                                  fused, sizeof fused, groups(sw, 160), groups(sh, kVifTileRows[scale]));  // its TW x TH tiles
@@ -1757,6 +1763,18 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     queueInfo.pQueuePriorities = &priority;
     VkPhysicalDeviceFeatures enabled = {};
     enabled.shaderInt64 = VK_TRUE;
+    VkPhysicalDevice16BitStorageFeatures storage16 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES };
+    if (api->vkGetPhysicalDeviceFeatures2) {
+        VkPhysicalDeviceFeatures2 query = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        query.pNext = &storage16;
+        api->vkGetPhysicalDeviceFeatures2(physical, &query);
+    }
+    samples16 = storage16.storageBuffer16BitAccess && features.shaderInt16;
+    if (const char *text = getenv("VV_SAMPLES16"))
+        samples16 = samples16 && strcmp(text, "0") != 0;
+    enabled.shaderInt16 = samples16 ? VK_TRUE : VK_FALSE;
+    storage16 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES };
+    storage16.storageBuffer16BitAccess = samples16 ? VK_TRUE : VK_FALSE;
     enabled.shaderFloat64 = nativeDouble ? VK_TRUE : VK_FALSE;
     // Experiments (VV_PIPELINE_STATS=<file>): what the driver's compiler made
     // of each shader, appended to the file as its pipeline is made.
@@ -1774,6 +1792,10 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         deviceInfo.pNext = &executables;
     else if (subgroupSizeControl)
         deviceInfo.pNext = &sizeControl;
+    if (samples16) {
+        storage16.pNext = (void *)deviceInfo.pNext;
+        deviceInfo.pNext = &storage16;
+    }
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
     deviceInfo.pEnabledFeatures = &enabled;

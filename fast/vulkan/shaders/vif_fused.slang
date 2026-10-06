@@ -37,8 +37,18 @@ struct Params {
 [vk::constant_id(6)] const uint kAddSq = 0;
 [vk::constant_id(7)] const int kRdStride = 1;
 [vk::constant_id(8)] const uint kSlot = 0;
+#ifndef SAMPLES16
+#define SAMPLES16 0
+#endif
+#if SAMPLES16
+// The pictures' 16-bit samples read one at a time, where the GPU has 16-bit
+// storage access (the engine's choice): no shift or mask a sample.
+[[vk::binding(0, 0)]] StructuredBuffer<uint16_t> refIn;
+[[vk::binding(1, 0)]] StructuredBuffer<uint16_t> disIn;
+#else
 [[vk::binding(0, 0)]] StructuredBuffer<uint> refIn;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> disIn;
+#endif
 // The next scale's images, one word a position: the reference's sample in
 // the low 16 bits, the distorted's in the high (scales 1-3 read refIn so;
 // disIn and disRd are not used). Two words, one per picture, were twice the
@@ -89,13 +99,14 @@ groupshared int gTotals[WORDS];
 #include "vif_stats.slang"
 
 
-// A tap's samples, the reference's and the distorted's, at a row.
 // A tap's samples, the reference's and the distorted's, from the word at
 // `at` (its row's first word plus the column's): `shift` and `mask` pick the
 // column's sample out of it (pictures of 8 or 16 bits a sample).
 uint2 samples_at(int at, uint shift, uint mask)
 {
-#if SRC_PICTURE
+#if SAMPLES16
+    return uint2(uint(refIn[at]), uint(disIn[at]));
+#elif SRC_PICTURE
     return uint2((refIn[at] >> shift) & mask, (disIn[at] >> shift) & mask);
 #else
     const uint word = refIn[at];
@@ -119,7 +130,10 @@ void vertical(int x, int y, uint at)
 {
     // Each tap's word: its row's first (rows inside the picture a stride
     // apart, the others mirrored) plus the column's.
-#if SRC_PICTURE && BPC16
+#if SAMPLES16
+    const int column = x;  // in samples: rows 2 stride apart
+    const uint shift = 0, mask = 0xFFFFu;
+#elif SRC_PICTURE && BPC16
     const int column = x >> 1;
     const uint shift = uint(x & 1) * 16, mask = 0xFFFFu;
 #elif SRC_PICTURE
@@ -129,19 +143,24 @@ void vertical(int x, int y, uint at)
     const int column = x;
     const uint shift = 0, mask = 0;
 #endif
+#if SAMPLES16
+    const int stride = 2 * kStride;  // samples a row
+#else
+    const int stride = kStride;
+#endif
     int words[FW];
     if (y >= FW / 2 && y + FW / 2 < kH) {
-        int at = (y - FW / 2) * kStride + column;
+        int at = (y - FW / 2) * stride + column;
         for (int fi = 0; fi < FW; ++fi) {
             words[fi] = at;
-            at += kStride;
+            at += stride;
         }
     } else {
         for (int fi = 0; fi < FW; ++fi) {
             int row = abs(y - FW / 2 + fi);
             if (row >= kH)
                 row = 2 * kH - row - 2;
-            words[fi] = row * kStride + column;
+            words[fi] = row * stride + column;
         }
     }
     const bool nextRow = (y & 1) == 0;  // the next scale's samples: even rows
