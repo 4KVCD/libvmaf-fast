@@ -41,11 +41,13 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <algorithm>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -60,7 +62,7 @@
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) \
     X(vkGetPhysicalDeviceFeatures) X(vkGetPhysicalDeviceMemoryProperties) \
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) \
-    X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceProperties2)
+    X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceProperties2)
 
 #define VK_DEVICE_FUNCTIONS(X) \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) \
@@ -72,7 +74,10 @@
     X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkResetCommandBuffer) \
     X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) \
     X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCreateFence) X(vkDestroyFence) \
-    X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) X(vkDeviceWaitIdle)
+    X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) X(vkDeviceWaitIdle) X(vkGetFenceStatus) \
+    X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) \
+    X(vkCmdCopyImageToBuffer) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) \
+    X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 namespace {
 
@@ -399,28 +404,57 @@ struct Pipeline {
     VkShaderModule module = VK_NULL_HANDLE;
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;  // a shader without specialization constants
     uint32_t bindings = 0;
+    // A shader with specialization constants (SpecId) is compiled for each
+    // set of push constants its passes use (constant k: word k).
+    bool specialized = false;
+    std::vector<std::pair<std::vector<uint32_t>, VkPipeline>> versions;
+    uint32_t readOnly = 0;  // the bindings it only reads (NonWritable), a bit each
 };
+
+enum { kMaxSlots = 16 };
 
 struct Pass {
     int shader;
+    VkPipeline pipeline;  // the shader's, for this pass's push constants
     VkDescriptorSet set;
+    // Passes that read the frames, where they read them from the frame
+    // slots' staging buffers (vv_context::direct): a set for each slot.
+    bool perSlot;
+    VkDescriptorSet slotSets[kMaxSlots];
     uint32_t constants[32];
     uint32_t constantBytes;
     uint32_t groups[3];
+    // Its buffers, and its dependency level in its list: one more than the
+    // highest of the earlier passes it shares a buffer with (vv_context::
+    // shares). The passes of a level run with no barrier between them.
+    const Buffer *bound[9];  // kMaxBindings
+    uint32_t boundCount;
+    uint32_t level;
 };
 
 struct Slot {
     Buffer staging, result;
+    Buffer stagingDis;  // vv_context::direct: the distorted's plane (staging: the reference's)
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool busy = false;
     bool scored = false;
     unsigned index = 0;
+    // Timing tests: what each timestamp of this slot's commands follows
+    // (a shader, or kShaderCount: the frames' copies, + 1: the sums' copy).
+    int stamped[64] = {};
+    uint32_t stamps = 0;
 };
 
 enum { kPushBytes = 128, kMaxBindings = 9 };
+// vif_fused.slang's tile rows (TH) at each scale: the build script's TH
+// defines. Its tiles are 160 pixels wide.
+const uint32_t kVifTileRows[4] = { 2, 2, 2, 2 };
+static_assert(kMaxBindings <= sizeof(Pass::bound) / sizeof(Pass::bound[0]), "Pass::bound holds a pass's buffers");
+// adm_dcm.slang's tile of contrast masking's positions (its TX x TY).
+const int kDcmTile[2] = { 16, 8 };
 
 // VMAF v1's options for ADM3 and motion3 (the model's feature_opts_dicts).
 struct V1Options {
@@ -460,7 +494,19 @@ struct vv_context {
     int skip = 0;  // timing tests: 1 = no motion, 2 = no VIF, 4 = no ADM
     int passLimit = 0;  // timing tests: only the first N scored passes
     int decoupleVariant = 0;  // adm_decouple_0's VARIANT (shaders/adm_decouple.slang)
+    // VIF's two passes as one (vif_fused); VV_VIF_FUSED=0 for the two, to compare.
+    bool vifFused = true;
+    // The GPU has subgroup arithmetic (Vulkan 1.1's, optional): motion adds
+    // up its groups' distances with it (motion_8w, _16w), as vif_fused its sums.
+    bool subgroupSums = true;
     uint32_t strideBytes = 0, planeBytes = 0;
+    // The first passes read each pair's frames where they were written (the
+    // frame slot's staging buffers: the reference's in staging, the
+    // distorted's in stagingDis), not from picRef and picDis after a copy:
+    // on integrated GPUs, but for VMAF v1 and frames from a decoder's CUDA
+    // (shared).
+    // VV_DIRECT_FRAMES=0 for the copy, to compare.
+    bool direct = true;
     // The frames' luma planes come from another API on this GPU (a decoder's
     // CUDA, or its own Vulkan device), which writes them into the slots'
     // staging buffers: GPU memory it imports by the handles vv_export gives,
@@ -469,11 +515,51 @@ struct vv_context {
     bool shared = false;
     PFN_vkGetMemoryWin32HandleKHR getMemoryHandle = nullptr;
     uint8_t deviceUuid[VK_UUID_SIZE] = {}, driverUuid[VK_UUID_SIZE] = {};
+    // Or a decoder on this GPU writes them into Direct3D 11 textures, which
+    // the context imports (vv_import_texture) and copies from on the GPU
+    // (vv_commit_textures): the frames never leave the GPU's memory.
+    struct Imported {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+    };
+    std::vector<Imported> imported;
+    PFN_vkGetMemoryWin32HandlePropertiesKHR getHandleProperties = nullptr;
+    int pendingTextures[2] = { -1, -1 };
+    int import_texture(void *handle, int *index);
+    int commit_textures(int ref, int dis, bool score);
+    unsigned completed();
+    // The SIMD width each shader is compiled for (VK_EXT_subgroup_size_control:
+    // 8, 16 or 32 lanes on Intel's GPUs), 0 for the driver's choice.
+    uint32_t subgroupSizes[kShaderCount] = {};
+    bool subgroupSizeControl = false;
 
     Pipeline pipelines[kShaderCount];
     std::vector<Buffer *> buffers;
     Buffer picRef, picDis, blur[2], vifTmp, rdRef[2], rdDis[2], logTable, divTable;
-    Buffer bandsRef[2], bandsDis[2], admR, admA, admF, acc;
+    // ADM's band images by scale parity: h, v, d (bandsRef, bandsDis) and a
+    // (bandsARef, bandsADis), as common.slang's adm_hvd describes.
+    Buffer bandsRef[2], bandsDis[2], bandsARef[2], bandsADis[2], admR, admA, admF, acc;
+    // VMAF NEG's decoupled images, made beside VMAF's by one pass (adm_decouple's
+    // BOTH); VV_ADM_BOTH=0 for a pass each, to compare.
+    Buffer admRB, admAB, admFB;
+    bool admBoth = true;
+    // ADM's decouple and both limits' contrast masking as one pass a scale
+    // (shaders/adm_dcm.slang), each row's masking sums in admRows until
+    // adm_rows.slang rounds them: all but VMAF v1, the decouple variants and
+    // pass-limited (diagnosis) runs. VV_ADM_FUSED=0 for the separate passes.
+    // A buffer a scale: a scale's masking need not wait for the scale
+    // before's rounding.
+    Buffer admRows[kScales];
+    bool admFused = true;
+    // The GPU reads 16-bit integers from storage buffers (storageBuffer16BitAccess
+    // and shaderInt16, both enabled): VIF scale 0 reads 16-bit samples so
+    // (vif_fused_0_16s; Core Ultra 9 285K's iGPU, 4K: 7.63 -> 7.46 ms), and
+    // ADM scale 0's transform stores a so (adm_dwt_0_8a, _16a).
+    bool samples16 = false;
+    // And 8-bit integers (VK_KHR_8bit_storage's storageBuffer8BitAccess,
+    // VK_KHR_shader_float16_int8's shaderInt8): VIF scale 0 reads 8-bit
+    // samples so (vif_fused_0_8s).
+    bool samples8 = false;
 
     std::vector<Pass> motion[2];  // by frame parity
     std::vector<Pass> scored;     // VIF and ADM
@@ -484,11 +570,30 @@ struct vv_context {
     std::vector<FrameSums> sums;
     bool failed = false;
 
+    // Timing tests (VV_GPU_TIME=<file>): each pair's time on the GPU, from
+    // timestamps around its commands, added up and appended to the file
+    // when the context closes, with the time from the first pair's start to
+    // the last one's end (the difference: the GPU idle between pairs).
+    VkQueryPool timePool = VK_NULL_HANDLE;
+    std::string timeFile;
+    std::string statsFile;  // VV_PIPELINE_STATS
+    double timestampNs = 0, gpuNs = 0;
+    uint64_t firstStart = 0, lastEnd = 0;
+    unsigned timed = 0;
+    double passNs[kShaderCount + 2] = {};
+    static constexpr uint32_t kStamps = 64;
+
     ~vv_context();
     int init(int deviceIndex, int width, int height, int bitDepth, int flags);
-    int create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported = false);
+    int create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported = false,
+                      bool writeOnly = false);
     void destroy_last_buffer(Buffer &buffer);
-    int create_pipeline(int shader, uint32_t bindings);
+    VkPipeline find_pipeline(int shader, const std::vector<uint32_t> &words) const;
+    VkResult compile_pipeline(int shader, const std::vector<uint32_t> &words, VkPipeline *out) const;
+    int compile_pipelines();
+    int make_layouts(int shader, uint32_t bindings);
+    void write_pipeline_stats(const char *name, VkPipeline pipeline);
+    bool shares(const Pass &a, const Pass &b) const;
     int add_pass(std::vector<Pass> &list, int shader, std::initializer_list<Buffer *> bound,
                  const void *constants, uint32_t constantBytes, uint32_t gx, uint32_t gy);
     int upload(Buffer &target, const void *data, size_t bytes);
@@ -506,6 +611,26 @@ vv_context::~vv_context()
     if (!device)
         return;
     vk.vkDeviceWaitIdle(device);
+    if (timePool) {
+        for (Slot &slot : slots)
+            collect(slot);
+        if (FILE *file = fopen(timeFile.c_str(), "a")) {
+            const double span = lastEnd > firstStart ? (double)(lastEnd - firstStart) * timestampNs : 0;
+            fprintf(file, "%dx%d %u pairs: %.3f ms a pair on the GPU, %.3f ms a pair from first to last, busy %.1f%%\n",
+                    w, h, timed, timed ? gpuNs / timed / 1e6 : 0.0, timed ? span / timed / 1e6 : 0.0,
+                    span > 0 ? 100.0 * gpuNs / span : 0.0);
+            std::vector<int> order;
+            for (int i = 0; i < kShaderCount + 2; ++i)
+                if (passNs[i] > 0)
+                    order.push_back(i);
+            std::sort(order.begin(), order.end(), [&](int a, int b) { return passNs[a] > passNs[b]; });
+            for (int i : order)
+                fprintf(file, "    %8.3f ms  %s\n", timed ? passNs[i] / timed / 1e6 : 0.0,
+                        i < kShaderCount ? kShaders[i].name : i == kShaderCount ? "(frames in)" : "(sums out)");
+            fclose(file);
+        }
+        vk.vkDestroyQueryPool(device, timePool, nullptr);
+    }
     for (Slot &slot : slots) {
         if (slot.fence)
             vk.vkDestroyFence(device, slot.fence, nullptr);
@@ -516,8 +641,14 @@ vv_context::~vv_context()
         if (buffer->memory)
             vk.vkFreeMemory(device, buffer->memory, nullptr);
     }
+    for (Imported &texture : imported) {
+        if (texture.image) vk.vkDestroyImage(device, texture.image, nullptr);
+        if (texture.memory) vk.vkFreeMemory(device, texture.memory, nullptr);
+    }
     for (Pipeline &pipeline : pipelines) {
         if (pipeline.pipeline) vk.vkDestroyPipeline(device, pipeline.pipeline, nullptr);
+        for (const auto &version : pipeline.versions)
+            vk.vkDestroyPipeline(device, version.second, nullptr);
         if (pipeline.layout) vk.vkDestroyPipelineLayout(device, pipeline.layout, nullptr);
         if (pipeline.setLayout) vk.vkDestroyDescriptorSetLayout(device, pipeline.setLayout, nullptr);
         if (pipeline.module) vk.vkDestroyShaderModule(device, pipeline.module, nullptr);
@@ -527,7 +658,7 @@ vv_context::~vv_context()
     vk.vkDestroyDevice(device, nullptr);
 }
 
-int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported)
+int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported, bool writeOnly)
 {
     buffers.push_back(&buffer);
     buffer.size = (size + 3) & ~VkDeviceSize(3);
@@ -544,17 +675,24 @@ int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisibl
         return fail(-1, "vkCreateBuffer failed");
     VkMemoryRequirements requirements;
     vk.vkGetBufferMemoryRequirements(device, buffer.buffer, &requirements);
-    // Host memory: cached if there is such a type (results are read back).
+    // Host memory: cached if there is such a type, as results are read back;
+    // but memory the CPU only writes (writeOnly: the frames' staging) not, if
+    // there is such a type: the GPU reads uncached memory faster (Core Ultra 9
+    // 285K's iGPU, reading the frames from it: 4K 15.66 -> 15.56 ms a pair,
+    // 1080p 4.17 -> 4.15), and the CPU writes it as fast.
     const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkMemoryPropertyFlags cached = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     const VkMemoryPropertyFlags wanted[3] = {
-        hostVisible ? visible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        hostVisible ? (writeOnly ? visible : visible | cached) : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         hostVisible ? visible : VkMemoryPropertyFlags(0), VkMemoryPropertyFlags(0)
     };
+    const VkMemoryPropertyFlags unwanted[3] = { hostVisible && writeOnly ? cached : 0, 0, 0 };
     int type = -1;
     for (int attempt = 0; attempt < (hostVisible ? 2 : 3) && type < 0; ++attempt) {
         for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
             if ((requirements.memoryTypeBits & (1u << i)) &&
-                (memoryProperties.memoryTypes[i].propertyFlags & wanted[attempt]) == wanted[attempt]) {
+                (memoryProperties.memoryTypes[i].propertyFlags & wanted[attempt]) == wanted[attempt] &&
+                !(memoryProperties.memoryTypes[i].propertyFlags & unwanted[attempt])) {
                 type = (int)i;
                 break;
             }
@@ -599,12 +737,124 @@ void vv_context::destroy_last_buffer(Buffer &buffer)
     buffers.pop_back();
 }
 
-int vv_context::create_pipeline(int shader, uint32_t bindings)
+// The pipeline made for `shader` and these push constants (a specialized
+// shader's for exactly these; another's for any), or none yet.
+VkPipeline vv_context::find_pipeline(int shader, const std::vector<uint32_t> &words) const
+{
+    const Pipeline &pipeline = pipelines[shader];
+    if (!pipeline.specialized)
+        return pipeline.pipeline;
+    for (const auto &version : pipeline.versions)
+        if (version.first == words)
+            return version.second;
+    return VK_NULL_HANDLE;
+}
+
+// Compiles `shader` for these push constants (its specialization constants,
+// constant k: word k, where it has any). Touches nothing of the context's:
+// called from several threads at once.
+VkResult vv_context::compile_pipeline(int shader, const std::vector<uint32_t> &words, VkPipeline *out) const
+{
+    const Pipeline &pipeline = pipelines[shader];
+    VkComputePipelineCreateInfo info = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    info.stage.module = pipeline.module;
+    info.stage.pName = "main";
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT required = {
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT };
+    if (subgroupSizeControl && subgroupSizes[shader]) {
+        required.requiredSubgroupSize = subgroupSizes[shader];
+        info.stage.pNext = &required;
+    }
+    std::vector<VkSpecializationMapEntry> entries(words.size());
+    for (uint32_t k = 0; k < (uint32_t)words.size(); ++k)
+        entries[k] = { k, 4 * k, 4 };
+    const VkSpecializationInfo specialization = { (uint32_t)words.size(), entries.data(), words.size() * 4,
+                                                  words.data() };
+    if (pipeline.specialized)
+        info.stage.pSpecializationInfo = &specialization;
+    info.layout = pipeline.layout;
+    if (!statsFile.empty())
+        info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+    return vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, out);
+}
+
+// Every pass's pipeline: those not made yet compiled at once, a thread each
+// (the driver compiles on the calling thread, and a specialized shader anew
+// for each size of picture it meets), then given to the passes.
+int vv_context::compile_pipelines()
+{
+    struct Job { int shader; std::vector<uint32_t> words; VkPipeline made = VK_NULL_HANDLE; VkResult result = VK_SUCCESS; };
+    std::vector<Job> jobs;
+    std::vector<Pass *> passes;
+    for (std::vector<Pass> *list : { &motion[0], &motion[1], &scored })
+        for (Pass &pass : *list)
+            passes.push_back(&pass);
+    auto words_of = [&](const Pass &pass) {
+        return pipelines[pass.shader].specialized
+            ? std::vector<uint32_t>(pass.constants, pass.constants + pass.constantBytes / 4) : std::vector<uint32_t>();
+    };
+    for (const Pass *pass : passes) {
+        const std::vector<uint32_t> words = words_of(*pass);
+        if (find_pipeline(pass->shader, words))
+            continue;
+        bool queued = false;
+        for (const Job &job : jobs)
+            queued = queued || (job.shader == pass->shader && job.words == words);
+        if (!queued)
+            jobs.push_back({ pass->shader, words });
+    }
+    std::vector<std::thread> threads;
+    for (Job &job : jobs)
+        threads.emplace_back([this, &job] { job.result = compile_pipeline(job.shader, job.words, &job.made); });
+    for (std::thread &thread : threads)
+        thread.join();
+    int error = 0;
+    for (Job &job : jobs) {
+        Pipeline &pipeline = pipelines[job.shader];
+        if (job.result != VK_SUCCESS) {
+            if (!error)
+                error = fail(-1, std::string("the GPU driver could not compile the shader ") + kShaders[job.shader].name);
+            continue;
+        }
+        if (pipeline.specialized)
+            pipeline.versions.emplace_back(job.words, job.made);
+        else
+            pipeline.pipeline = job.made;
+        if (!statsFile.empty())
+            write_pipeline_stats(kShaders[job.shader].name, job.made);
+    }
+    for (Pass *pass : passes)
+        pass->pipeline = find_pipeline(pass->shader, words_of(*pass));
+    return error;
+}
+
+// The shader's module and layouts, and whether it has specialization
+// constants: a SpecId decoration (OpDecorate, opcode 71, four words,
+// decoration 1) anywhere in it.
+int vv_context::make_layouts(int shader, uint32_t bindings)
 {
     Pipeline &pipeline = pipelines[shader];
-    if (pipeline.pipeline)
-        return 0;
     pipeline.bindings = bindings;
+    // And the bindings it only reads: variables decorated NonWritable (24)
+    // and Binding (33), by their ids.
+    const uint32_t *code = kShaders[shader].code;
+    std::vector<std::pair<uint32_t, uint32_t>> bindingOf;  // id, binding
+    std::vector<uint32_t> nonWritable;
+    for (size_t at = 5; at < kShaders[shader].bytes / 4;) {
+        const uint32_t length = code[at] >> 16, opcode = code[at] & 0xFFFF;
+        if (opcode == 71 && length == 4 && code[at + 2] == 1)
+            pipeline.specialized = true;
+        if (opcode == 71 && length == 4 && code[at + 2] == 33)
+            bindingOf.emplace_back(code[at + 1], code[at + 3]);
+        if (opcode == 71 && length == 3 && code[at + 2] == 24)
+            nonWritable.push_back(code[at + 1]);
+        at += length ? length : 1;
+    }
+    for (const auto &[id, binding] : bindingOf)
+        if (binding < 32 && std::find(nonWritable.begin(), nonWritable.end(), id) != nonWritable.end())
+            pipeline.readOnly |= 1u << binding;
     VkShaderModuleCreateInfo module = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
     module.codeSize = kShaders[shader].bytes;
     module.pCode = kShaders[shader].code;
@@ -630,22 +880,80 @@ int vv_context::create_pipeline(int shader, uint32_t bindings)
     layout.pPushConstantRanges = &range;
     if (vk.vkCreatePipelineLayout(device, &layout, nullptr, &pipeline.layout) != VK_SUCCESS)
         return fail(-1, "vkCreatePipelineLayout failed");
-    VkComputePipelineCreateInfo info = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    info.stage.module = pipeline.module;
-    info.stage.pName = "main";
-    info.layout = pipeline.layout;
-    if (vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline.pipeline) != VK_SUCCESS)
-        return fail(-1, std::string("the GPU driver could not compile the shader ") + kShaders[shader].name);
     return 0;
+}
+
+void vv_context::write_pipeline_stats(const char *name, VkPipeline pipeline)
+{
+    auto properties = (PFN_vkGetPipelineExecutablePropertiesKHR)api->vkGetDeviceProcAddr(
+        device, "vkGetPipelineExecutablePropertiesKHR");
+    auto statistics = (PFN_vkGetPipelineExecutableStatisticsKHR)api->vkGetDeviceProcAddr(
+        device, "vkGetPipelineExecutableStatisticsKHR");
+    FILE *file = fopen(statsFile.c_str(), "a");
+    if (!properties || !statistics || !file) {
+        if (file) fclose(file);
+        return;
+    }
+    VkPipelineInfoKHR info = { VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR };
+    info.pipeline = pipeline;
+    uint32_t count = 0;
+    properties(device, &info, &count, nullptr);
+    std::vector<VkPipelineExecutablePropertiesKHR> executables(count, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR });
+    properties(device, &info, &count, executables.data());
+    for (uint32_t i = 0; i < count; ++i) {
+        fprintf(file, "%s [%s] subgroup %u:", name, executables[i].name, executables[i].subgroupSize);
+        VkPipelineExecutableInfoKHR executable = { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR };
+        executable.pipeline = pipeline;
+        executable.executableIndex = i;
+        uint32_t n = 0;
+        statistics(device, &executable, &n, nullptr);
+        std::vector<VkPipelineExecutableStatisticKHR> values(n, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR });
+        statistics(device, &executable, &n, values.data());
+        for (const VkPipelineExecutableStatisticKHR &value : values) {
+            fprintf(file, " | %s=", value.name);
+            switch (value.format) {
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: fprintf(file, "%u", value.value.b32); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: fprintf(file, "%lld", (long long)value.value.i64); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: fprintf(file, "%llu", (unsigned long long)value.value.u64); break;
+            default: fprintf(file, "%g", value.value.f64); break;
+            }
+        }
+        fprintf(file, "\n");
+        // And what the driver shows of the compiled code (its internal
+        // representations), each in a file of its own beside statsFile.
+        auto representations = (PFN_vkGetPipelineExecutableInternalRepresentationsKHR)api->vkGetDeviceProcAddr(
+            device, "vkGetPipelineExecutableInternalRepresentationsKHR");
+        uint32_t m = 0;
+        if (representations && representations(device, &executable, &m, nullptr) == VK_SUCCESS && m) {
+            std::vector<VkPipelineExecutableInternalRepresentationKHR> texts(
+                m, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR });
+            representations(device, &executable, &m, texts.data());
+            std::vector<std::vector<char>> data(m);
+            for (uint32_t k = 0; k < m; ++k) {
+                data[k].resize(texts[k].dataSize + 1);
+                texts[k].pData = data[k].data();
+            }
+            representations(device, &executable, &m, texts.data());
+            for (uint32_t k = 0; k < m; ++k) {
+                const std::string path = statsFile + "." + name + "." + std::to_string(k) + ".txt";
+                if (FILE *out = fopen(path.c_str(), "wb")) {
+                    fprintf(out, "%s: %s\n", texts[k].name, texts[k].description);
+                    fwrite(data[k].data(), 1, texts[k].dataSize, out);
+                    fclose(out);
+                }
+            }
+        }
+    }
+    fclose(file);
 }
 
 int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_list<Buffer *> bound,
                          const void *constants, uint32_t constantBytes, uint32_t gx, uint32_t gy)
 {
-    if (int error = create_pipeline(shader, (uint32_t)bound.size()))
-        return error;
+    if (!pipelines[shader].module) {  // its pipeline compiled by compile_pipelines, once every pass is in
+        if (int error = make_layouts(shader, (uint32_t)bound.size()))
+            return error;
+    }
     Pass pass = {};
     pass.shader = shader;
     VkDescriptorSetAllocateInfo allocate = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
@@ -668,13 +976,58 @@ int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_l
         ++count;
     }
     vk.vkUpdateDescriptorSets(device, count, writes, 0, nullptr);
+    for (Buffer *buffer : bound)
+        pass.perSlot = pass.perSlot || (direct && (buffer == &picRef || buffer == &picDis));
+    for (size_t i = 0; pass.perSlot && i < slots.size(); ++i) {
+        if (vk.vkAllocateDescriptorSets(device, &allocate, &pass.slotSets[i]) != VK_SUCCESS)
+            return fail(-1, "vkAllocateDescriptorSets failed");
+        for (uint32_t b = 0; b < count; ++b) {
+            Buffer *buffer = bound.begin()[b];
+            infos[b].buffer = buffer == &picRef ? slots[i].staging.buffer
+                              : buffer == &picDis ? slots[i].stagingDis.buffer : buffer->buffer;
+            writes[b].dstSet = pass.slotSets[i];
+        }
+        vk.vkUpdateDescriptorSets(device, count, writes, 0, nullptr);
+    }
     memcpy(pass.constants, constants, constantBytes);
     pass.constantBytes = constantBytes;
     pass.groups[0] = gx;
     pass.groups[1] = gy;
     pass.groups[2] = 1;
+    for (Buffer *buffer : bound)
+        pass.bound[pass.boundCount++] = buffer;
+    for (const Pass &earlier : list)
+        if (shares(earlier, pass))
+            pass.level = std::max(pass.level, earlier.level + 1);
     list.push_back(pass);
     return 0;
+}
+
+// Whether two passes must not overlap: a buffer bound to both that either
+// writes (binds where its shader does not mark the binding NonWritable), but
+// the pictures and the division and logarithm tables, which passes only
+// read, and acc, which they only add to atomically (acc_add64). Two passes
+// that only read a buffer overlap (ADM's CSF denominator and masking of a
+// scale).
+bool vv_context::shares(const Pass &a, const Pass &b) const
+{
+    auto writes = [&](const Pass &pass, const Buffer *buffer) {
+        for (uint32_t i = 0; i < pass.boundCount; ++i)
+            if (pass.bound[i] == buffer && !((pipelines[pass.shader].readOnly >> i) & 1u))
+                return true;
+        return false;
+    };
+    for (uint32_t i = 0; i < a.boundCount; ++i) {
+        const Buffer *buffer = a.bound[i];
+        if (buffer == &picRef || buffer == &picDis || buffer == &divTable || buffer == &logTable || buffer == &acc)
+            continue;
+        bool both = false;
+        for (uint32_t j = 0; j < b.boundCount; ++j)
+            both = both || b.bound[j] == buffer;
+        if (both && (writes(a, buffer) || writes(b, buffer)))
+            return true;
+    }
+    return false;
 }
 
 namespace {
@@ -734,9 +1087,11 @@ int vv_context::build_passes()
     // Motion (integer_motion_cuda.c: calculate_motion_score).
     for (int parity = 0; parity < 2 && !error && !(skip & 1); ++parity) {
         const int32_t constants[] = { w, h, strideWords, bpc, 1 << (bpc - 1), kSlotSad };
-        error = add_pass(motion[parity], deep ? kShader_motion_16 : kShader_motion_8,
+        const int shader = subgroupSums ? (deep ? kShader_motion_16w : kShader_motion_8w)
+                                        : (deep ? kShader_motion_16 : kShader_motion_8);
+        error = add_pass(motion[parity], shader,
                          { &picRef, &blur[parity], &blur[1 - parity], &acc }, constants, sizeof constants,
-                         groups(w, 16), groups(h, 16));
+                         groups(w, 64), groups(h, 8));
     }
 
     // VIF (integer_vif_cuda.c: filter1d_8, filter1d_16).
@@ -759,6 +1114,22 @@ int vv_context::build_passes()
             Buffer *inRef = scale == 0 ? &picRef : &rdRef[(scale - 1) % 2];
             Buffer *inDis = scale == 0 ? &picDis : &rdDis[(scale - 1) % 2];
             const int nextStride = (sw + 1) / 2;
+            if (vifFused && !nativeDouble) {
+                // Both passes in one, the vertical pass's results in group
+                // memory (shaders/vif_fused.slang).
+                const uint32_t fused[] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)sourceStride,
+                                           shiftVP, addVP, shiftSq, addSq, (uint32_t)nextStride,
+                                           (uint32_t)(kSlotVif + scale * kVifSums),
+                                           (uint32_t)epsilon, (uint32_t)(epsilon >> 32) };
+                // 16-bit samples read as such where the GPU can (samples16).
+                const int shader = scale == 0 ? (!deep ? (samples8 ? kShader_vif_fused_0_8s : kShader_vif_fused_0_8)
+                                                 : samples16 ? kShader_vif_fused_0_16s : kShader_vif_fused_0_16)
+                                              : kShader_vif_fused_1 + (scale - 1);
+                error = add_pass(scored, shader, { inRef, inDis, &rdRef[scale % 2], &rdDis[scale % 2], &acc, &logTable },
+                                 fused, sizeof fused, groups(sw, 160), groups(sh, kVifTileRows[scale]));  // its TW x TH tiles
+                sourceStride = nextStride;
+                continue;
+            }
             const uint32_t vertical[] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)sourceStride,
                                           shiftVP, addVP, shiftSq, addSq };
             const int verticalShader = scale == 0 ? (deep ? kShader_vif_vert_0_16 : kShader_vif_vert_0_8)
@@ -768,7 +1139,7 @@ int vv_context::build_passes()
             if (error)
                 break;
             const uint32_t horizontal[] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)nextStride,
-                                            (uint32_t)(kSlotVif + scale * kVifSums), 100, 1,
+                                            (uint32_t)(kSlotVif + scale * kVifSums),
                                             (uint32_t)epsilon, (uint32_t)(epsilon >> 32) };
             const int horizontalShader = (nativeDouble ? kShader_vif_hori_native_0 : kShader_vif_hori_0) + scale;
             error = add_pass(scored, horizontalShader,
@@ -784,20 +1155,26 @@ int vv_context::build_passes()
     int inW = w, inH = h, inStride = strideWords;
     for (int scale = 0; scale < kScales && !error && !(skip & 4); ++scale) {
         const int set = scale % 2;
-        Buffer *inRef = scale == 0 ? &picRef : &bandsRef[1 - set];
-        Buffer *inDis = scale == 0 ? &picDis : &bandsDis[1 - set];
+        Buffer *inRef = scale == 0 ? &picRef : &bandsARef[1 - set];
+        Buffer *inDis = scale == 0 ? &picDis : &bandsADis[1 - set];
         const int bw = (inW + 1) / 2, bh = (inH + 1) / 2;
         const int bandStride = set == 0 ? (w + 1) / 2 : ((w + 1) / 2 + 1) / 2;
         const int outStride = (w + 1) / 2;  // of admR, admA, admF
+        const int aStride0 = ((w + 1) / 2 + 1) & ~1;  // scale 0's a, two a word (adm_dwt)
 
         {   // dwt2_8_device / adm_dwt2_16_device / adm_dwt2_s123_combined_device
             static const int kV[4][2] = { { 0, 0 }, { 0, 0 }, { 16, 32768 }, { 16, 32768 } };
             static const int kH[4][2] = { { 16, 32768 }, { 15, 16384 }, { 16, 32768 }, { 15, 16384 } };
             const int32_t constants[] = { inW, inH, inStride, bandStride,
                                           scale == 0 ? bpc : kV[scale][0], scale == 0 ? 1 << (bpc - 1) : kV[scale][1],
-                                          kH[scale][0], kH[scale][1] };
-            const int shader = scale == 0 ? (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8) : kShader_adm_dwt;
-            error = add_pass(scored, shader, { inRef, inDis, &bandsRef[set], &bandsDis[set] }, constants,
+                                          kH[scale][0], kH[scale][1], aStride0 };
+            // Scales 1-3: a shader each, with these shifts (kV, kH) built in. Scale 0
+            // stores a as 16-bit values where the GPU can (samples16).
+            const int shader = scale != 0 ? kShader_adm_dwt_1 + (scale - 1)
+                               : samples16 ? (deep ? kShader_adm_dwt_0_16a : kShader_adm_dwt_0_8a)
+                                           : (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8);
+            error = add_pass(scored, shader, { inRef, inDis, &bandsRef[set], &bandsDis[set], &bandsARef[set],
+                                               &bandsADis[set] }, constants,
                              sizeof constants, groups(bw, 16), groups(bh, 8));
             if (error)
                 break;
@@ -830,8 +1207,55 @@ int vv_context::build_passes()
             if (error)
                 break;
         }
+        if (admFused) {  // adm_decouple and adm_cm below, in one pass, then the rows' rounding
+            int left = bw * (float)(ADM_BORDER_FACTOR) - 0.5f;
+            int top = bh * (float)(ADM_BORDER_FACTOR) - 0.5f;
+            int right = bw - left;
+            int bottom = bh - top;
+            int start_col, end_col, start_row, end_row;
+            if (scale == 0) {
+                start_col = std::max(0, left);
+                end_col = std::min(right, bw);
+                start_row = std::max(0, top);
+                end_row = std::min(bottom, bh);
+            } else {
+                start_col = (left > 1) ? left : ((left <= 0) ? 0 : 1);
+                end_col = (right < (bw - 1)) ? right : ((right > (bw - 1)) ? bw : bw - 1);
+                start_row = (top > 1) ? top : ((top <= 0) ? 0 : 1);
+                end_row = (bottom < (bh - 1)) ? bottom : ((bottom > (bh - 1)) ? bh : bh - 1);
+            }
+            const int rows = std::max(0, end_row - start_row);
+            // The gain limits (100, 1) and the shifts but shiftCub are adm_dcm's own.
+            static const int fixed_shift[3] = { 4, 4, 3 };
+            struct {
+                int32_t w, h, inStride, startRow, endRow, startCol, endCol;
+                uint32_t rfactor[3];
+                int32_t shiftCub[3];
+                uint32_t rowSlot;
+            } constants = {};
+            constants.w = bw;
+            constants.h = bh;
+            constants.inStride = bandStride;
+            constants.startRow = start_row;
+            constants.endRow = start_row + rows;
+            constants.startCol = start_col;
+            constants.endCol = std::max(start_col, end_col);
+            for (int band = 0; band < 3; ++band) {
+                constants.rfactor[band] = i_rfactor[scale * 3 + band];
+                const double shift = scale == 0 ? ceil(log2((double)bw) - fixed_shift[band]) : ceil(log2((double)bw));
+                constants.shiftCub[band] = shift > 0 ? (int32_t)shift : 0;
+            }
+            constants.rowSlot = 0;  // admRows[scale]'s first
+            error = add_pass(scored, scale == 0 ? kShader_adm_dcm_0 : kShader_adm_dcm,
+                             { &bandsRef[set], &bandsDis[set], &divTable, &admRows[scale] }, &constants, sizeof constants,
+                             groups(constants.endCol - start_col, kDcmTile[0]), groups(rows, kDcmTile[1]));
+            const uint32_t finish[] = { (uint32_t)rows, (uint32_t)ceil_log2(bh), 0,
+                                        (uint32_t)(kSlotCm + scale * 3), (uint32_t)(kScales * 3) };
+            if (!error)
+                error = add_pass(scored, kShader_adm_rows, { &admRows[scale], &acc }, finish, sizeof finish, 6, 1);
+        }
         // The enhancement gain limit: 100 (VMAF), then 1 (VMAF NEG).
-        for (int limit = 0; limit < 2 && !error; ++limit) {
+        for (int limit = 0; limit < 2 && !error && !admFused; ++limit) {
             {   // adm_decouple_device / adm_decouple_s123_device, adm_csf_device / i4_adm_csf_device
                 int left = bw * (float)(ADM_BORDER_FACTOR) - 0.5f - 1;
                 int top = bh * (float)(ADM_BORDER_FACTOR) - 0.5f - 1;
@@ -841,15 +1265,28 @@ int vv_context::build_passes()
                 if (right > bw) right = bw;
                 if (top < 0) top = 0;
                 if (bottom > bh) bottom = bh;
-                const uint32_t constants[] = { (uint32_t)top, (uint32_t)bottom, (uint32_t)left, (uint32_t)right,
-                                               (uint32_t)bandStride, (uint32_t)outStride,
-                                               limit == 0 ? 100u : 1u,
-                                               i_rfactor[scale * 3], i_rfactor[scale * 3 + 1], i_rfactor[scale * 3 + 2] };
-                const int decouple0 = decoupleVariant ? kShader_adm_decouple_0_v1 + decoupleVariant - 1
-                                                      : kShader_adm_decouple_0;
-                error = add_pass(scored, scale == 0 ? decouple0 : kShader_adm_decouple,
-                                 { &bandsRef[set], &bandsDis[set], &admR, &admA, &admF, &divTable }, constants,
-                                 sizeof constants, groups(right - left, 16), groups(bottom - top, 8));
+                const bool both = admBoth && !decoupleVariant;
+                if (both && limit == 0) {
+                    const uint32_t constants[] = { (uint32_t)top, (uint32_t)bottom, (uint32_t)left, (uint32_t)right,
+                                                   (uint32_t)bandStride, (uint32_t)outStride, 100u, 1u,
+                                                   i_rfactor[scale * 3], i_rfactor[scale * 3 + 1],
+                                                   i_rfactor[scale * 3 + 2] };
+                    error = add_pass(scored, scale == 0 ? kShader_adm_decouple_0_both : kShader_adm_decouple_both,
+                                     { &bandsRef[set], &bandsDis[set], &admR, &admA, &admF, &divTable,
+                                       &admRB, &admAB, &admFB },
+                                     constants, sizeof constants, groups(right - left, 16), groups(bottom - top, 8));
+                } else if (!both) {
+                    const uint32_t constants[] = { (uint32_t)top, (uint32_t)bottom, (uint32_t)left, (uint32_t)right,
+                                                   (uint32_t)bandStride, (uint32_t)outStride,
+                                                   limit == 0 ? 100u : 1u,
+                                                   i_rfactor[scale * 3], i_rfactor[scale * 3 + 1],
+                                                   i_rfactor[scale * 3 + 2] };
+                    const int decouple0 = decoupleVariant ? kShader_adm_decouple_0_v1 + decoupleVariant - 1
+                                                          : kShader_adm_decouple_0;
+                    error = add_pass(scored, scale == 0 ? decouple0 : kShader_adm_decouple,
+                                     { &bandsRef[set], &bandsDis[set], &admR, &admA, &admF, &divTable }, constants,
+                                     sizeof constants, groups(right - left, 16), groups(bottom - top, 8));
+                }
                 if (error)
                     break;
             }
@@ -897,14 +1334,16 @@ int vv_context::build_passes()
                 constants.shiftInner = ceil_log2(bh);
                 constants.addInner = constants.shiftInner ? 1 << (constants.shiftInner - 1) : 0;
                 constants.slot = (uint32_t)(kSlotCm + limit * kScales * 3 + scale * 3);
+                const bool fromB = admBoth && !decoupleVariant && limit == 1;
                 error = add_pass(scored, scale == 0 ? kShader_adm_cm_0 : kShader_adm_cm,
-                                 { &admR, &admA, &admF, &acc }, &constants, sizeof constants, 1,
+                                 { fromB ? &admRB : &admR, fromB ? &admAB : &admA, fromB ? &admFB : &admF, &acc },
+                                 &constants, sizeof constants, 1,
                                  (uint32_t)std::max(0, end_row - start_row));
             }
         }
         inW = bw;
         inH = bh;
-        inStride = bandStride;
+        inStride = scale == 0 ? aStride0 : bandStride;
     }
     return error;
 }
@@ -979,11 +1418,12 @@ int vv_context::build_passes_v1()
     int inW = w, inH = h, inStride = strideWords;
     for (int scale = 0; scale < kScales && !error; ++scale) {
         const int set = scale % 2;
-        Buffer *inRef = scale == 0 ? &picRef : &bandsRef[1 - set];
-        Buffer *inDis = scale == 0 ? &picDis : &bandsDis[1 - set];
+        Buffer *inRef = scale == 0 ? &picRef : &bandsARef[1 - set];
+        Buffer *inDis = scale == 0 ? &picDis : &bandsADis[1 - set];
         const int bw = (inW + 1) / 2, bh = (inH + 1) / 2;
         const int bandStride = set == 0 ? (w + 1) / 2 : ((w + 1) / 2 + 1) / 2;
         const int outStride = (w + 1) / 2;
+        const int aStride0 = ((w + 1) / 2 + 1) & ~1;  // scale 0's a, two a word (adm_dwt)
         if (!v1_rfactors(options, scale, rfactorV1[scale]))
             return fail(-3, "VMAF v1: no contrast sensitivity table for this viewing distance and display height");
         const float *rfactor = rfactorV1[scale];
@@ -1012,9 +1452,12 @@ int vv_context::build_passes_v1()
             static const int kH[4][2] = { { 16, 32768 }, { 15, 16384 }, { 16, 32768 }, { 15, 16384 } };
             const int32_t constants[] = { inW, inH, inStride, bandStride,
                                           scale == 0 ? bpc : kV[scale][0], scale == 0 ? 1 << (bpc - 1) : kV[scale][1],
-                                          kH[scale][0], kH[scale][1] };
-            const int shader = scale == 0 ? (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8) : kShader_adm_dwt;
-            error = add_pass(scored, shader, { inRef, inDis, &bandsRef[set], &bandsDis[set] }, constants,
+                                          kH[scale][0], kH[scale][1], aStride0 };
+            // Scales 1-3: a shader each, with these shifts (kV, kH) built in.
+            const int shader = scale == 0 ? (deep ? kShader_adm_dwt_0_16 : kShader_adm_dwt_0_8)
+                                          : kShader_adm_dwt_1 + (scale - 1);
+            error = add_pass(scored, shader, { inRef, inDis, &bandsRef[set], &bandsDis[set], &bandsARef[set],
+                                               &bandsADis[set] }, constants,
                              sizeof constants, groups(bw, 16), groups(bh, 8));
             if (error)
                 break;
@@ -1117,7 +1560,7 @@ int vv_context::build_passes_v1()
         }
         inW = bw;
         inH = bh;
-        inStride = bandStride;
+        inStride = scale == 0 ? aStride0 : bandStride;
     }
     return error;
 }
@@ -1248,18 +1691,95 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     skip = (flags >> 16) & 7;
     passLimit = (flags >> 20) & 0xFF;
     shared = (flags >> 19) & 1;
-    const char *extensions[] = { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME };
-    if (shared) {
-        uint32_t count = 0;
-        api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr);
-        std::vector<VkExtensionProperties> listed(count);
-        if (count)
-            api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, listed.data());
-        bool found = false;
-        for (uint32_t i = 0; i < count; ++i)
-            found = found || !strcmp(listed[i].extensionName, extensions[0]);
-        if (!found)
-            return fail(-4, deviceName + " cannot share its memory with a decoder");
+    uint32_t listedCount = 0;
+    api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &listedCount, nullptr);
+    std::vector<VkExtensionProperties> listed(listedCount);
+    if (listedCount)
+        api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &listedCount, listed.data());
+    auto has = [&](const char *name) {
+        for (const VkExtensionProperties &extension : listed)
+            if (!strcmp(extension.extensionName, name))
+                return true;
+        return false;
+    };
+    std::vector<const char *> extensions;
+    // Win32 external memory, where the driver has it: for frames from a
+    // decoder (shared, or Direct3D textures imported).
+    const bool externalMemory = has(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+    if (shared && !externalMemory)
+        return fail(-4, deviceName + " cannot share its memory with a decoder");
+    if (externalMemory)
+        extensions.push_back(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+    // The SIMD width per shader, where the GPU lets it be chosen.
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sizeControl = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT };
+    if (has(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME) && api->vkGetPhysicalDeviceFeatures2) {
+        VkPhysicalDeviceFeatures2 query = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        query.pNext = &sizeControl;
+        api->vkGetPhysicalDeviceFeatures2(physical, &query);
+        subgroupSizeControl = sizeControl.subgroupSizeControl == VK_TRUE;
+        if (subgroupSizeControl)
+            extensions.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+        sizeControl.computeFullSubgroups = VK_FALSE;
+        sizeControl.pNext = nullptr;
+    }
+    // Intel's GPUs run ADM's shaders fastest at 8 lanes (Core Ultra 9 285K's
+    // iGPU: ADM 2.97 -> 2.42 ms a 1080p pair), but the fused decouple and
+    // masking (adm_dcm) at 16 (0.64 -> 0.44 ms at scale 0), and so the CSF
+    // denominator's passes (4K: scale 0 0.213 -> 0.197 ms, 1-3 0.153 -> 0.140);
+    // the others at the driver's choice. Subgroup operations are only integer
+    // sums here (the same in any order): the width changes no sum.
+    if (subgroupSizeControl && properties.vendorID == 0x8086) {
+        for (int i = 0; i < kShaderCount; ++i) {
+            const char *name = kShaders[i].name;
+            if (!strncmp(name, "adm_", 4))
+                subgroupSizes[i] = !strncmp(name, "adm_dcm", 7) || !strcmp(name, "adm_csf_den_0")
+                                   || !strcmp(name, "adm_csf_den") ? 16 : 8;
+        }
+    }
+    if (const char *text = getenv("VV_ADM_FUSED"))
+        admFused = strcmp(text, "0") != 0;
+    if (const char *text = getenv("VV_DIRECT_FRAMES"))
+        direct = strcmp(text, "0") != 0;
+    // Only where the staging memory is the GPU's own (an integrated GPU): a
+    // discrete GPU's shaders would read it across PCIe -- an RTX 5090's 4K
+    // pair took 13.6 ms of GPU time that way against 1.5 with the copy.
+    direct = direct && !shared && !v1 && properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    if (const char *text = getenv("VV_VIF_FUSED"))
+        vifFused = strcmp(text, "0") != 0;
+    // vif_fused adds up its group's sums with subgroup arithmetic (Vulkan
+    // 1.1's, optional): without it, VIF's two passes.
+    {
+        VkPhysicalDeviceSubgroupProperties subgroup = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES };
+        VkPhysicalDeviceProperties2 query = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        query.pNext = &subgroup;
+        if (api->vkGetPhysicalDeviceProperties2)
+            api->vkGetPhysicalDeviceProperties2(physical, &query);
+        const VkSubgroupFeatureFlags needed = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
+        if (!(subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) || (subgroup.supportedOperations & needed) != needed)
+            vifFused = subgroupSums = false;
+    }
+    if (const char *text = getenv("VV_ADM_BOTH"))
+        admBoth = strcmp(text, "0") != 0;
+    // For experiments: VV_SUBGROUP="shader=16,shader=8" or "*=16".
+    if (const char *text = getenv("VV_SUBGROUP")) {
+        std::string spec = text;
+        size_t at = 0;
+        while (at < spec.size()) {
+            size_t end = spec.find(',', at);
+            std::string item = spec.substr(at, end == std::string::npos ? std::string::npos : end - at);
+            size_t equals = item.find('=');
+            if (equals != std::string::npos) {
+                std::string name = item.substr(0, equals);
+                uint32_t size = (uint32_t)atoi(item.c_str() + equals + 1);
+                for (int i = 0; i < kShaderCount; ++i)
+                    if (name == "*" || name == kShaders[i].name)
+                        subgroupSizes[i] = size;
+            }
+            if (end == std::string::npos)
+                break;
+            at = end + 1;
+        }
     }
     if (shared) {
         VkPhysicalDeviceIDProperties ids = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
@@ -1270,6 +1790,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         memcpy(driverUuid, ids.driverUUID, VK_UUID_SIZE);
     }
     decoupleVariant = (flags >> 28) & 7;
+    admFused = admFused && admBoth && !v1 && !decoupleVariant && !passLimit;
     api->vkGetPhysicalDeviceMemoryProperties(physical, &memoryProperties);
 
     uint32_t familyCount = 0;
@@ -1294,15 +1815,69 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     queueInfo.pQueuePriorities = &priority;
     VkPhysicalDeviceFeatures enabled = {};
     enabled.shaderInt64 = VK_TRUE;
+    VkPhysicalDevice16BitStorageFeatures storage16 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES };
+    if (api->vkGetPhysicalDeviceFeatures2) {
+        VkPhysicalDeviceFeatures2 query = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        query.pNext = &storage16;
+        api->vkGetPhysicalDeviceFeatures2(physical, &query);
+    }
+    samples16 = storage16.storageBuffer16BitAccess && features.shaderInt16;
+    if (const char *text = getenv("VV_SAMPLES16"))
+        samples16 = samples16 && strcmp(text, "0") != 0;
+    enabled.shaderInt16 = samples16 ? VK_TRUE : VK_FALSE;
+    storage16 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES };
+    storage16.storageBuffer16BitAccess = samples16 ? VK_TRUE : VK_FALSE;
     enabled.shaderFloat64 = nativeDouble ? VK_TRUE : VK_FALSE;
+    VkPhysicalDevice8BitStorageFeaturesKHR storage8 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR };
+    VkPhysicalDeviceShaderFloat16Int8FeaturesKHR int8 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR };
+    if (has(VK_KHR_8BIT_STORAGE_EXTENSION_NAME) && has(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME)
+        && api->vkGetPhysicalDeviceFeatures2) {
+        VkPhysicalDeviceFeatures2 query = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        storage8.pNext = &int8;
+        query.pNext = &storage8;
+        api->vkGetPhysicalDeviceFeatures2(physical, &query);
+    }
+    samples8 = storage8.storageBuffer8BitAccess && int8.shaderInt8;
+    if (const char *text = getenv("VV_SAMPLES8"))
+        samples8 = samples8 && strcmp(text, "0") != 0;
+    storage8 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR };
+    storage8.storageBuffer8BitAccess = VK_TRUE;
+    int8 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR };
+    int8.shaderInt8 = VK_TRUE;
+    if (samples8) {
+        extensions.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
+        extensions.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+    }
+    // Experiments (VV_PIPELINE_STATS=<file>): what the driver's compiler made
+    // of each shader, appended to the file as its pipeline is made.
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executables = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+    if (const char *file = getenv("VV_PIPELINE_STATS"); file && *file
+        && has(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+        extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+        executables.pipelineExecutableInfo = VK_TRUE;
+        executables.pNext = subgroupSizeControl ? &sizeControl : nullptr;
+        statsFile = file;
+    }
     VkDeviceCreateInfo deviceInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+    if (!statsFile.empty())
+        deviceInfo.pNext = &executables;
+    else if (subgroupSizeControl)
+        deviceInfo.pNext = &sizeControl;
+    if (samples16) {
+        storage16.pNext = (void *)deviceInfo.pNext;
+        deviceInfo.pNext = &storage16;
+    }
+    if (samples8) {
+        int8.pNext = (void *)deviceInfo.pNext;
+        storage8.pNext = &int8;
+        deviceInfo.pNext = &storage8;
+    }
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
     deviceInfo.pEnabledFeatures = &enabled;
-    if (shared) {
-        deviceInfo.enabledExtensionCount = 1;
-        deviceInfo.ppEnabledExtensionNames = extensions;
-    }
+    deviceInfo.enabledExtensionCount = (uint32_t)extensions.size();
+    deviceInfo.ppEnabledExtensionNames = extensions.empty() ? nullptr : extensions.data();
     VkResult result = api->vkCreateDevice(physical, &deviceInfo, nullptr, &device);
     if (result != VK_SUCCESS) {
         device = VK_NULL_HANDLE;
@@ -1317,15 +1892,19 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         if (!getMemoryHandle)
             return fail(-4, deviceName + " cannot share its memory with a decoder");
     }
+    if (externalMemory)
+        getHandleProperties = (PFN_vkGetMemoryWin32HandlePropertiesKHR)api->vkGetDeviceProcAddr(
+            device, "vkGetMemoryWin32HandlePropertiesKHR");
 
     VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = queueFamily;
     if (vk.vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS)
         return fail(-1, "vkCreateCommandPool failed");
-    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 * kMaxBindings };
+    // A set a pass, and one a frame slot more for each pass that reads the frames.
+    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (64 + 8 * kMaxSlots) * kMaxBindings };
     VkDescriptorPoolCreateInfo descriptorInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    descriptorInfo.maxSets = 64;
+    descriptorInfo.maxSets = 64 + 8 * kMaxSlots;
     descriptorInfo.poolSizeCount = 1;
     descriptorInfo.pPoolSizes = &poolSize;
     if (vk.vkCreateDescriptorPool(device, &descriptorInfo, nullptr, &descriptorPool) != VK_SUCCESS)
@@ -1338,19 +1917,37 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     const int w1 = (w + 1) / 2, h1 = (h + 1) / 2, w2 = (w1 + 1) / 2, h2 = (h1 + 1) / 2;
     const int rw1 = (w / 2 + 1) / 2, rh1 = (h / 2 + 1) / 2;
     const VkDeviceSize v0 = v1 ? 0 : 1, only1 = v1 ? 1 : 0;  // buffers one of the two uses hold 4 bytes in the other
+    // VIF's vertical results: only the two-pass VIF writes them (vif_fused
+    // keeps them in group memory) -- 166 MB at 4K.
+    const VkDeviceSize twoPass = vifFused && !nativeDouble ? 0 : 1;
     struct { Buffer *buffer; VkDeviceSize bytes; } sized[] = {
-        { &picRef, planeBytes }, { &picDis, planeBytes },
-        { &blur[0], pixels * 4 * v0 + 4 }, { &blur[1], pixels * 4 * v0 + 4 }, { &vifTmp, pixels * 4 * kVifTmpWords * v0 + 4 },
-        { &rdRef[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 }, { &rdDis[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 },
-        { &rdRef[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 }, { &rdDis[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 },
+        { &picRef, direct ? 4 : planeBytes }, { &picDis, direct ? 4 : planeBytes },
+        // Motion's blur, 16-bit: two pixels a word.
+        { &blur[0], (VkDeviceSize)(w + 1) / 2 * h * 4 * v0 + 4 }, { &blur[1], (VkDeviceSize)(w + 1) / 2 * h * 4 * v0 + 4 },
+        { &vifTmp, pixels * 4 * kVifTmpWords * v0 * twoPass + 4 },
+        // vif_fused keeps both pictures' samples in rdRef (a word each position).
+        { &rdRef[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 }, { &rdDis[0], (VkDeviceSize)w1 * h1 * 4 * v0 * twoPass + 4 },
+        { &rdRef[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 }, { &rdDis[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 * twoPass + 4 },
         { &picPrev[0], planeBytes * only1 + 4 }, { &picPrev[1], planeBytes * only1 + 4 },
         { &admAdditive, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 }, { &admCsfR, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 },
         { &admCsfRF, (VkDeviceSize)w1 * h1 * 16 * only1 + 4 },
-        { &logTable, 32768 * 4 }, { &divTable, 65536 * 4 },
-        { &bandsRef[0], (VkDeviceSize)w1 * h1 * 16 }, { &bandsDis[0], (VkDeviceSize)w1 * h1 * 16 },
-        { &bandsRef[1], (VkDeviceSize)w2 * h2 * 16 }, { &bandsDis[1], (VkDeviceSize)w2 * h2 * 16 },
+        { &logTable, 16384 * 4 }, { &divTable, 65536 * 4 },
+        // Scales 0 and 2: two words a position at scale 0; 1 and 3: three.
+        { &bandsRef[0], (VkDeviceSize)w1 * h1 * 8 }, { &bandsDis[0], (VkDeviceSize)w1 * h1 * 8 },
+        { &bandsRef[1], (VkDeviceSize)w2 * h2 * 12 }, { &bandsDis[1], (VkDeviceSize)w2 * h2 * 12 },
+        { &bandsARef[0], (VkDeviceSize)w1 * h1 * 4 }, { &bandsADis[0], (VkDeviceSize)w1 * h1 * 4 },
+        { &bandsARef[1], (VkDeviceSize)w2 * h2 * 4 }, { &bandsADis[1], (VkDeviceSize)w2 * h2 * 4 },
         { &admR, (VkDeviceSize)w1 * h1 * 16 }, { &admA, (VkDeviceSize)w1 * h1 * 16 },
         { &admF, (VkDeviceSize)w1 * h1 * 16 }, { &acc, kSlots * 8 },
+        { &admRB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
+        { &admAB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
+        { &admFB, (VkDeviceSize)w1 * h1 * 16 * v0 * (admBoth ? 1 : 0) + 4 },
+        // Six 64-bit sums a row of contrast masking at each scale: at most its
+        // band images' rows.
+        { &admRows[0], (VkDeviceSize)h1 * 6 * 8 * (admFused ? 1 : 0) + 4 },
+        { &admRows[1], (VkDeviceSize)h2 * 6 * 8 * (admFused ? 1 : 0) + 4 },
+        { &admRows[2], (VkDeviceSize)((h2 + 1) / 2) * 6 * 8 * (admFused ? 1 : 0) + 4 },
+        { &admRows[3], (VkDeviceSize)((h2 + 3) / 4) * 6 * 8 * (admFused ? 1 : 0) + 4 },
     };
     for (auto &entry : sized) {
         if (int error = create_buffer(*entry.buffer, entry.bytes, false))
@@ -1372,18 +1969,32 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         if (vk.vkCreateFence(device, &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS)
             return fail(-1, "vkCreateFence failed");
-        if (int error = create_buffer(slot.staging, (VkDeviceSize)planeBytes * 2, !shared, shared))
+        if (int error = create_buffer(slot.staging, (VkDeviceSize)planeBytes * (direct ? 1 : 2), !shared, shared, true))
+            return error;
+        if (int error = create_buffer(slot.stagingDis, direct ? planeBytes : 4, true, false, true))
             return error;
         if (int error = create_buffer(slot.result, kSlots * 8, true))
             return error;
+    }
+    if (const char *file = getenv("VV_GPU_TIME"); file && *file && families[queueFamily].timestampValidBits) {
+        VkQueryPoolCreateInfo queryInfo = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        queryInfo.queryCount = kStamps * (uint32_t)slots.size();
+        if (vk.vkCreateQueryPool(device, &queryInfo, nullptr, &timePool) != VK_SUCCESS)
+            timePool = VK_NULL_HANDLE;
+        timeFile = file;
+        timestampNs = properties.limits.timestampPeriod;
     }
 
     // The tables, and zeros where a first frame reads before anything wrote:
     // the previous blur (as the CUDA code's memset) and the band images.
     std::vector<uint32_t> table(65536);
     for (uint32_t i = 0; i < 32768; ++i)
-        table[i] = cuda_log_generate(32768 + i);
-    if (int error = upload(logTable, table.data(), 32768 * 4))
+        table[i] = cuda_log_generate(32768 + i);  // 30720..32768
+    // Two entries a word (vif_stats.slang's log_generate).
+    for (uint32_t i = 0; i < 16384; ++i)
+        table[i] = table[2 * i] | (table[2 * i + 1] << 16);
+    if (int error = upload(logTable, table.data(), 16384 * 4))
         return error;
     const float div_Q_factor = 1073741824;  // 2^30
     for (int i = -32768; i < 32768; ++i) {
@@ -1400,8 +2011,10 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vk.vkBeginCommandBuffer(cb, &begin);
         for (Buffer *buffer : { &blur[0], &blur[1], &vifTmp, &rdRef[0], &rdDis[0], &rdRef[1], &rdDis[1],
-                                &bandsRef[0], &bandsDis[0], &bandsRef[1], &bandsDis[1], &admR, &admA, &admF,
-                                &picPrev[0], &picPrev[1], &admAdditive, &admCsfR, &admCsfRF })
+                                &bandsRef[0], &bandsDis[0], &bandsRef[1], &bandsDis[1], &bandsARef[0],
+                                &bandsADis[0], &bandsARef[1], &bandsADis[1], &admR, &admA, &admF,
+                                &admRB, &admAB, &admFB, &picPrev[0], &picPrev[1], &admAdditive, &admCsfR,
+                                &admCsfRF })
             vk.vkCmdFillBuffer(cb, buffer->buffer, 0, VK_WHOLE_SIZE, 0);
         vk.vkEndCommandBuffer(cb);
         VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -1411,7 +2024,9 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
             vk.vkDeviceWaitIdle(device) != VK_SUCCESS)
             return fail(-1, "clearing the GPU buffers failed");
     }
-    return build_passes();
+    if (int error = build_passes())
+        return error;
+    return compile_pipelines();
 }
 
 int vv_context::collect(Slot &slot)
@@ -1426,6 +2041,20 @@ int vv_context::collect(Slot &slot)
                                              : "the GPU failed (" + std::to_string(result) + ")");
     }
     vk.vkResetFences(device, 1, &slot.fence);
+    if (timePool) {
+        uint64_t stamps[kStamps];
+        const uint32_t query = kStamps * (uint32_t)(&slot - slots.data()), n = slot.stamps;
+        if (n >= 2 && vk.vkGetQueryPoolResults(device, timePool, query, n, sizeof stamps, stamps, 8,
+                                               VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            gpuNs += (double)(stamps[n - 1] - stamps[0]) * timestampNs;
+            for (uint32_t i = 1; i < n; ++i)
+                passNs[slot.stamped[i]] += (double)(stamps[i] - stamps[i - 1]) * timestampNs;
+            if (!timed || stamps[0] < firstStart)
+                firstStart = stamps[0];
+            lastEnd = std::max(lastEnd, stamps[n - 1]);
+            ++timed;
+        }
+    }
     FrameSums &frame = sums[slot.index];
     frame.scored = slot.scored;
     const uint32_t *words = (const uint32_t *)slot.result.mapped;
@@ -1447,7 +2076,7 @@ int vv_context::staging(uint8_t **ref, uint8_t **dis)
         return error;
     pending = &slot;
     *ref = (uint8_t *)slot.staging.mapped;
-    *dis = (uint8_t *)slot.staging.mapped + planeBytes;
+    *dis = direct ? (uint8_t *)slot.stagingDis.mapped : (uint8_t *)slot.staging.mapped + planeBytes;
     return 0;
 }
 
@@ -1493,31 +2122,109 @@ int vv_context::commit(bool score)
     VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk.vkBeginCommandBuffer(cb, &begin);
+    const uint32_t query = kStamps * (uint32_t)(&slot - slots.data());
+    slot.stamps = 0;
+    // Each timestamp once the GPU is done with everything before it.
+    auto stamp = [&](int what) {
+        if (timePool && slot.stamps < kStamps) {
+            vk.vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timePool, query + slot.stamps);
+            slot.stamped[slot.stamps++] = what;
+        }
+    };
+    if (timePool)
+        vk.vkCmdResetQueryPool(cb, timePool, query, kStamps);
+    stamp(-1);
     barrier(vk, cb, kCompute | kTransfer, kTransfer);
-    VkBufferCopy copy = { 0, 0, planeBytes };
-    vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
-    if (score) {
-        copy.srcOffset = planeBytes;
-        vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picDis.buffer, 1, &copy);
+    if (pendingTextures[0] >= 0) {
+        // From the decoder's Direct3D textures: taken over from the
+        // "external" queue family for the copy and handed back after it,
+        // in the general layout throughout (the memory is Direct3D's).
+        const int textures[2] = { pendingTextures[0], score ? pendingTextures[1] : -1 };
+        Buffer *targets[2] = { direct ? &slot.staging : &picRef, direct ? &slot.stagingDis : &picDis };
+        pendingTextures[0] = pendingTextures[1] = -1;
+        for (int i = 0; i < 2; ++i) {
+            if (textures[i] < 0)
+                continue;
+            VkImageMemoryBarrier take = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+            take.srcAccessMask = 0;
+            take.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            take.oldLayout = take.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            take.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+            take.dstQueueFamilyIndex = queueFamily;
+            take.image = imported[(size_t)textures[i]].image;
+            take.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                    nullptr, 0, nullptr, 1, &take);
+            VkBufferImageCopy region = {};
+            region.bufferRowLength = strideBytes / (bpc > 8 ? 2 : 1);
+            region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.imageExtent = { (uint32_t)w, (uint32_t)h, 1 };
+            vk.vkCmdCopyImageToBuffer(cb, take.image, VK_IMAGE_LAYOUT_GENERAL, targets[i]->buffer, 1, &region);
+            VkImageMemoryBarrier give = take;
+            give.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            give.dstAccessMask = 0;
+            give.srcQueueFamilyIndex = queueFamily;
+            give.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+            vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+                                    nullptr, 0, nullptr, 1, &give);
+        }
+    } else if (!direct) {
+        VkBufferCopy copy = { 0, 0, planeBytes };
+        vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
+        if (score) {
+            copy.srcOffset = planeBytes;
+            vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picDis.buffer, 1, &copy);
+        }
     }
     vk.vkCmdFillBuffer(cb, acc.buffer, 0, VK_WHOLE_SIZE, 0);
+    if (admFused && score) {
+        for (const Buffer &rows : admRows)
+            vk.vkCmdFillBuffer(cb, rows.buffer, 0, VK_WHOLE_SIZE, 0);
+    }
     barrier(vk, cb, kTransfer, kCompute);
+    stamp(kShaderCount);
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
     const std::vector<Pass> *lists[2] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr };
-    for (const std::vector<Pass> *list : lists) {
-        if (!list)
-            continue;
-        int done = 0;
-        for (const Pass &pass : *list) {
-            if (list == &scored && passLimit && done++ >= passLimit)
-                break;
-            if (!pass.groups[0] || !pass.groups[1])
+    auto record = [&](const Pass &pass) {
+        const Pipeline &pipeline = pipelines[pass.shader];
+        vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pass.pipeline);
+        const VkDescriptorSet *set = pass.perSlot ? &pass.slotSets[&slot - slots.data()] : &pass.set;
+        vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, set, 0, nullptr);
+        vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pass.constantBytes, pass.constants);
+        vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], pass.groups[2]);
+    };
+    if (timePool || passLimit) {
+        // Timing tests and pass limits (the diagnosis): the passes in their
+        // order, each finished before the next (its timestamp, its buffers).
+        for (const std::vector<Pass> *list : lists) {
+            if (!list)
                 continue;
-            const Pipeline &pipeline = pipelines[pass.shader];
-            vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
-            vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &pass.set, 0, nullptr);
-            vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pass.constantBytes, pass.constants);
-            vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], pass.groups[2]);
+            int done = 0;
+            for (const Pass &pass : *list) {
+                if (list == &scored && passLimit && done++ >= passLimit)
+                    break;
+                if (!pass.groups[0] || !pass.groups[1])
+                    continue;
+                record(pass);
+                barrier(vk, cb, kCompute, kCompute | kTransfer);
+                stamp(pass.shader);
+            }
+        }
+    } else {
+        // Level by level, a barrier after each: the passes that depend on no
+        // other of the level (motion, VIF's and ADM's chains) overlap, and the
+        // GPU is not drained between every two. The motion and scored lists
+        // share no buffer (Pass::level is within a list): their levels run
+        // together.
+        uint32_t levels = 0;
+        for (const std::vector<Pass> *list : lists)
+            for (size_t i = 0; list && i < list->size(); ++i)
+                levels = std::max(levels, (*list)[i].level + 1);
+        for (uint32_t level = 0; level < levels; ++level) {
+            for (const std::vector<Pass> *list : lists)
+                for (size_t i = 0; list && i < list->size(); ++i)
+                    if ((*list)[i].level == level && (*list)[i].groups[0] && (*list)[i].groups[1])
+                        record((*list)[i]);
             barrier(vk, cb, kCompute, kCompute | kTransfer);
         }
     }
@@ -1528,6 +2235,7 @@ int vv_context::commit(bool score)
     }
     VkBufferCopy back = { 0, 0, kSlots * 8 };
     vk.vkCmdCopyBuffer(cb, acc.buffer, slot.result.buffer, 1, &back);
+    stamp(kShaderCount + 1);
     vk.vkEndCommandBuffer(cb);
     VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.commandBufferCount = 1;
@@ -1540,6 +2248,95 @@ int vv_context::commit(bool score)
     slot.busy = true;
     return 0;
 }
+
+// A Direct3D 11 texture shared by its NT handle (D3D11_RESOURCE_MISC_SHARED_
+// NTHANDLE), the context's size and R16_UINT (more than 8 bits) or R8_UINT:
+// one frame's luma, as a decoder writes it. The handle stays the caller's.
+int vv_context::import_texture(void *handle, int *index)
+{
+    if (!getHandleProperties)
+        return fail(-4, deviceName + " cannot import Direct3D textures");
+    const VkExternalMemoryHandleTypeFlagBits type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+    VkExternalMemoryImageCreateInfo external = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+    external.handleTypes = type;
+    VkImageCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    info.pNext = &external;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = bpc > 8 ? VK_FORMAT_R16_UINT : VK_FORMAT_R8_UINT;
+    info.extent = { (uint32_t)w, (uint32_t)h, 1 };
+    info.mipLevels = info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imported.emplace_back();
+    Imported &texture = imported.back();
+    if (vk.vkCreateImage(device, &info, nullptr, &texture.image) != VK_SUCCESS)
+        return fail(-1, "vkCreateImage failed for a Direct3D texture");
+    VkMemoryWin32HandlePropertiesKHR properties = { VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
+    VkResult result = getHandleProperties(device, type, (HANDLE)handle, &properties);
+    if (result != VK_SUCCESS)
+        return fail(-1, "the Direct3D texture's handle was refused (" + std::to_string(result) + ")");
+    VkMemoryRequirements requirements;
+    vk.vkGetImageMemoryRequirements(device, texture.image, &requirements);
+    const uint32_t bits = requirements.memoryTypeBits & (properties.memoryTypeBits ? properties.memoryTypeBits : ~0u);
+    if (!bits)
+        return fail(-1, "no memory type takes the Direct3D texture");
+    uint32_t memoryType = 0;
+    while (!(bits & (1u << memoryType)))
+        ++memoryType;
+    VkMemoryDedicatedAllocateInfo dedicated = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+    dedicated.image = texture.image;
+    VkImportMemoryWin32HandleInfoKHR import = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+    import.pNext = &dedicated;
+    import.handleType = type;
+    import.handle = (HANDLE)handle;
+    VkMemoryAllocateInfo allocate = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    allocate.pNext = &import;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = memoryType;
+    result = vk.vkAllocateMemory(device, &allocate, nullptr, &texture.memory);
+    if (result != VK_SUCCESS)
+        return fail(-1, "importing the Direct3D texture failed (" + std::to_string(result) + ")");
+    if (vk.vkBindImageMemory(device, texture.image, texture.memory, 0) != VK_SUCCESS)
+        return fail(-1, "vkBindImageMemory failed for a Direct3D texture");
+    *index = (int)imported.size() - 1;
+    return 0;
+}
+
+// The next frame pair from two imported textures (`dis` unused when the
+// frame is not scored). The caller must not let the decoder write either
+// texture again before completed() counts this frame.
+int vv_context::commit_textures(int ref, int dis, bool score)
+{
+    const int count = (int)imported.size();
+    if (ref < 0 || ref >= count || (score && (dis < 0 || dis >= count)))
+        return fail(-3, "no such imported texture");
+    uint8_t *unused[2];
+    if (int error = staging(&unused[0], &unused[1]))
+        return error;
+    pendingTextures[0] = ref;
+    pendingTextures[1] = score ? dis : -1;
+    return commit(score);
+}
+
+// How many frames the GPU has finished, without waiting: the oldest frames'
+// slots whose fences have signalled are collected.
+unsigned vv_context::completed()
+{
+    for (size_t i = 0; i < slots.size(); ++i) {
+        Slot &slot = slots[(nextSlot + i) % slots.size()];
+        if (!slot.busy)
+            continue;
+        if (vk.vkGetFenceStatus(device, slot.fence) != VK_SUCCESS || collect(slot))
+            break;
+    }
+    unsigned busy = 0;
+    for (const Slot &slot : slots)
+        busy += slot.busy ? 1 : 0;
+    return frames - busy;
+}
+
 
 int vv_context::flush()
 {
@@ -1689,6 +2486,26 @@ VV_EXPORT int vv_shared_device(vv_context *context, uint8_t *deviceUuid, uint8_t
 
 // Waits for every submitted frame.
 VV_EXPORT int vv_flush(vv_context *context) { return context->flush(); }
+// Frames from a Direct3D 11 decoder on this GPU (Intel's, through oneVPL):
+// each shared texture is imported once (*index), then each frame pair is
+// committed by its two textures' indices. vv_completed gives how many
+// frames the GPU has finished, so the decoder may reuse their textures.
+VV_EXPORT int vv_import_texture(vv_context *context, void *handle, int *index)
+{
+    return context->import_texture(handle, index);
+}
+
+VV_EXPORT int vv_commit_textures(vv_context *context, int reference, int distorted, int score)
+{
+    return context->commit_textures(reference, distorted, score != 0);
+}
+
+VV_EXPORT int vv_completed(vv_context *context, unsigned *frames)
+{
+    *frames = context->completed();
+    return context->failed ? fail(-5, "the GPU failed on an earlier frame") : 0;
+}
+
 
 // A frame's features (kFeatures doubles), after vv_flush. Returns 1 when
 // the frame was scored, 0 when only its motion was (the others are 0 then).
@@ -1738,12 +2555,14 @@ VV_EXPORT const char *vv_device_name(vv_context *context) { return context->devi
 
 // A device buffer's first `bytes` bytes, after vv_flush; for tests. `which`:
 // 0 admR, 1 admA, 2 admF, 3 bandsRef[0], 4 bandsDis[0], 5 bandsRef[1], 6 bandsDis[1], 7 vifTmp,
-// 8 the division table, 9 the logarithm table.
+// 8 the division table, 9 the logarithm table (two entries a word), 10 admRB, 11 admAB, 12 admFB (VMAF NEG's, BOTH),
+// 13 bandsARef[0], 14 bandsADis[0], 15 bandsARef[1], 16 bandsADis[1]. 3-6 hold h, v, d (adm_hvd).
 VV_EXPORT int vv_read_buffer(vv_context *context, int which, void *out, uint64_t bytes)
 {
     Buffer *all[] = { &context->admR, &context->admA, &context->admF, &context->bandsRef[0], &context->bandsDis[0],
                       &context->bandsRef[1], &context->bandsDis[1], &context->vifTmp, &context->divTable,
-                      &context->logTable };
+                      &context->logTable, &context->admRB, &context->admAB, &context->admFB,
+                      &context->bandsARef[0], &context->bandsADis[0], &context->bandsARef[1], &context->bandsADis[1] };
     if (which < 0 || which >= (int)(sizeof all / sizeof all[0]))
         return fail(-3, "no such buffer");
     Buffer *source = all[which];

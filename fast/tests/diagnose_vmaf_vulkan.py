@@ -43,12 +43,16 @@ from vmaf_fast import vulkan as vmaf_vulkan
 REFERENCE = Path(__file__).with_name("vmaf_vulkan_reference.json")
 BLOCK_WORDS = 256
 WIDTH, HEIGHT = vmaf_vulkan._PROBE_SIZE
-#: vv_read_buffer's buffers and their sizes in bytes for a WIDTH x HEIGHT picture.
+#: vv_read_buffer's buffers: their index and size in bytes for a WIDTH x HEIGHT picture. The
+#: band images hold h, v, d (two words a position at scales 0 and 2, three at 1 and 3) and a
+#: (bandsA*, one word; scale 0's 16-bit, two a word), as common.slang's adm_hvd describes.
 _W1, _H1 = (WIDTH + 1) // 2, (HEIGHT + 1) // 2
 _W2, _H2 = (_W1 + 1) // 2, (_H1 + 1) // 2
-BUFFERS = {"admR": _W1 * _H1 * 16, "admA": _W1 * _H1 * 16, "admF": _W1 * _H1 * 16,
-           "bandsRef0": _W1 * _H1 * 16, "bandsDis0": _W1 * _H1 * 16,
-           "bandsRef1": _W2 * _H2 * 16, "bandsDis1": _W2 * _H2 * 16, "vifTmp": WIDTH * HEIGHT * 20}
+BUFFERS = {"admR": (0, _W1 * _H1 * 16), "admA": (1, _W1 * _H1 * 16), "admF": (2, _W1 * _H1 * 16),
+           "bandsRef0": (3, _W1 * _H1 * 8), "bandsDis0": (4, _W1 * _H1 * 8),
+           "bandsRef1": (5, _W2 * _H2 * 12), "bandsDis1": (6, _W2 * _H2 * 12), "vifTmp": (7, WIDTH * HEIGHT * 20),
+           "bandsARef0": (13, _W1 * _H1 * 4), "bandsADis0": (14, _W1 * _H1 * 4),
+           "bandsARef1": (15, _W2 * _H2 * 4), "bandsADis1": (16, _W2 * _H2 * 4)}
 #: The scored passes in the order vmaf_vulkan.cpp's build_passes adds them.
 PASSES = ([f"vif_{kind} scale {scale}" for scale in range(4) for kind in ("vert", "hori")]
           + [f"adm_{kind} scale {scale}" for scale in range(4)
@@ -129,7 +133,7 @@ def after_passes(device: int, bits: int, count: int, variant: int = 0) -> tuple[
         scorer.add(reference[0], distorted[0])
         scorer.features()
         sums = [int(value) for value in scorer.sums(0)]
-        return sums, {name: read_buffer(scorer, which, size) for which, (name, size) in enumerate(BUFFERS.items())}
+        return sums, {name: read_buffer(scorer, which, size) for name, (which, size) in BUFFERS.items()}
     finally:
         scorer.close()
 
