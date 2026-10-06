@@ -1598,12 +1598,17 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     api->vkGetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, nullptr);
     std::vector<VkQueueFamilyProperties> families(familyCount);
     api->vkGetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, families.data());
+    // A compute queue without graphics if there is one (an AMD GPU's async
+    // compute): the work of others on the GPU's graphics queue (a decoder's
+    // copies by Direct3D 11, say) then need not wait behind this one's.
     int family = -1;
-    for (uint32_t i = 0; i < familyCount; ++i) {
-        if (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+    for (uint32_t i = 0; i < familyCount && family < 0; ++i) {
+        if ((families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
             family = (int)i;
-            break;
-        }
+    }
+    for (uint32_t i = 0; i < familyCount && family < 0; ++i) {
+        if (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
+            family = (int)i;
     }
     if (family < 0)
         return fail(-4, deviceName + " has no compute queue");
