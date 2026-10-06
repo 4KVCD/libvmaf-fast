@@ -418,6 +418,12 @@ struct Pass {
     uint32_t constants[32];
     uint32_t constantBytes;
     uint32_t groups[3];
+    // Its buffers, and its dependency level in its list: one more than the
+    // highest of the earlier passes it shares a buffer with (vv_context::
+    // shares). The passes of a level run with no barrier between them.
+    const Buffer *bound[9];  // kMaxBindings
+    uint32_t boundCount;
+    uint32_t level;
 };
 
 struct Slot {
@@ -435,6 +441,7 @@ struct Slot {
 };
 
 enum { kPushBytes = 128, kMaxBindings = 9 };
+static_assert(kMaxBindings <= sizeof(Pass::bound) / sizeof(Pass::bound[0]), "Pass::bound holds a pass's buffers");
 // adm_dcm.slang's tile of contrast masking's positions (its TX x TY).
 const int kDcmTile[2] = { 16, 8 };
 
@@ -554,6 +561,7 @@ struct vv_context {
     void destroy_last_buffer(Buffer &buffer);
     int create_pipeline(int shader, uint32_t bindings);
     void write_pipeline_stats(const char *name, VkPipeline pipeline);
+    bool shares(const Pass &a, const Pass &b) const;
     int add_pass(std::vector<Pass> &list, int shader, std::initializer_list<Buffer *> bound,
                  const void *constants, uint32_t constantBytes, uint32_t gx, uint32_t gy);
     int upload(Buffer &target, const void *data, size_t bytes);
@@ -848,8 +856,29 @@ int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_l
     pass.groups[0] = gx;
     pass.groups[1] = gy;
     pass.groups[2] = 1;
+    for (Buffer *buffer : bound)
+        pass.bound[pass.boundCount++] = buffer;
+    for (const Pass &earlier : list)
+        if (shares(earlier, pass))
+            pass.level = std::max(pass.level, earlier.level + 1);
     list.push_back(pass);
     return 0;
+}
+
+// Whether two passes must not overlap: a buffer bound to both, but the
+// pictures and the division and logarithm tables, which passes only read,
+// and acc, which they only add to atomically (acc_add64).
+bool vv_context::shares(const Pass &a, const Pass &b) const
+{
+    for (uint32_t i = 0; i < a.boundCount; ++i) {
+        const Buffer *buffer = a.bound[i];
+        if (buffer == &picRef || buffer == &picDis || buffer == &divTable || buffer == &logTable || buffer == &acc)
+            continue;
+        for (uint32_t j = 0; j < b.boundCount; ++j)
+            if (b.bound[j] == buffer)
+                return true;
+    }
+    return false;
 }
 
 namespace {
@@ -1943,23 +1972,47 @@ int vv_context::commit(bool score)
     stamp(kShaderCount);
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
     const std::vector<Pass> *lists[2] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr };
-    for (const std::vector<Pass> *list : lists) {
-        if (!list)
-            continue;
-        int done = 0;
-        for (const Pass &pass : *list) {
-            if (list == &scored && passLimit && done++ >= passLimit)
-                break;
-            if (!pass.groups[0] || !pass.groups[1])
+    auto record = [&](const Pass &pass) {
+        const Pipeline &pipeline = pipelines[pass.shader];
+        vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+        const VkDescriptorSet *set = pass.perSlot ? &pass.slotSets[&slot - slots.data()] : &pass.set;
+        vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, set, 0, nullptr);
+        vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pass.constantBytes, pass.constants);
+        vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], pass.groups[2]);
+    };
+    if (timePool || passLimit) {
+        // Timing tests and pass limits (the diagnosis): the passes in their
+        // order, each finished before the next (its timestamp, its buffers).
+        for (const std::vector<Pass> *list : lists) {
+            if (!list)
                 continue;
-            const Pipeline &pipeline = pipelines[pass.shader];
-            vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
-            const VkDescriptorSet *set = pass.perSlot ? &pass.slotSets[&slot - slots.data()] : &pass.set;
-            vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, set, 0, nullptr);
-            vk.vkCmdPushConstants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pass.constantBytes, pass.constants);
-            vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], pass.groups[2]);
+            int done = 0;
+            for (const Pass &pass : *list) {
+                if (list == &scored && passLimit && done++ >= passLimit)
+                    break;
+                if (!pass.groups[0] || !pass.groups[1])
+                    continue;
+                record(pass);
+                barrier(vk, cb, kCompute, kCompute | kTransfer);
+                stamp(pass.shader);
+            }
+        }
+    } else {
+        // Level by level, a barrier after each: the passes that depend on no
+        // other of the level (motion, VIF's and ADM's chains) overlap, and the
+        // GPU is not drained between every two. The motion and scored lists
+        // share no buffer (Pass::level is within a list): their levels run
+        // together.
+        uint32_t levels = 0;
+        for (const std::vector<Pass> *list : lists)
+            for (size_t i = 0; list && i < list->size(); ++i)
+                levels = std::max(levels, (*list)[i].level + 1);
+        for (uint32_t level = 0; level < levels; ++level) {
+            for (const std::vector<Pass> *list : lists)
+                for (size_t i = 0; list && i < list->size(); ++i)
+                    if ((*list)[i].level == level && (*list)[i].groups[0] && (*list)[i].groups[1])
+                        record((*list)[i]);
             barrier(vk, cb, kCompute, kCompute | kTransfer);
-            stamp(pass.shader);
         }
     }
     if (v1) {
