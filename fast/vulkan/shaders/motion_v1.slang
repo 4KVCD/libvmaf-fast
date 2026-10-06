@@ -30,28 +30,39 @@ int mirror(int idx, int size)
     return idx;
 }
 
+#define TILE 16
+#define SPAN (TILE + 4)
+groupshared int gDiff[SPAN * SPAN];     // previous - current around the tile (mirrored at the edges)
+groupshared int gColumn[TILE * SPAN];   // the vertical pass, rounded, per output row and column
+
+// A workgroup takes 16 x 16 pixels: the differences it reads are loaded once
+// into shared memory, the vertical pass done there for its rows, and the
+// horizontal pass per pixel -- the same products, sums and rounding as
+// motion_score_pipeline's, per pixel, at the same mirrored places.
 [shader("compute")]
-[numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID, uint local : SV_GroupIndex)
+[numthreads(TILE, TILE, 1)]
+void main(uint3 group : SV_GroupID, uint3 inGroup : SV_GroupThreadID, uint local : SV_GroupIndex)
 {
-    int x = int(id.x), y = int(id.y);
+    const int x0 = int(group.x) * TILE, y0 = int(group.y) * TILE;
+    for (uint i = local; i < SPAN * SPAN; i += TILE * TILE) {
+        const int column = mirror(x0 - 2 + int(i % SPAN), pc.w), row = mirror(y0 - 2 + int(i / SPAN), pc.h);
+        gDiff[i] = int(pixel(previous, column, row, pc.strideWords)) - int(pixel(current, column, row, pc.strideWords));
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint i = local; i < TILE * SPAN; i += TILE * TILE) {
+        const uint lx = i % SPAN, ly = i / SPAN;
+        int64_t vertical = 0;
+        for (uint k = 0; k < 5; ++k)
+            vertical += int64_t(kFilter[k] * gDiff[(ly + k) * SPAN + lx]);
+        gColumn[i] = int((vertical + pc.addY) >> pc.shiftY);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const int x = x0 + int(inGroup.x), y = y0 + int(inGroup.y);
     uint distance = 0;
     if (x < pc.w && y < pc.h) {
-        int rows[5];
-        for (int k = 0; k < 5; ++k)
-            rows[k] = mirror(y - 2 + k, pc.h);
         int64_t blurred = 0;
-        for (int xf = 0; xf < 5; ++xf) {
-            int column = mirror(x - 2 + xf, pc.w);
-            int64_t vertical = 0;
-            for (int k = 0; k < 5; ++k) {
-                int difference = int(pixel(previous, column, rows[k], pc.strideWords))
-                               - int(pixel(current, column, rows[k], pc.strideWords));
-                vertical += int64_t(kFilter[k] * difference);
-            }
-            int rounded = int((vertical + pc.addY) >> pc.shiftY);
-            blurred += int64_t(kFilter[xf]) * rounded;
-        }
+        for (uint xf = 0; xf < 5; ++xf)
+            blurred += int64_t(kFilter[xf]) * gColumn[inGroup.y * SPAN + inGroup.x + xf];
         distance = uint(abs(int((blurred + 32768) >> 16)));
     }
     gSum[local] = distance;
