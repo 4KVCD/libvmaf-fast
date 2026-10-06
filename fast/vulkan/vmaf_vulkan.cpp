@@ -2031,8 +2031,15 @@ int vv_context::enable_cambi(const double *values)
                              constants, sizeof constants, groups(sw, 16), groups(sh, 16));
         }
         if (!error) {
-            // The sliding counts (CVALUES_SLIDE) for windows of at most 65.
-            const uint32_t rows = 16;
+            // The sliding counts (CVALUES_SLIDE) for windows of at most 65, in
+            // bands of these rows a workgroup: fewer for the smaller scales,
+            // whose few workgroups (each a band's rows one after another) the
+            // GPU otherwise waited on -- on a Radeon 780M, of 16 at every
+            // scale, 2.42 -> 2.30 ms a frame at 4K and 1.08 -> 0.89 at 1080p
+            // (taller bands, with fewer rows of each band's first window
+            // counted, were slower: 32 and 64 rows took 2.85 and 3.54 at 4K).
+            static const uint32_t kRows[V1_CAMBI_SCALES] = { 16, 8, 8, 4, 4 };
+            const uint32_t rows = kRows[scale];
             uint32_t constants[15] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)(c.window_size >> 1),
                                        (uint32_t)c.vlt_luma, (uint32_t)c.v_band_base, (uint32_t)c.v_band_size };
             for (int d = 0; d < 4; ++d) {
