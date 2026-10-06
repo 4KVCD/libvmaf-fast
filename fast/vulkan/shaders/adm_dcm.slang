@@ -183,9 +183,18 @@ static const int kShiftSq[3] = { 30, 30, 30 };
 #define F_WORDS 6
 #endif
 groupshared uint gF[HX * HY * F_WORDS];
-// Each of the tile's rows' sums, [row][limit * 3 + band], 64-bit as two
-// words: zeroed at the start, added to after the first barrier.
-groupshared uint gRows[TY * 12];
+// Each of the tile's rows' sums, [row][limit * 3 + band][copy], 64-bit as
+// two words: zeroed at the start, added to after the first barrier. A
+// thread adds into copy tx % ROW_COPIES: the row's 16 threads' atomic adds
+// to the same words wait on each other. At scales 1-3, four copies (Core
+// Ultra 9 285K's iGPU, 4K: 0.973 -> 0.935 ms); at scale 0 they gained
+// nothing.
+#if SCALE0
+#define ROW_COPIES 1
+#else
+#define ROW_COPIES 4
+#endif
+groupshared uint gRows[TY * 12 * ROW_COPIES];
 
 // adm_decouple.slang's main (BOTH, VARIANT 0) for the position at `from`:
 // both limits' restored, csfA and csfF of its three bands.
@@ -310,8 +319,8 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
     const int x0 = P_startCol + int(group.x) * TX, y0 = P_startRow + int(group.y) * TY;
     const int tx = int(local % uint(TX)), ty = int(local / uint(TX));
-    if (local < uint(TY * 12))
-        gRows[local] = 0;
+    for (uint z = local; z < uint(TY * 12 * ROW_COPIES); z += THREADS)
+        gRows[z] = 0;
     // The thread's own position first (its restored and csfA kept), then the
     // positions around the tile, each decoupled once. Positions outside the
     // band images are not; contrast masking never reads them.
@@ -393,7 +402,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     for (int k = 0; k < 6; ++k) {
         const uint64_t value = uint64_t(sums[k / 3][k % 3]);
         if (value != 0) {
-            const uint lo = uint(value), at = uint(ty * 12 + 2 * k);
+            const uint lo = uint(value), at = uint(((ty * 6 + k) * ROW_COPIES + tx % ROW_COPIES) * 2);
             uint old;
             InterlockedAdd(gRows[at], lo, old);
             const uint high = uint(value >> 32) + (old > ~lo ? 1u : 0u);
@@ -404,7 +413,11 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     GroupMemoryBarrierWithGroupSync();
     if (local < uint(6 * TY)) {
         const int k = int(local) % 6, row = int(local) / 6, ri = y0 + row;
-        const uint64_t total = uint64_t(gRows[row * 12 + 2 * k]) | (uint64_t(gRows[row * 12 + 2 * k + 1]) << 32);
+        uint64_t total = 0;
+        for (int c = 0; c < ROW_COPIES; ++c) {
+            const uint at = uint(((row * 6 + k) * ROW_COPIES + c) * 2);
+            total += uint64_t(gRows[at]) | (uint64_t(gRows[at + 1]) << 32);
+        }
         if (ri < P_endRow && total != 0)
             acc_add64(rowSums, P_rowSlot + uint(k * (P_endRow - P_startRow) + ri - P_startRow), total);
     }
