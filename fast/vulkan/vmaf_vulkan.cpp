@@ -1704,28 +1704,35 @@ int vv_context::enable_cambi(const double *values)
                           : add_pass(scored, kShader_cambi_cvalues, { &cambiFiltered[scale], mask, &cambiC[scale],
                                      &cambiReciprocal }, constants, sizeof constants, groups(sw, 16), groups(sh, 16));
         }
-        const uint32_t n = (uint32_t)(sw * sh);
-        const uint32_t histGroups = std::min<uint32_t>(groups((int)n, 256), 128);
-        const uint32_t slot = (uint32_t)(kSlotCambi + scale * 4);
-        for (uint32_t level = 0; level < 3 && !error; ++level) {
-            const uint32_t histOffset = (uint32_t)((scale * 3 + (int)level) * 4096), stateOffset = (uint32_t)(scale * 2);
-            const uint32_t histConstants[] = { n, level, histGroups, histOffset, stateOffset };
-            error = add_pass(scored, kShader_cambi_hist, { &cambiC[scale], &cambiHist, &cambiState }, histConstants,
-                             sizeof histConstants, histGroups, 1);
-            if (!error) {
-                const uint32_t selectConstants[] = { level, (uint32_t)c.topk_elements[scale], slot + 1, slot + 2,
-                                                     histOffset, stateOffset };
-                error = add_pass(scored, kShader_cambi_select, { &cambiHist, &cambiState, &acc }, selectConstants,
-                                 sizeof selectConstants, 1, 1);
-            }
-        }
-        if (!error) {
-            const uint32_t constants[] = { n, histGroups, slot, slot + 3, (uint32_t)(scale * 2) };
-            error = add_pass(scored, kShader_cambi_sum, { &cambiC[scale], &cambiState, &acc }, constants,
-                             sizeof constants, histGroups, 1);
-        }
         inW = sw;
         image = &cambiFiltered[scale];
+    }
+    // spatial_pooling's top k of the five scales together: the radix select's
+    // three levels (HIST, SELECT) and the sum above the k-th largest (SUM).
+    uint32_t sizes[12] = {};
+    uint32_t mostGroups = 0;
+    for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
+        sizes[1 + scale] = (uint32_t)(c.scale_w[scale] * c.scale_h[scale]);
+        sizes[6 + scale] = std::min<uint32_t>(groups((int)sizes[1 + scale], 256), 128);
+        mostGroups = std::max(mostGroups, sizes[6 + scale]);
+    }
+    for (uint32_t level = 0; level < 3 && !error; ++level) {
+        sizes[0] = level;
+        error = add_pass(scored, kShader_cambi_hist, { &cambiC[0], &cambiC[1], &cambiC[2], &cambiC[3], &cambiC[4],
+                         &cambiHist, &cambiState }, sizes, sizeof sizes, mostGroups, V1_CAMBI_SCALES);
+        if (!error) {
+            uint32_t select[7] = { level };
+            for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale)
+                select[1 + scale] = (uint32_t)c.topk_elements[scale];
+            select[6] = (uint32_t)kSlotCambi;
+            error = add_pass(scored, kShader_cambi_select, { &cambiHist, &cambiState, &acc }, select, sizeof select, 1,
+                             V1_CAMBI_SCALES);
+        }
+    }
+    if (!error) {
+        sizes[11] = (uint32_t)kSlotCambi;
+        error = add_pass(scored, kShader_cambi_sum, { &cambiC[0], &cambiC[1], &cambiC[2], &cambiC[3], &cambiC[4],
+                         &cambiState, &acc }, sizes, sizeof sizes, mostGroups, V1_CAMBI_SCALES);
     }
     if (!error) {
         uint32_t constants[7] = { cambiPoolOnCpu ? 1u : 0u, (uint32_t)kSlotCambi };

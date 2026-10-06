@@ -19,7 +19,8 @@
 //             CPU's reciprocal table (its entries as written, not 1.0f/i)
 //   CLEAR     zeros
 //   HIST      a level of the radix select of spatial_pooling's top k: the
-//             c-values' bits are ordered as the floats are (all >= 0)
+//             c-values' bits are ordered as the floats are (all >= 0); the
+//             five scales in one dispatch (as SELECT and SUM)
 //   SELECT    the bin the k-th largest value is in, at that level
 //   SUM       the values above the k-th largest, exactly: each nonzero
 //             c-value is at least 0.5, a multiple of 2^-24 -- an integer in
@@ -477,26 +478,50 @@ void main(uint3 id : SV_DispatchThreadID)
     if (id.x < pc[0]) target[id.x] = 0;
 }
 
-#elif STAGE == 8  // HIST
-[[vk::binding(0, 0)]] StructuredBuffer<uint> cValues;
-[[vk::binding(1, 0)]] RWStructuredBuffer<uint> hist;    // every scale's and level's bins
-[[vk::binding(2, 0)]] StructuredBuffer<uint> state;     // every scale's prefix, remaining
-// pc: n, level, groupsTotal, histOffset (this scale's and level's bins), stateOffset
+#elif STAGE == 8 || STAGE == 10  // HIST, SUM
+// The five scales at once: a row of workgroups each (group.y = the scale).
+[[vk::binding(0, 0)]] StructuredBuffer<uint> cValues0;
+[[vk::binding(1, 0)]] StructuredBuffer<uint> cValues1;
+[[vk::binding(2, 0)]] StructuredBuffer<uint> cValues2;
+[[vk::binding(3, 0)]] StructuredBuffer<uint> cValues3;
+[[vk::binding(4, 0)]] StructuredBuffer<uint> cValues4;
+#if STAGE == 8
+[[vk::binding(5, 0)]] RWStructuredBuffer<uint> hist;    // every scale's and level's bins
+[[vk::binding(6, 0)]] StructuredBuffer<uint> state;     // every scale's prefix, remaining
+// pc: level, n[5], groups[5]
+#else
+[[vk::binding(5, 0)]] StructuredBuffer<uint> state;     // every scale's threshold bits, remaining
+[[vk::binding(6, 0)]] RWStructuredBuffer<uint> acc;
+// pc: (unused), n[5], groups[5], the first scale's slot (sum, threshold, remaining, inexact: 4 a scale)
+#endif
 
+uint c_value(uint scale, uint i)
+{
+    switch (scale) {
+    case 0: return cValues0[i];
+    case 1: return cValues1[i];
+    case 2: return cValues2[i];
+    case 3: return cValues3[i];
+    default: return cValues4[i];
+    }
+}
+
+#if STAGE == 8
 groupshared uint gHist[4096];
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
-    const uint level = pc[1];
+    const uint scale = group.y, level = pc[0];
+    if (group.x >= pc[6 + scale]) return;  // the scale's workgroups
     const uint bins = level < 2 ? 4096u : 256u;
     for (uint b = local; b < bins; b += 256) gHist[b] = 0;
     GroupMemoryBarrierWithGroupSync();
-    const uint prefix = state[pc[4]];
-    const uint stride = pc[2] * 256;
-    for (uint i = group.x * 256 + local; i < pc[0]; i += stride) {
-        const uint bits = cValues[i];
+    const uint prefix = state[scale * 2];
+    const uint stride = pc[6 + scale] * 256, n = pc[1 + scale];
+    for (uint i = group.x * 256 + local; i < n; i += stride) {
+        const uint bits = c_value(scale, i);
         uint bin;
         if (level == 0) {
             bin = bits >> 20;
@@ -510,46 +535,11 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         InterlockedAdd(gHist[bin], 1u);
     }
     GroupMemoryBarrierWithGroupSync();
+    const uint offset = (scale * 3 + level) * 4096;
     for (uint b = local; b < bins; b += 256)
-        if (gHist[b] != 0) InterlockedAdd(hist[pc[3] + b], gHist[b]);
+        if (gHist[b] != 0) InterlockedAdd(hist[offset + b], gHist[b]);
 }
-
-#elif STAGE == 9  // SELECT
-[[vk::binding(0, 0)]] StructuredBuffer<uint> hist;
-[[vk::binding(1, 0)]] RWStructuredBuffer<uint> state;   // prefix, remaining
-[[vk::binding(2, 0)]] RWStructuredBuffer<uint> acc;
-// pc: level, k, slotThreshold, slotRemaining, histOffset, stateOffset
-
-[shader("compute")]
-[numthreads(1, 1, 1)]
-void main()
-{
-    const uint level = pc[0];
-    const uint bins = level < 2 ? 4096u : 256u;
-    const uint at = pc[5];
-    uint remaining = level == 0 ? pc[1] : state[at + 1];
-    uint prefix = level == 0 ? 0u : state[at];
-    uint chosen = 0;
-    for (int b = int(bins) - 1; b >= 0; --b) {
-        const uint count = hist[pc[4] + uint(b)];
-        if (count >= remaining) { chosen = uint(b); break; }
-        remaining -= count;
-    }
-    prefix = level == 0 ? chosen : (prefix << (level < 2 ? 12u : 8u)) | chosen;
-    state[at] = prefix;
-    state[at + 1] = remaining;
-    if (level == 2) {
-        acc[2 * pc[2]] = prefix;       // the k-th largest value's bits
-        acc[2 * pc[3]] = remaining;    // how many of it are in the top k
-    }
-}
-
-#elif STAGE == 10  // SUM
-[[vk::binding(0, 0)]] StructuredBuffer<uint> cValues;
-[[vk::binding(1, 0)]] StructuredBuffer<uint> state;     // the threshold's bits
-[[vk::binding(2, 0)]] RWStructuredBuffer<uint> acc;
-// pc: n, groupsTotal, slotSum, slotInexact, stateOffset
-
+#else
 groupshared uint64_t gSum[256];
 groupshared uint gInexact;
 
@@ -557,13 +547,15 @@ groupshared uint gInexact;
 [numthreads(256, 1, 1)]
 void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
 {
+    const uint scale = group.y;
+    if (group.x >= pc[6 + scale]) return;
     if (local == 0) gInexact = 0;
     GroupMemoryBarrierWithGroupSync();
-    const uint threshold = state[pc[4]];
-    const uint stride = pc[1] * 256;
+    const uint threshold = state[scale * 2];
+    const uint stride = pc[6 + scale] * 256, n = pc[1 + scale];
     uint64_t sum = 0;
-    for (uint i = group.x * 256 + local; i < pc[0]; i += stride) {
-        const uint bits = cValues[i];
+    for (uint i = group.x * 256 + local; i < n; i += stride) {
+        const uint bits = c_value(scale, i);
         if (bits <= threshold) continue;
         // bits > threshold >= 0: a positive float, mantissa * 2^(e - 150), in units of 2^-24.
         const uint e = bits >> 23;
@@ -581,8 +573,83 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         GroupMemoryBarrierWithGroupSync();
     }
     if (local == 0) {
-        if (gSum[0] != 0) acc_add64(acc, pc[2], gSum[0]);
-        if (gInexact != 0) InterlockedOr(acc[2 * pc[3]], 1u);
+        const uint slot = pc[11] + scale * 4;
+        if (gSum[0] != 0) acc_add64(acc, slot, gSum[0]);
+        if (gInexact != 0) InterlockedOr(acc[2 * (slot + 3)], 1u);
+    }
+}
+#endif
+
+#elif STAGE == 9  // SELECT
+// A level of the radix select, a workgroup per scale: the bin the k-th
+// largest value is in, the first bin from the top at which the count from
+// the top reaches what is left of k (as a loop from the top would find it;
+// with none, the bottom bin and k less every count). 256 threads sum 16 bins
+// each (1 at the last level), the sums are scanned, and the thread whose
+// bins hold it finds the bin.
+[[vk::binding(0, 0)]] StructuredBuffer<uint> hist;
+[[vk::binding(1, 0)]] RWStructuredBuffer<uint> state;   // prefix, remaining
+[[vk::binding(2, 0)]] RWStructuredBuffer<uint> acc;
+// pc: level, k[5], the first scale's slot (sum, threshold, remaining, inexact: 4 a scale)
+
+groupshared uint gScan[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
+{
+    const uint scale = group.y, level = pc[0];
+    const uint bins = level < 2 ? 4096u : 256u, per = bins / 256;
+    const uint at = scale * 2, offset = (scale * 3 + level) * 4096;
+    const uint remaining = level == 0 ? pc[1 + scale] : state[at + 1];
+    const uint prefix = level == 0 ? 0u : state[at];
+    // The thread's bins, from the top: bins - 1 - per * local down.
+    const uint top = bins - 1 - per * local;
+    uint own = 0;
+    for (uint i = 0; i < per; ++i) own += hist[offset + top - i];
+    gScan[local] = own;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint step = 1; step < 256; step <<= 1) {  // inclusive scan: the count from the top to the thread's last bin
+        const uint add = local >= step ? gScan[local - step] : 0u;
+        GroupMemoryBarrierWithGroupSync();
+        gScan[local] += add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    const uint before = local == 0 ? 0u : gScan[local - 1];
+    bool write = false;
+    uint chosen = 0, left = 0;
+    if (remaining == 0) {  // the top bin's count reaches it at once
+        if (local == 0) {
+            chosen = bins - 1;
+            left = 0;
+            write = true;
+        }
+    } else if (gScan[local] >= remaining && before < remaining) {
+        uint counted = before;
+        for (uint i = 0; i < per; ++i) {
+            const uint count = hist[offset + top - i];
+            if (counted + count >= remaining) {
+                chosen = top - i;
+                left = remaining - counted;
+                break;
+            }
+            counted += count;
+        }
+        write = true;
+    } else if (local == 255 && gScan[255] < remaining) {  // no bin reaches it
+        chosen = 0;
+        left = remaining - gScan[255];
+        write = true;
+    }
+    if (write) {
+        const uint next = level == 0 ? chosen : (prefix << (level < 2 ? 12u : 8u)) | chosen;
+        state[at] = next;
+        state[at + 1] = left;
+        if (level == 2) {
+            const uint slot = pc[6] + scale * 4;
+            acc[2 * (slot + 1)] = next;  // the k-th largest value's bits
+            acc[2 * (slot + 2)] = left;  // how many of it are in the top k
+        }
     }
 }
 #endif
