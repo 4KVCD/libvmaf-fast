@@ -21,7 +21,6 @@ struct Params {
     uint shiftSq, addSq;
     int rdStride;        // samples per row of the next scale's images
     uint slot;           // this scale's first sum
-    uint gainA, gainB;   // the two gain limits; integers
     uint epsLo, epsHi;   // the kernel's eps as a double (unused: no NATIVE_F64)
 };
 [[vk::push_constant]] Params pc;

@@ -6,8 +6,12 @@
 //
 // VIF's statistics of a pixel (vif_statistic_calculation of
 // vif_statistics.cuh), shared by vif_hori.slang and vif_fused.slang, which
-// include it after declaring pc (gainA, gainB, epsLo, epsHi), logTable and
-// SUMS.
+// include it after declaring pc (epsLo, epsHi), logTable and SUMS.
+
+// The two enhancement gain limits, VMAF's and VMAF NEG's: VIF's passes make
+// the two together.
+#define VIF_GAIN_A 100u
+#define VIF_GAIN_B 1u
 
 // log_generate(32768 + i) for i = v & 0x7FFF: two 16-bit entries a word (the
 // values are 30720..32768), half the table a word each would take in the
@@ -246,8 +250,8 @@ bool fast_gain(int sigma12, int sigma1, int sigma2, out int sv, out int64_t term
     const int64_t residual = int64_t(sigma2) - q + int64_t(whole);
     sv = residual > 0 ? int(residual) : 0;  // residual <= sigma2
     // The gain terms, g capped at each limit.
-    if (uint64_t(uint(sigma12)) > uint64_t(pc.gainA) * uint(sigma1)) {
-        terms[0] = int64_t(uint64_t(pc.gainA) * pc.gainA * uint64_t(sigma1));
+    if (uint64_t(uint(sigma12)) > uint64_t(VIF_GAIN_A) * uint(sigma1)) {
+        terms[0] = int64_t(uint64_t(VIF_GAIN_A) * VIF_GAIN_A * uint64_t(sigma1));
     } else {
         const float psi = fraction - 2.0 * c;
         const float Et = (c + 1.0) * 1.9073486e-6 + P * 7.1054274e-15;  // 2^-19, 2^-47
@@ -256,8 +260,8 @@ bool fast_gain(int sigma12, int sigma1, int sigma2, out int sv, out int64_t term
             return false;
         terms[0] = q + int64_t(part);
     }
-    terms[1] = pc.gainB == pc.gainA || uint64_t(uint(sigma12)) <= uint64_t(pc.gainB) * uint(sigma1)
-        ? terms[0] : int64_t(uint64_t(pc.gainB) * pc.gainB * uint64_t(sigma1));
+    terms[1] = VIF_GAIN_B == VIF_GAIN_A || uint64_t(uint(sigma12)) <= uint64_t(VIF_GAIN_B) * uint(sigma1)
+        ? terms[0] : int64_t(uint64_t(VIF_GAIN_B) * VIF_GAIN_B * uint64_t(sigma1));
     return true;
 }
 
@@ -305,9 +309,9 @@ void statistics(uint mu1, uint mu2, uint xx, uint yy, uint xy, inout int sums[SU
         sv = residual(sigma2, gm, ge, sigma12);
         // The gain term is the same for both limits unless g is above the
         // lower one, and then that limit's term is just limit * limit * sigma1_sq.
-        terms[0] = gain_term(gm, ge, sigma1, pc.gainA);
-        terms[1] = pc.gainB == pc.gainA || !above(gm, ge, pc.gainB)
-            ? terms[0] : int64_t(uint64_t(pc.gainB) * pc.gainB * uint64_t(sigma1));
+        terms[0] = gain_term(gm, ge, sigma1, VIF_GAIN_A);
+        terms[1] = VIF_GAIN_B == VIF_GAIN_A || !above(gm, ge, VIF_GAIN_B)
+            ? terms[0] : int64_t(uint64_t(VIF_GAIN_B) * VIF_GAIN_B * uint64_t(sigma1));
     }
 #if VIF_STATS_VERIFY
     if (gained) {

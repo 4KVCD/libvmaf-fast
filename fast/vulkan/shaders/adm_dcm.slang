@@ -25,10 +25,7 @@ struct Params {
     int w, h;                       // the band images' size
     int inStride;                   // positions per band row
     int startRow, endRow, startCol, endCol;  // contrast masking's region
-    uint gainA, gainB;              // the gain limits: VMAF's, VMAF NEG's
     uint rfactor0, rfactor1, rfactor2;
-    int shiftSub0, shiftSub1, shiftSub2;
-    int shiftSq0, shiftSq1, shiftSq2;
     int shiftCub0, shiftCub1, shiftCub2;
     uint rowSlot;                   // this scale's first row sum (words / 2) in rowSums
 };
@@ -50,6 +47,20 @@ struct Params {
 #define HX (TX + 2)               // the tile and the positions around it
 #define HY (TY + 2)
 #define LIMITS 2
+// The gain limits, VMAF's and VMAF NEG's (the pass is for the two together),
+// and contrast masking's shifts but shiftCub, which the band width sets
+// (integer_adm_cuda.c's).
+#define GAIN_A 100
+#define GAIN_B 1
+#if SCALE0
+static const int kShiftSub[3] = { 10, 10, 12 }, kShiftSq[3] = { 29, 29, 30 };
+// And scale 0's rfactors (the engine's adm_rfactors).
+static const uint kRfactor0[3] = { 36453, 36453, 49417 };
+#define RFACTORS kRfactor0
+#else
+#define RFACTORS { pc.rfactor0, pc.rfactor1, pc.rfactor2 }
+static const int kShiftSq[3] = { 30, 30, 30 };
+#endif
 // csfF of both limits' three bands a position: 16-bit at scale 0 (three
 // words, two values each), 32-bit at the others.
 #if SCALE0
@@ -73,9 +84,8 @@ void decouple(int from, out int restored[LIMITS][3], out int csfA[LIMITS][3], ou
     int64_t oMagSq = int64_t(o[0]) * o[0] + int64_t(o[1]) * o[1];
     int64_t tMagSq = int64_t(t[0]) * t[0] + int64_t(t[1]) * t[1];
     bool aligned = within_one_degree(otDp, oMagSq, tMagSq);
-    const int64_t limits[LIMITS] = { aligned ? int64_t(pc.gainA) : int64_t(1),
-                                     aligned ? int64_t(pc.gainB) : int64_t(1) };
-    const uint rfactor[3] = { pc.rfactor0, pc.rfactor1, pc.rfactor2 };
+    const int limits[LIMITS] = { aligned ? GAIN_A : 1, aligned ? GAIN_B : 1 };
+    const uint rfactor[3] = RFACTORS;
     for (int b = 0; b < 3; ++b) {
 #if SCALE0
         int k = 32768;
@@ -85,7 +95,7 @@ void decouple(int from, out int restored[LIMITS][3], out int csfA[LIMITS][3], ou
         int product = k * o[b];
         [ForceUnroll]
         for (int v = 0; v < LIMITS; ++v) {
-            int restV = ((product + 16384) >> 15) * int(limits[v]);
+            int restV = ((product + 16384) >> 15) * limits[v];
             if (aligned) {
                 if (product > 0) restV = min(restV, t[b]);
                 if (product < 0) restV = max(restV, t[b]);
@@ -112,7 +122,8 @@ void decouple(int from, out int restored[LIMITS][3], out int csfA[LIMITS][3], ou
         }
         [ForceUnroll]
         for (int v = 0; v < LIMITS; ++v) {
-            int restV = saturate32(int64_t(int((k * o[b] + 16384) >> 15)) * limits[v]);
+            const int rest = int((k * o[b] + 16384) >> 15);
+            int restV = limits[v] == 1 ? rest : saturate32(int64_t(rest) * limits[v]);
             if (aligned && k > 0) {
                 if (o[b] > 0) restV = min(restV, t[b]);
                 if (o[b] < 0) restV = max(restV, t[b]);
@@ -195,9 +206,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     if (i < pc.endRow && j < pc.endCol) {
         const int rows[3] = { min(abs(i - 1), pc.h - 1), i, min(i + 1, pc.h - 1) };
         const int columns[3] = { min(abs(j - 1), pc.w - 1), j, min(j + 1, pc.w - 1) };
-        const uint rfactor[3] = { pc.rfactor0, pc.rfactor1, pc.rfactor2 };
-        const int shiftSub[3] = { pc.shiftSub0, pc.shiftSub1, pc.shiftSub2 };
-        const int shiftSq[3] = { pc.shiftSq0, pc.shiftSq1, pc.shiftSq2 };
+        const uint rfactor[3] = RFACTORS;
         const int shiftCub[3] = { pc.shiftCub0, pc.shiftCub1, pc.shiftCub2 };
         [ForceUnroll]
         for (int v = 0; v < LIMITS; ++v) {
@@ -223,12 +232,12 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
             for (int b = 0; b < 3; ++b) {
                 int source = restored[v][b];
 #if SCALE0
-                int value = abs(int(rfactor[b] * uint(source))) - (threshold << shiftSub[b]);
+                int value = abs(int(rfactor[b] * uint(source))) - (threshold << kShiftSub[b]);
 #else
                 int value = abs(int((int64_t(source) * int64_t(rfactor[b]) + 134217728) >> 28)) - threshold;
 #endif
                 value = max(value, 0);
-                int square = int((int64_t(value) * value + (1ll << (shiftSq[b] - 1))) >> shiftSq[b]);
+                int square = int((int64_t(value) * value + (1ll << (kShiftSq[b] - 1))) >> kShiftSq[b]);
                 const int64_t addCub = shiftCub[b] ? (1ll << (shiftCub[b] - 1)) : 0;
                 sums[v][b] = (int64_t(square) * value + addCub) >> shiftCub[b];
             }

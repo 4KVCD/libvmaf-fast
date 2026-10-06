@@ -939,7 +939,7 @@ int vv_context::build_passes()
                 // memory (shaders/vif_fused.slang).
                 const uint32_t fused[] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)sourceStride,
                                            shiftVP, addVP, shiftSq, addSq, (uint32_t)nextStride,
-                                           (uint32_t)(kSlotVif + scale * kVifSums), 100, 1,
+                                           (uint32_t)(kSlotVif + scale * kVifSums),
                                            (uint32_t)epsilon, (uint32_t)(epsilon >> 32) };
                 // 9 to 12 bits: the sums of squares in two 32-bit words (NARROW).
                 const int shader = scale == 0 ? (!deep ? kShader_vif_fused_0_8
@@ -959,7 +959,7 @@ int vv_context::build_passes()
             if (error)
                 break;
             const uint32_t horizontal[] = { (uint32_t)sw, (uint32_t)sh, (uint32_t)nextStride,
-                                            (uint32_t)(kSlotVif + scale * kVifSums), 100, 1,
+                                            (uint32_t)(kSlotVif + scale * kVifSums),
                                             (uint32_t)epsilon, (uint32_t)(epsilon >> 32) };
             const int horizontalShader = (nativeDouble ? kShader_vif_hori_native_0 : kShader_vif_hori_0) + scale;
             error = add_pass(scored, horizontalShader,
@@ -1044,12 +1044,12 @@ int vv_context::build_passes()
                 end_row = (bottom < (bh - 1)) ? bottom : ((bottom > (bh - 1)) ? bh : bh - 1);
             }
             const int rows = std::max(0, end_row - start_row);
-            static const int shift_sub[3] = { 10, 10, 12 }, fixed_shift[3] = { 4, 4, 3 };
-            static const int shift_xsq[3] = { 29, 29, 30 };
+            // The gain limits (100, 1) and the shifts but shiftCub are adm_dcm's own.
+            static const int fixed_shift[3] = { 4, 4, 3 };
             struct {
                 int32_t w, h, inStride, startRow, endRow, startCol, endCol;
-                uint32_t gainA, gainB, rfactor[3];
-                int32_t shiftSub[3], shiftSq[3], shiftCub[3];
+                uint32_t rfactor[3];
+                int32_t shiftCub[3];
                 uint32_t rowSlot;
             } constants = {};
             constants.w = bw;
@@ -1059,12 +1059,8 @@ int vv_context::build_passes()
             constants.endRow = start_row + rows;
             constants.startCol = start_col;
             constants.endCol = std::max(start_col, end_col);
-            constants.gainA = 100;
-            constants.gainB = 1;
             for (int band = 0; band < 3; ++band) {
                 constants.rfactor[band] = i_rfactor[scale * 3 + band];
-                constants.shiftSub[band] = scale == 0 ? shift_sub[band] : 0;
-                constants.shiftSq[band] = scale == 0 ? shift_xsq[band] : 30;
                 const double shift = scale == 0 ? ceil(log2((double)bw) - fixed_shift[band]) : ceil(log2((double)bw));
                 constants.shiftCub[band] = shift > 0 ? (int32_t)shift : 0;
             }
