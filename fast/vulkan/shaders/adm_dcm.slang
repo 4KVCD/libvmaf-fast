@@ -289,14 +289,18 @@ void store_f(uint at, int csfF[LIMITS][3])
 #endif
 }
 
-// The three bands' csfF of limit v at tile position `at`, added up.
-int f_sum(uint at, int v)
+// The three bands' csfF at tile position `at`, added up, of each limit: its
+// words read once for both.
+void add_f(uint at, inout int thresholds[LIMITS])
 {
 #if SCALE0
     const int w0 = int(gF[at * 3]), w1 = int(gF[at * 3 + 1]), w2 = int(gF[at * 3 + 2]);
-    return v == 0 ? sext16(w0) + (w0 >> 16) + sext16(w1) : (w1 >> 16) + sext16(w2) + (w2 >> 16);
+    thresholds[0] += sext16(w0) + (w0 >> 16) + sext16(w1);
+    thresholds[1] += (w1 >> 16) + sext16(w2) + (w2 >> 16);
 #else
-    return int(gF[at * 6 + uint(v * 3)]) + int(gF[at * 6 + uint(v * 3 + 1)]) + int(gF[at * 6 + uint(v * 3 + 2)]);
+    for (int v = 0; v < LIMITS; ++v)
+        thresholds[v] += int(gF[at * 6 + uint(v * 3)]) + int(gF[at * 6 + uint(v * 3 + 1)])
+                         + int(gF[at * 6 + uint(v * 3 + 2)]);
 #endif
 }
 
@@ -345,27 +349,31 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         const int columns[3] = { min(abs(j - 1), P_w - 1), j, min(j + 1, P_w - 1) };
         const uint rfactor[3] = RFACTORS;
         const int shiftCub[3] = { P_shiftCub0, P_shiftCub1, P_shiftCub2 };
-        [ForceUnroll]
-        for (int v = 0; v < LIMITS; ++v) {
-            // The 3x3 neighbourhood's csfF of every band, but the centre's own,
-            // which is csfA's.
-            int threshold = 0;
-            for (int di = 0; di < 3; ++di) {
-                for (int c = 0; c < 3; ++c) {
-                    if (di == 1 && c == 1) {
+        // The 3x3 neighbourhood's csfF of every band, but the centre's own,
+        // which is csfA's: both limits' thresholds.
+        int thresholds[LIMITS] = { 0, 0 };
+        for (int di = 0; di < 3; ++di) {
+            for (int c = 0; c < 3; ++c) {
+                if (di == 1 && c == 1) {
+                    [ForceUnroll]
+                    for (int v = 0; v < LIMITS; ++v) {
                         for (int theta = 0; theta < 3; ++theta) {
                             int center = abs(csfA[v][theta]);
 #if SCALE0
-                            threshold += sext16((8738 * center + 2048) >> 12);
+                            thresholds[v] += sext16((8738 * center + 2048) >> 12);
 #else
-                            threshold += high_round(286331153, center);
+                            thresholds[v] += high_round(286331153, center);
 #endif
                         }
-                    } else {
-                        threshold += f_sum(uint((rows[di] - y0 + 1) * HX + columns[c] - x0 + 1), v);
                     }
+                } else {
+                    add_f(uint((rows[di] - y0 + 1) * HX + columns[c] - x0 + 1), thresholds);
                 }
             }
+        }
+        [ForceUnroll]
+        for (int v = 0; v < LIMITS; ++v) {
+            const int threshold = thresholds[v];
             for (int b = 0; b < 3; ++b) {
                 int source = restored[v][b];
 #if SCALE0
