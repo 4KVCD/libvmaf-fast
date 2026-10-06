@@ -552,6 +552,10 @@ struct vv_context {
     // (vif_fused_0_16s; Core Ultra 9 285K's iGPU, 4K: 7.63 -> 7.46 ms), and
     // ADM scale 0's transform stores a so (adm_dwt_0_8a, _16a).
     bool samples16 = false;
+    // And 8-bit integers (VK_KHR_8bit_storage's storageBuffer8BitAccess,
+    // VK_KHR_shader_float16_int8's shaderInt8): VIF scale 0 reads 8-bit
+    // samples so (vif_fused_0_8s).
+    bool samples8 = false;
 
     std::vector<Pass> motion[2];  // by frame parity
     std::vector<Pass> scored;     // VIF and ADM
@@ -1113,7 +1117,7 @@ int vv_context::build_passes()
                                            (uint32_t)(kSlotVif + scale * kVifSums),
                                            (uint32_t)epsilon, (uint32_t)(epsilon >> 32) };
                 // 16-bit samples read as such where the GPU can (samples16).
-                const int shader = scale == 0 ? (!deep ? kShader_vif_fused_0_8
+                const int shader = scale == 0 ? (!deep ? (samples8 ? kShader_vif_fused_0_8s : kShader_vif_fused_0_8)
                                                  : samples16 ? kShader_vif_fused_0_16s : kShader_vif_fused_0_16)
                                               : kShader_vif_fused_1 + (scale - 1);
                 error = add_pass(scored, shader, { inRef, inDis, &rdRef[scale % 2], &rdDis[scale % 2], &acc, &logTable },
@@ -1811,6 +1815,26 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     storage16 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES };
     storage16.storageBuffer16BitAccess = samples16 ? VK_TRUE : VK_FALSE;
     enabled.shaderFloat64 = nativeDouble ? VK_TRUE : VK_FALSE;
+    VkPhysicalDevice8BitStorageFeaturesKHR storage8 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR };
+    VkPhysicalDeviceShaderFloat16Int8FeaturesKHR int8 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR };
+    if (has(VK_KHR_8BIT_STORAGE_EXTENSION_NAME) && has(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME)
+        && api->vkGetPhysicalDeviceFeatures2) {
+        VkPhysicalDeviceFeatures2 query = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        storage8.pNext = &int8;
+        query.pNext = &storage8;
+        api->vkGetPhysicalDeviceFeatures2(physical, &query);
+    }
+    samples8 = storage8.storageBuffer8BitAccess && int8.shaderInt8;
+    if (const char *text = getenv("VV_SAMPLES8"))
+        samples8 = samples8 && strcmp(text, "0") != 0;
+    storage8 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR };
+    storage8.storageBuffer8BitAccess = VK_TRUE;
+    int8 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR };
+    int8.shaderInt8 = VK_TRUE;
+    if (samples8) {
+        extensions.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
+        extensions.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+    }
     // Experiments (VV_PIPELINE_STATS=<file>): what the driver's compiler made
     // of each shader, appended to the file as its pipeline is made.
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executables = {
@@ -1830,6 +1854,11 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     if (samples16) {
         storage16.pNext = (void *)deviceInfo.pNext;
         deviceInfo.pNext = &storage16;
+    }
+    if (samples8) {
+        int8.pNext = (void *)deviceInfo.pNext;
+        storage8.pNext = &int8;
+        deviceInfo.pNext = &storage8;
     }
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;

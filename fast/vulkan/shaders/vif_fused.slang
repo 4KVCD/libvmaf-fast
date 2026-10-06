@@ -40,11 +40,18 @@ struct Params {
 #ifndef SAMPLES16
 #define SAMPLES16 0
 #endif
+#ifndef SAMPLES8
+#define SAMPLES8 0
+#endif
 #if SAMPLES16
 // The pictures' 16-bit samples read one at a time, where the GPU has 16-bit
 // storage access (the engine's choice): no shift or mask a sample.
 [[vk::binding(0, 0)]] StructuredBuffer<uint16_t> refIn;
 [[vk::binding(1, 0)]] StructuredBuffer<uint16_t> disIn;
+#elif SAMPLES8
+// And 8-bit samples, where it has 8-bit storage access.
+[[vk::binding(0, 0)]] StructuredBuffer<uint8_t> refIn;
+[[vk::binding(1, 0)]] StructuredBuffer<uint8_t> disIn;
 #else
 [[vk::binding(0, 0)]] StructuredBuffer<uint> refIn;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> disIn;
@@ -105,7 +112,7 @@ groupshared int gTotals[WORDS];
 // column's sample out of it (pictures of 8 or 16 bits a sample).
 uint2 samples_at(int at, uint shift, uint mask)
 {
-#if SAMPLES16
+#if SAMPLES16 || SAMPLES8
     return uint2(uint(refIn[at]), uint(disIn[at]));
 #elif SRC_PICTURE
     return uint2((refIn[at] >> shift) & mask, (disIn[at] >> shift) & mask);
@@ -131,8 +138,8 @@ void vertical(int x, int y, uint at)
 {
     // Each tap's word: its row's first (rows inside the picture a stride
     // apart, the others mirrored) plus the column's.
-#if SAMPLES16
-    const int column = x;  // in samples: rows 2 stride apart
+#if SAMPLES16 || SAMPLES8
+    const int column = x;  // in samples: rows 2 (4) stride apart
     const uint shift = 0, mask = 0xFFFFu;
 #elif SRC_PICTURE && BPC16
     const int column = x >> 1;
@@ -146,6 +153,8 @@ void vertical(int x, int y, uint at)
 #endif
 #if SAMPLES16
     const int stride = 2 * kStride;  // samples a row
+#elif SAMPLES8
+    const int stride = 4 * kStride;
 #else
     const int stride = kStride;
 #endif
