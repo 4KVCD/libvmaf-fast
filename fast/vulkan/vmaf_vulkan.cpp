@@ -424,6 +424,10 @@ struct Pass {
     // Per slot, where the pass reads the slot's own staging buffer (VMAF v1's
     // passes that read the pictures): the set for each slot, in place of `set`.
     std::vector<VkDescriptorSet> slotSets;
+    // Independent of the pass after it (neither writes what the other reads
+    // or writes): no barrier between them, so that the GPU runs them together
+    // (but when profiling, which times each).
+    bool overlapNext = false;
 };
 
 // A buffer a pass binds, or part of one (at a multiple of the storage
@@ -1809,6 +1813,10 @@ int vv_context::enable_cambi(const double *values)
     }
     Buffer *image = &cambiImage, *mask = &cambiMaskFull;
     int inW = w;
+    // The scales' c-values (each from its filtered image and mask) after all
+    // of those, together: the small scales' few workgroups, one row after
+    // another, took about as long as scale 0's, the GPU mostly idle.
+    std::vector<Pass> cvalues;
     for (int scale = 0; scale < V1_CAMBI_SCALES && !error; ++scale) {
         const int sw = c.scale_w[scale], sh = c.scale_h[scale];
         if (scale == 0 && c.speedup) {  // FRONT wrote them
@@ -1837,13 +1845,17 @@ int vv_context::enable_cambi(const double *values)
             }
             constants[14] = rows;
             const bool slide = (c.window_size >> 1) <= 32 && c.v_band_size <= 32 * 56 && !cambiBruteForce;
-            error = slide ? add_pass(scored, kShader_cambi_cvalues_slide, { &cambiFiltered[scale], mask, &cambiC[scale],
+            error = slide ? add_pass(cvalues, kShader_cambi_cvalues_slide, { &cambiFiltered[scale], mask, &cambiC[scale],
                                      &cambiReciprocal }, constants, sizeof constants, groups(sw, 64), groups(sh, (int)rows))
-                          : add_pass(scored, kShader_cambi_cvalues, { &cambiFiltered[scale], mask, &cambiC[scale],
+                          : add_pass(cvalues, kShader_cambi_cvalues, { &cambiFiltered[scale], mask, &cambiC[scale],
                                      &cambiReciprocal }, constants, sizeof constants, groups(sw, 16), groups(sh, 16));
         }
         inW = sw;
         image = &cambiFiltered[scale];
+    }
+    for (size_t i = 0; i < cvalues.size(); ++i) {
+        cvalues[i].overlapNext = i + 1 < cvalues.size();
+        scored.push_back(cvalues[i]);
     }
     // spatial_pooling's top k of the five scales together: the radix select's
     // three levels (HIST, SELECT) and the sum above the k-th largest (SUM).
@@ -2260,7 +2272,8 @@ int vv_context::commit(bool score)
                 vk.vkCmdDispatchIndirect(cb, pass.indirect, pass.indirectOffset);
             else
                 vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], pass.groups[2]);
-            barrier(vk, cb, kCompute, kCompute | kTransfer | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
+            if (!pass.overlapNext || profile)
+                barrier(vk, cb, kCompute, kCompute | kTransfer | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
             stamp(pass.shader);
         }
     }
