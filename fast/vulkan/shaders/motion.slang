@@ -25,8 +25,12 @@ struct Params {
 
 static const uint kFilter[5] = { 3571, 16004, 26386, 16004, 3571 };
 
-#define TW 32             // the group's tile: TW x TH pixels, two a thread
-#define TH 16
+// The group's tile: TW x TH pixels, two a thread. Timed at 4K on the Core
+// Ultra 9 285K's iGPU: 64 x 8 1.33 ms, against 1.37 for 32 x 16, 1.34 for
+// 96 x 8 and 64 x 12, 1.40 for 64 x 16 and 128 x 8, 1.44 for 32 x 32 and
+// 64 x 4, 1.51 for 128 x 4, 1.56 for 16 x 32 and 128 x 2.
+#define TW 64
+#define TH 8
 #define REACH 2           // the filter's reach either side
 #define IN_W (TW + 2 * REACH)
 #define IN_H (TH + 2 * REACH)
@@ -160,7 +164,7 @@ void main(uint3 group : SV_GroupID, uint3 lid : SV_GroupThreadID, uint local : S
     }
     gDistances[local] = distance;
     GroupMemoryBarrierWithGroupSync();
-    if (local < 16) {
+    if (local < uint(TW / 2 * TH / 16)) {
         uint sum = 0;
         for (uint i = 0; i < 16; ++i)
             sum += gDistances[local * 16 + i];
@@ -169,7 +173,7 @@ void main(uint3 group : SV_GroupID, uint3 lid : SV_GroupThreadID, uint local : S
     GroupMemoryBarrierWithGroupSync();
     if (local == 0) {
         uint sum = 0;
-        for (uint i = 0; i < 16; ++i)
+        for (uint i = 0; i < uint(TW / 2 * TH / 16); ++i)
             sum += gDistances[i * 16];
         if (sum != 0)
             acc_add64(acc, pc.slot, uint64_t(sum));

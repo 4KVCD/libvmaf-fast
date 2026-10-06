@@ -943,7 +943,7 @@ int vv_context::build_passes()
         const int32_t constants[] = { w, h, strideWords, bpc, 1 << (bpc - 1), kSlotSad };
         error = add_pass(motion[parity], deep ? kShader_motion_16 : kShader_motion_8,
                          { &picRef, &blur[parity], &blur[1 - parity], &acc }, constants, sizeof constants,
-                         groups(w, 32), groups(h, 16));
+                         groups(w, 64), groups(h, 8));
     }
 
     // VIF (integer_vif_cuda.c: filter1d_8, filter1d_16).
