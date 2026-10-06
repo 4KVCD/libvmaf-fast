@@ -441,6 +441,9 @@ struct Slot {
 };
 
 enum { kPushBytes = 128, kMaxBindings = 9 };
+// vif_fused.slang's tile rows (TH) at each scale: the build script's TH
+// defines. Its tiles are 160 pixels wide.
+const uint32_t kVifTileRows[4] = { 2, 1, 2, 2 };
 static_assert(kMaxBindings <= sizeof(Pass::bound) / sizeof(Pass::bound[0]), "Pass::bound holds a pass's buffers");
 // adm_dcm.slang's tile of contrast masking's positions (its TX x TY).
 const int kDcmTile[2] = { 16, 8 };
@@ -973,7 +976,7 @@ int vv_context::build_passes()
                 const int shader = scale == 0 ? (deep ? kShader_vif_fused_0_16 : kShader_vif_fused_0_8)
                                               : kShader_vif_fused_1 + (scale - 1);
                 error = add_pass(scored, shader, { inRef, inDis, &rdRef[scale % 2], &rdDis[scale % 2], &acc, &logTable },
-                                 fused, sizeof fused, groups(sw, 160), groups(sh, 1));  // its TW x TH tiles
+                                 fused, sizeof fused, groups(sw, 160), groups(sh, kVifTileRows[scale]));  // its TW x TH tiles
                 sourceStride = nextStride;
                 continue;
             }

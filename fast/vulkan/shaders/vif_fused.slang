@@ -39,20 +39,23 @@ struct Params {
 #define OFF ((FW - FW_RD) / 2)
 #define SMALL (SRC_PICTURE && !BPC16)
 #define SUMS 9
-// The tile: TW pixels along a row, TH rows, a thread a pixel. Timed on the
-// Core Ultra 9 285K's iGPU (1080p VIF scale 0): of 20 shapes, two rows of 80
-// or 96 were the fastest once the group's sums were subgroup sums; with the
-// sums packed and the sums of squares in 32-bit words, one row of 160 (2.85 ms,
-// against 2.91 for 80 x 2, 2.90 for 192 x 1, 2.94 for 128 x 1, 2.98 for
-// 64 x 2, 3.01 for 112 x 2, 3.43 for 240 x 1). Rows share no vertical work;
-// a wider tile computes fewer columns beyond its pixels (16 of 176 here).
+// The tile: TW pixels along a row, TH rows (the build's, per scale), THREADS
+// threads. Timed on the Core Ultra 9 285K's iGPU: at 1080p scale 0, of 20
+// shapes of a pixel a thread, one row of 160 was the fastest (2.85 ms, against
+// 2.91 for 80 x 2, 2.90 for 192 x 1, 2.94 for 128 x 1, 2.98 for 64 x 2, 3.01
+// for 112 x 2, 3.43 for 240 x 1). Then two rows of 160, two pixels a thread,
+// each thread's sums added into the group's once (4K: scale 0 8.92 -> 8.13
+// ms, 2 0.331 -> 0.293, 3 0.076 -> 0.070; scale 1 1.50 -> 2.01, kept at one
+// row; scale 0 at 144 x 2 8.49, 176 x 2 8.65, 192 x 2 11.2, 160 x 3 10.7).
+// Rows share no vertical work; a wider tile computes fewer columns beyond its
+// pixels (16 of 176 here).
 #define TW 160
 #ifndef TH
 #define TH 1
 #endif
 #define THREADS 160
-#if TW * TH > 255
-#error "group_words packs the sums of at most 255 pixels"
+#if TW * TH > 511
+#error "group_words packs the sums of at most 511 pixels"
 #endif
 #define TCOLS (TW + FW - 1)    // the columns the tile's horizontal filters read
 // The group's sums: the nine of statistics(), the fourth (num_non_log, 31
@@ -245,8 +248,8 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     // Each subgroup's sum of every word, added into the group's: the words'
     // sums are the values' sums, packed the same way (nothing overflows its
     // field: see group_words).
-    const int words[WORDS] = { totals[0] + (totals[1] << 13) + (totals[5] << 21), totals[2], totals[3], totals[4],
-                               totals[7], totals[9], totals[6] + (totals[8] << 15) };
+    const int words[WORDS] = { totals[0] + (totals[1] << 14) + (totals[5] << 23), totals[2], totals[3], totals[4],
+                               totals[7], totals[9], totals[6] + (totals[8] << 16) };
     for (int i = 0; i < WORDS; ++i) {
         const int sum = WaveActiveSum(words[i]);
         if (WaveIsFirstLane())
@@ -254,16 +257,17 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     }
     GroupMemoryBarrierWithGroupSync();
     if (local < SUMS) {  // a sum a thread
-        // group_words: a group has at most 255 pixels, and a pixel adds
+        // group_words: a group has at most 511 pixels, and a pixel adds
         // -16..-3 to x, 0 or 1 to num_x and den_non_log, -63..63 to each
-        // limit's x2: x (at least -4080) in the first word's low 13 bits,
-        // num_x and den_non_log (at most 255) 8 bits each above it; the two x2
-        // (within +-16065) in 15 bits each of the last word.
+        // limit's x2: x (at least -8176) in the first word's low 14 bits,
+        // num_x and den_non_log (at most 511) 9 bits each above it (the word
+        // taken modulo 2^32); the two x2 (within +-32193) in 16 bits each of
+        // the last word.
         const int first = gTotals[0], last = gTotals[6];
-        const int x = (first << 19) >> 19, x2 = (last << 17) >> 17;
-        const int counts = (first - x) >> 13;
-        const int values[SUMS] = { x, counts & 0xFF, gTotals[1], 0, counts >> 8, x2, gTotals[4], (last - x2) >> 15,
-                                   gTotals[5] };
+        const int x = (first << 18) >> 18, x2 = (last << 16) >> 16;
+        const uint counts = uint(first - x) >> 14;
+        const int values[SUMS] = { x, int(counts & 0x1FFu), gTotals[1], 0, int(counts >> 9), x2, gTotals[4],
+                                   (last - x2) >> 16, gTotals[5] };
         const int64_t value = local == 3 ? int64_t(gTotals[2]) + (int64_t(gTotals[3]) << 16) : int64_t(values[local]);
         if (value != 0)
             acc_add64(acc, pc.slot + local, uint64_t(value));
