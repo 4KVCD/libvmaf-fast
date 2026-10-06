@@ -29,6 +29,10 @@ struct Params {
 [[vk::binding(1, 0)]] RWStructuredBuffer<uint> acc;
 
 groupshared uint64_t gSums[128 * 3];
+#if !ROWWISE
+// Each warp's sums in eight parts a band: [warp][band][part].
+groupshared uint64_t gParts[4 * 3 * 8];
+#endif
 
 #if ROWWISE
 // VMAF v1 follows libvmaf's CPU code (adm_csf_den_scale, adm_csf_den_s123 of
@@ -105,15 +109,25 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
     for (int b = 0; b < 3; ++b)
         gSums[local * 3 + b] = sums[b];
     GroupMemoryBarrierWithGroupSync();
-    if ((local & 31) == 0) {
-        for (int b = 0; b < 3; ++b) {
-            uint64_t sum = 0;
-            for (uint t = 0; t < 32; ++t)
-                sum += gSums[(local + t) * 3 + b];
-            sum = (sum + pc.addAccum) >> pc.shiftAccum;
-            if (sum != 0)
-                acc_add64(acc, pc.slot + uint(b), sum);
-        }
+    // A warp's 32 threads' sums of a band added up in eight parts of four
+    // (24 of its threads, a part each), then the parts (three threads, a
+    // band each): the warp's sum, whatever the order, rounded as before.
+    const uint warp = local / 32, lane = local % 32;
+    if (lane < 24) {
+        const uint b = lane / 8, part = lane % 8, first = warp * 32 + part * 4;
+        uint64_t sum = 0;
+        for (uint t = 0; t < 4; ++t)
+            sum += gSums[(first + t) * 3 + b];
+        gParts[(warp * 3 + b) * 8 + part] = sum;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane < 3) {
+        uint64_t sum = 0;
+        for (uint part = 0; part < 8; ++part)
+            sum += gParts[(warp * 3 + lane) * 8 + part];
+        sum = (sum + pc.addAccum) >> pc.shiftAccum;
+        if (sum != 0)
+            acc_add64(acc, pc.slot + lane, sum);
     }
 }
 #endif
