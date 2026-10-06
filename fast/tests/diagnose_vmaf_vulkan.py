@@ -165,7 +165,9 @@ def diagnose(device: int, name: str) -> bool:
         want = reference[str(bits)]
         print(f"== {bits}-bit")
         got = full_sums(device, bits)
-        differing = [(frame, slot) for frame in range(len(got)) for slot in range(len(got[frame]))
+        # (The engine's later slots, VMAF v1's CAMBI, are not VMAF v0.6.1's: the reference has none.)
+        differing = [(frame, slot) for frame in range(len(got))
+                     for slot in range(min(len(got[frame]), len(want["frames"][frame])))
                      if got[frame][slot] != want["frames"][frame][slot]]
         digest = vmaf_vulkan.probe_sums(device, bits)
         expected = vmaf_vulkan._PROBE_SUMS[bits == 10]
@@ -182,7 +184,7 @@ def diagnose(device: int, name: str) -> bool:
         for count, step in enumerate(want["passes"], start=1):
             known.update(step["buffers"])
             sums, buffers = after_passes(device, bits, count)
-            bad_sums = [slot for slot in range(len(sums)) if sums[slot] != step["sums"][slot]]
+            bad_sums = [slot for slot in range(min(len(sums), len(step["sums"]))) if sums[slot] != step["sums"][slot]]
             bad_buffers = [label for label, words in buffers.items()
                            if hashlib.sha256(words.tobytes()).hexdigest() != known[label]["sha256"]]
             verdict = "same" if not bad_sums and not bad_buffers else "DIFFERENT"
@@ -212,7 +214,7 @@ def diagnose(device: int, name: str) -> bool:
         print("3. the scale-0 decouple shader built other ways")
         other = full_sums(device, bits, 1)
         wrong = sum(other[frame][slot] != want["frames"][frame][slot]
-                    for frame in range(len(other)) for slot in range(len(other[frame])))
+                    for frame in range(len(other)) for slot in range(min(len(other[frame]), len(want["frames"][frame]))))
         print(f"   the table read at o + 32768, as it was (variant 1): "
               f"{'ALL SUMS MATCH' if not wrong else f'{wrong} sums differ'}")
         print(f"   the division table in the GPU's memory: {table_check(device, bits)}")
