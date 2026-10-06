@@ -63,25 +63,21 @@ uint log_generate(uint v)
     return log_table(i);
 }
 
-// get_best16_from64
+// get_best16_from64 (v != 0): v shifted right by s to bring its highest set
+// bit to bit 15 (left where s < 0), and x = -s. Its three cases -- leading
+// zeros above 48, below 47, and 47 or 48 (bit 16 then shifted out) -- are
+// each that shift. Made from v's 32-bit halves: 64-bit shifts take several
+// instructions on GPUs without 64-bit integers.
 uint best16(uint64_t v, out int x)
 {
-    int k = 63 - msb64(v);
-    if (k > 48) {
-        k -= 48;
-        x = k;
-        return uint(v << k) & 0xFFFFu;
-    } else if (k < 47) {
-        k = 48 - k;
-        x = -k;
-        return uint(v >> k) & 0xFFFFu;
-    }
-    x = 0;
-    if ((v >> 16) != 0) {
-        v >>= 1;
-        x = -1;
-    }
-    return uint(v) & 0xFFFFu;
+    const uint hi = uint(v >> 32), lo = uint(v);
+    const int s = (hi != 0 ? 32 + msb32(hi) : msb32(lo)) - 15;
+    x = -s;
+    if (s <= 0)
+        return (lo << uint(-s)) & 0xFFFFu;
+    if (s < 32)
+        return ((lo >> uint(s)) | (hi << uint(32 - s))) & 0xFFFFu;
+    return (hi >> uint(s - 32)) & 0xFFFFu;
 }
 
 // g = sigma12 / (sigma1_sq + eps) as a double's mantissa and exponent:
@@ -372,11 +368,14 @@ void statistics(uint mu1, uint mu2, uint xx, uint yy, uint xy, inout int sums[SU
     uint numer1 = uint(sv + kSigmaNsq);
     int x2;
     uint denLog = log_generate(best16(uint64_t(numer1), x2));
-    for (int v = 0; v < 2; ++v) {
-        int64_t numer = int64_t(numer1) + terms[v];
-        int x1;
-        uint numLog = log_generate(best16(uint64_t(numer), x1));
-        sums[5 + 2 * v] += x2 - x1;
-        sums[6 + 2 * v] += int(numLog) - int(denLog);
-    }
+    // The second limit's numerator is the first's unless its gain term
+    // differs (g above the lower limit): its log made only then.
+    int x1;
+    uint numLog = log_generate(best16(uint64_t(int64_t(numer1) + terms[0]), x1));
+    sums[5] += x2 - x1;
+    sums[6] += int(numLog) - int(denLog);
+    if (terms[1] != terms[0])
+        numLog = log_generate(best16(uint64_t(int64_t(numer1) + terms[1]), x1));
+    sums[7] += x2 - x1;
+    sums[8] += int(numLog) - int(denLog);
 }
