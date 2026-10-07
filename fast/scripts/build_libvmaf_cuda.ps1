@@ -2,19 +2,25 @@
 # Netflix/vmaf with the pull requests README.md lists merged, for VMAF
 # and VMAF NEG on NVIDIA GPUs.
 #
-# Needs git, Visual Studio 2022 Build Tools (C++), the CUDA Toolkit (13.x),
+# Needs git, Visual Studio 2022 Build Tools (C++), the CUDA Toolkit (13.x; not with -NoCuda),
 # Python with meson and ninja (pip install meson ninja), and nasm, cmake and
 # xxd on PATH (Git for Windows has xxd in usr\bin). The CUDA runtime is not
 # linked: libvmaf loads the NVIDIA driver (nvcuda.dll) when it starts.
 #
 # libvmaf reports the commit it was built from as its version: build from a
 # clean checkout of the commit that is released.
+#
+# -NoCuda: libvmaf without CUDA, on a PC without the CUDA Toolkit (its CPU
+# code is the same; the vmaf_cuda_* functions are not exported). It also
+# builds Netflix's own tree when this script is copied into it (benchmarks
+# against official libvmaf: VideoMetricsLab's scripts/bench_release.py).
 param(
     [string]$NvCodecHeadersCommit = 'eddcea9e27f6b772057c9b3f87de2cc1737faffc',  # 13.1.15.1 in development
     [string]$Python = 'python',
     [string]$CudaPath = $env:CUDA_PATH,
     [string]$WorkDirectory = (Join-Path $env:TEMP 'libvmaf-fast-build'),
-    [string]$OutputDirectory = ''  # default: fast/dist/libvmaf
+    [string]$OutputDirectory = '',  # default: fast/dist/libvmaf
+    [switch]$NoCuda
 )
 $ErrorActionPreference = 'Stop'
 # libvmaf's public API (include/libvmaf/*.h): what the DLL exports.
@@ -32,6 +38,8 @@ $exports = @(
     'vmaf_cuda_state_init', 'vmaf_cuda_import_state', 'vmaf_cuda_preallocate_pictures',
     'vmaf_cuda_fetch_preallocated_picture'
 )
+if ($NoCuda) { $exports = $exports | Where-Object { -not $_.StartsWith('vmaf_cuda_') } }
+$cuda = if ($NoCuda) { 'false' } else { 'true' }
 $repository = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $outputDirectory = if ($OutputDirectory) { $OutputDirectory } else { Join-Path $repository 'fast/dist/libvmaf' }
 $output = Join-Path $outputDirectory 'libvmaf.dll'
@@ -61,8 +69,8 @@ function Invoke-Checked([string]$what, [scriptblock]$command) {
 $savedEnvironment = @{}
 Get-ChildItem env: | ForEach-Object { $savedEnvironment[$_.Name] = $_.Value }
 try {
-    if (-not $CudaPath -or -not (Test-Path (Join-Path $CudaPath 'bin/nvcc.exe'))) {
-        throw 'The CUDA Toolkit was not found: pass -CudaPath or set CUDA_PATH'
+    if (-not $NoCuda -and (-not $CudaPath -or -not (Test-Path (Join-Path $CudaPath 'bin/nvcc.exe')))) {
+        throw 'The CUDA Toolkit was not found: pass -CudaPath or set CUDA_PATH (or -NoCuda: libvmaf without CUDA)'
     }
     # The Visual Studio environment, taken into this session.
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -78,19 +86,24 @@ try {
     # Git's usr\bin (xxd) goes last: it has a link.exe of its own.
     # Python's own folder too: meson looks for ninja on PATH.
     $pythonDirectory = Split-Path (& $Python -c 'import sys; print(sys.executable)')
-    $env:PATH = "$CudaPath\bin;$pythonDirectory;$env:PATH;$env:ProgramFiles\Git\usr\bin"
+    $env:PATH = "$pythonDirectory;$env:PATH;$env:ProgramFiles\Git\usr\bin"
     $env:CC = 'cl'; $env:CXX = 'cl'
-    $env:CUDA_PATH = $CudaPath
+    if (-not $NoCuda) {
+        $env:PATH = "$CudaPath\bin;$env:PATH"
+        $env:CUDA_PATH = $CudaPath
+    }
 
     New-Item -ItemType Directory -Path $WorkDirectory -Force | Out-Null
     $vmaf = $repository
     $headers = Join-Path $WorkDirectory 'nv-codec-headers'
     $build = Join-Path $WorkDirectory 'build'
 
-    if (-not (Test-Path (Join-Path $headers '.git'))) {
-        Invoke-Checked 'Cloning nv-codec-headers' { git clone --quiet https://github.com/FFmpeg/nv-codec-headers.git $headers }
+    if (-not $NoCuda) {
+        if (-not (Test-Path (Join-Path $headers '.git'))) {
+            Invoke-Checked 'Cloning nv-codec-headers' { git clone --quiet https://github.com/FFmpeg/nv-codec-headers.git $headers }
+        }
+        Invoke-Checked 'Checking out nv-codec-headers' { git -C $headers -c advice.detachedHead=false checkout --quiet --force $NvCodecHeadersCommit }
     }
-    Invoke-Checked 'Checking out nv-codec-headers' { git -C $headers -c advice.detachedHead=false checkout --quiet --force $NvCodecHeadersCommit }
 
     Invoke-Checked 'Fetching pthread-win32' {
         git -C $vmaf submodule update --quiet --init --force libvmaf/subprojects/pthread-win32
@@ -100,11 +113,11 @@ try {
     # at spaces (a profile like C:\Users\Jo Smith), and nvcc's custom targets do
     # not get c_args at all; cl, nvcc's host compiler too, reads INCLUDE.
     $nvInclude = Join-Path $headers 'include'
-    $env:INCLUDE = "$nvInclude;$env:INCLUDE"
+    if (-not $NoCuda) { $env:INCLUDE = "$nvInclude;$env:INCLUDE" }
     if (Test-Path $build) { Remove-Item -Recurse -Force $build }
     Invoke-Checked 'Configuring libvmaf' {
         & $Python -m mesonbuild.mesonmain setup (Join-Path $vmaf 'libvmaf') $build --buildtype release `
-            --default-library static -Denable_cuda=true -Denable_nvcc=true -Denable_tests=false `
+            --default-library static "-Denable_cuda=$cuda" "-Denable_nvcc=$cuda" -Denable_tests=false `
             -Denable_tools=false -Denable_docs=false -Denable_float=false -Dbuilt_in_models=true -Db_vscrt=mt `
             -Dc_args=/Brepro -Dcpp_args=/Brepro -Dc_link_args=/Brepro -Dcpp_link_args=/Brepro
     }
@@ -135,22 +148,28 @@ try {
     New-Item -ItemType Directory -Path $licenses -Force | Out-Null
     Copy-Item (Join-Path $vmaf 'LICENSE') (Join-Path $licenses 'LICENSE.libvmaf.txt')
     Copy-Item (Join-Path $vmaf 'libvmaf/subprojects/pthread-win32/docs/LICENSE.md') (Join-Path $licenses 'LICENSE.pthreads4w.txt')
-    # The xpsnr extractor is a port of FFmpeg's filter, under its licence.
-    Set-Content -Path (Join-Path $licenses 'LICENSE.xpsnr.txt') -Encoding ascii -Value (
-        @('libvmaf/src/feature/xpsnr.c and xpsnr_template.c, ported from FFmpeg''s libavfilter/vf_xpsnr.c',
-          '(Copyright (c) 2024 Christian R. Helmrich, Christian Lehmann, Christian Stoffers), are under the',
-          'GNU Lesser General Public License, version 2.1 or later; the rest of libvmaf under BSD+Patent', '') +
-        (Get-Content (Join-Path $vmaf 'libvmaf/COPYING.LGPLv2.1')))
+    # The xpsnr extractor is a port of FFmpeg's filter, under its licence
+    # (this fork's; Netflix's tree has none).
+    if (Test-Path (Join-Path $vmaf 'libvmaf/src/feature/xpsnr.c')) {
+        Set-Content -Path (Join-Path $licenses 'LICENSE.xpsnr.txt') -Encoding ascii -Value (
+            @('libvmaf/src/feature/xpsnr.c and xpsnr_template.c, ported from FFmpeg''s libavfilter/vf_xpsnr.c',
+              '(Copyright (c) 2024 Christian R. Helmrich, Christian Lehmann, Christian Stoffers), are under the',
+              'GNU Lesser General Public License, version 2.1 or later; the rest of libvmaf under BSD+Patent', '') +
+            (Get-Content (Join-Path $vmaf 'libvmaf/COPYING.LGPLv2.1')))
+    }
     # nv-codec-headers' CUDA loader is compiled in; its MIT notice is the
     # comment its headers open with.
-    $loader = Get-Content (Join-Path $nvInclude 'ffnvcodec/dynlink_loader.h')
-    $end = [Array]::FindIndex($loader, [Predicate[string]] { param($line) $line.Trim() -eq '*/' })
-    Set-Content -Path (Join-Path $licenses 'LICENSE.nv-codec-headers.txt') -Encoding ascii -Value (
-        @('nv-codec-headers (https://github.com/FFmpeg/nv-codec-headers), commit ' + $NvCodecHeadersCommit, '') +
-        ($loader[1..($end - 1)] | ForEach-Object { $_ -replace '^ \* ?', '' }))
+    if (-not $NoCuda) {
+        $loader = Get-Content (Join-Path $nvInclude 'ffnvcodec/dynlink_loader.h')
+        $end = [Array]::FindIndex($loader, [Predicate[string]] { param($line) $line.Trim() -eq '*/' })
+        Set-Content -Path (Join-Path $licenses 'LICENSE.nv-codec-headers.txt') -Encoding ascii -Value (
+            @('nv-codec-headers (https://github.com/FFmpeg/nv-codec-headers), commit ' + $NvCodecHeadersCommit, '') +
+            ($loader[1..($end - 1)] | ForEach-Object { $_ -replace '^ \* ?', '' }))
+    }
 
     $hash = (Get-FileHash $output -Algorithm SHA256).Hash.ToLowerInvariant()
-    Write-Host "libvmaf-fast ($(git -C $vmaf describe --always --dirty)) with CUDA: $output"
+    $with = if ($NoCuda) { 'without CUDA' } else { 'with CUDA' }
+    Write-Host "libvmaf ($(git -C $vmaf describe --always --dirty)) $($with): $output"
     Write-Host "SHA-256 $hash, $((Get-Item $output).Length) bytes"
 }
 finally {

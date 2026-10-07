@@ -91,7 +91,13 @@ def _load() -> ctypes.CDLL:
             ("vmaf_model_destroy", None, [handle]),
             ("vmaf_close", ctypes.c_int, [handle]),
         ):
-            function = getattr(lib, name)
+            function = getattr(lib, name, None)
+            if function is None and name.startswith("vmaf_cuda_"):
+                # libvmaf built without CUDA (build_libvmaf_cuda.ps1 -NoCuda): its CPU code and the
+                # predictions vulkan and v1 make with it work; a GpuScorer fails on the missing function.
+                continue
+            if function is None:
+                raise AttributeError(f"{LIBRARY_PATH.name} has no {name}")
             function.restype, function.argtypes = restype, argtypes
         _library = lib
     return _library
