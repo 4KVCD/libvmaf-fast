@@ -33,14 +33,23 @@ runs with decoding.
   `vmaf_v1.0.16_1d5h_2160` at 4K. The CPU code gets 4:2:0 pictures, as
   FFmpeg's libvmaf filter gives it, and all of the CPU's threads.
 - **Method**: first a warm-up (20 s of the new build on the CPU, then on each
-  GPU), then every implementation back to back, each in a process of its own:
-  set up once, given the 48 frame pairs once untimed (the scores checked),
-  then 3 rounds of at least 10 s, looping over them, each timed from the end
-  of one pass over the frames to the end of another (a scorer takes a pair
-  only when it has room for it, so its queue is as full at both ends). Its
-  number is the median of the 3 rounds. Each implementation waits until no
-  other benchmark runs, no other process uses an NVIDIA GPU and the CPU is
-  under 15% busy.
+  GPU). Then, metric by metric and device by device (the CPU, CUDA, each
+  GPU), its implementations there are set up, each in a process of its own,
+  set up once and given the 48 frame pairs once untimed (the scores
+  checked), and they take turns: round 1 of each, round 2 of each, round 3
+  of each, back to back. (A whole metric's processes alive at once, 8 at
+  4K, held enough memory to slow the iGPU by a quarter; a device's few do
+  not.) A round fills the scorer's queue
+  with a pass over the frames, then loops over them for at least 10 s,
+  timed from the end of one pass to the end of another (a scorer takes a
+  pair only when it has room for it, so its queue is as full at both ends),
+  then waits for its queue to empty, so none of its work runs into the next
+  one's round. Its number is the median of its 3 rounds. Taking turns puts
+  what the PC does from one minute to the next (the CPU's speed drifted
+  about 10% between minutes on the main PC) on all the implementations
+  that are close to each other alike. Each round waits until no other benchmark runs,
+  no other process uses an NVIDIA GPU and the CPU is under 15% busy. The
+  frames are shared between the processes (mapped, not copied).
 - **Score checks**, per frame, against the baselines. Expected: the new CPU
   VMAF + NEG, PSNR and SSIM identical to official libvmaf's; Vulkan VMAF +
   NEG identical to libvmaf CUDA's; VMAF v1 on the GPU identical to official

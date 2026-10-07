@@ -336,18 +336,16 @@ class LibvmafCpu:
             self._context = ctypes.c_void_p()
 
 
-def load_frames(work: Path, size: str) -> tuple[list[bytearray], list[bytearray]]:
+def load_frames(work: Path, size: str) -> tuple[list[memoryview], list[memoryview]]:
+    """The frames, mapped from prepare's files copy-on-write: every implementation of a metric holds them at
+    once, and they share the same memory (written by none). Writable, as the bindings' from_buffer wants."""
+    import mmap
     each = frame_bytes(size)
     pairs = []
     for name in ("ref", "dis"):
-        frames = []
         with open(work / f"{name}_{size}.yuv", "rb") as file:
-            while True:
-                frame = bytearray(each)
-                if file.readinto(frame) != each:
-                    break
-                frames.append(frame)
-        pairs.append(frames)
+            mapped = memoryview(mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_COPY))
+        pairs.append([mapped[start:start + each] for start in range(0, len(mapped) - each + 1, each)])
     return pairs[0], pairs[1]
 
 
@@ -370,26 +368,34 @@ def ffmpeg_xpsnr(ffmpeg: str, work: Path, size: str, frames: int, loops: int) ->
     return seconds, values[:frames]
 
 
+def reply(message: dict) -> None:
+    print(json.dumps(message), flush=True)
+
+
 def child(args) -> int:
-    """An implementation at a size, in a process of its own: its scorer, set up
-    once, fed the frames once (not timed: these scores are checked), then
-    --rounds rounds back to back, each feeding them again and again for
-    --seconds, timed from the end of one pass over the frames to the end of
-    another. Every scorer takes a pair only when it has room for it, so its
-    queue is as full at both ends and the frames counted are the frames
-    scored in that time. Prints a line of JSON. The build's bindings come from
-    --tree (fast\\python) and its DLLs from --dist, as VMAF_FAST_DIST (set by
-    the parent) names it."""
+    """An implementation at a size, in a process of its own, run by the parent
+    a line on stdin at a time, so the implementations of a metric take turns
+    while each is set up once. Set up, it scores the frames once (not timed:
+    these scores are checked) and says READY. Each "round": a pass over the
+    frames to fill its queue again, then passes for --seconds, timed from the
+    end of one pass to the end of another (every scorer takes a pair only when
+    it has room for it, so its queue is as full at both ends and the frames
+    counted are the frames scored in that time), then a wait for its queue to
+    empty, so none of its work runs into the next one's round. "finish":
+    the checked scores, and exit. The build's bindings come from --tree
+    (fast\\python), its DLLs from --dist (VMAF_FAST_DIST, set by the parent)."""
     work, size, dist = Path(args.work), args.size, Path(args.dist)
     if args.kind == "ffmpeg":
         frames = json.loads((work / "frames.json").read_text())["sizes"][size]["frames"]
         first, values = ffmpeg_xpsnr(args.ffmpeg, work, size, frames, 0)
         loops = max(1, round(args.seconds / first)) if first > 0 else 1
-        rounds = []
-        for _ in range(args.rounds):
+        reply({"ready": os.getpid()})
+        for command in sys.stdin:
+            if command.strip() != "round":
+                break
             seconds, _ = ffmpeg_xpsnr(args.ffmpeg, work, size, frames, loops)
-            rounds.append({"fps": frames * (loops + 1) / seconds, "frames": frames * (loops + 1), "seconds": seconds})
-        print(json.dumps({"rounds": rounds, "scores": {"xpsnr": values}}))
+            reply({"fps": frames * (loops + 1) / seconds, "frames": frames * (loops + 1), "seconds": seconds})
+        reply({"scores": {"xpsnr": values}})
         return 0
     sys.path.insert(0, str(Path(args.tree) / "fast" / "python"))
     width, height = SIZES[size]
@@ -415,25 +421,32 @@ def child(args) -> int:
         scorer = v1.V1Scorer(width, height, BITS, v1_model, device=args.device)
     else:
         raise SystemExit(f"no implementation {args.kind}")
+    # The most frame pairs a scorer has in flight: libvmaf's CPU code one per thread and two more (its
+    # pictures, preallocated two a pair); the GPU scorers a few.
+    in_flight = threads + 2 if isinstance(scorer, LibvmafCpu) else 4
     try:
         count = len(reference)
-        for index in range(count):
-            scorer.add(reference[index], distorted[index])
-        if args.memory:  # the parent reads this process's GPU memory now, set up and scoring
-            print(f"READY {os.getpid()}", flush=True)
-            sys.stdin.readline()
-        rounds = []
-        for _ in range(args.rounds):
+
+        def one_pass() -> None:
+            for index in range(count):
+                scorer.add(reference[index], distorted[index])
+
+        one_pass()
+        reply({"ready": os.getpid()})  # the parent reads a CUDA process's GPU memory now, set up and scoring
+        for command in sys.stdin:
+            if command.strip() != "round":
+                break
+            one_pass()  # its queue full again (it emptied while the others had their rounds)
             timed = 0
             started = time.perf_counter()
             while True:
-                for index in range(count):
-                    scorer.add(reference[index], distorted[index])
+                one_pass()
                 timed += count
                 seconds = time.perf_counter() - started
                 if seconds >= args.seconds:
                     break
-            rounds.append({"fps": timed / seconds, "frames": timed, "seconds": seconds})
+            time.sleep(max(0.2, 1.5 * in_flight * seconds / timed))  # its queue's last pairs done
+            reply({"fps": timed / seconds, "frames": timed, "seconds": seconds})
         _frames, scores = scorer.finish()
     finally:
         scorer.close()
@@ -444,7 +457,7 @@ def child(args) -> int:
             out[name if keep else args.metric] = [float(value) for value in column[:count]]
     version = ctypes.CDLL(str(dll))
     version.vmaf_version.restype = ctypes.c_char_p
-    print(json.dumps({"rounds": rounds, "scores": out, "libvmaf": version.vmaf_version().decode()}))
+    reply({"scores": out, "libvmaf": version.vmaf_version().decode()})
     return 0
 
 
@@ -589,16 +602,40 @@ def plan_rows(args) -> tuple[list[dict], list[dict]]:
     return rows, gpus
 
 
-def child_command(args, row: dict, size: str, memory: bool = False) -> tuple[list[str], dict]:
-    tree, dist = builds(args)[row["build"]]
-    command = [sys.executable, str(Path(__file__).resolve()), "child", "--work", args.work, "--size", size,
-               "--metric", row["metric"], "--kind", row["kind"], "--tree", str(tree), "--dist", str(dist),
-               "--seconds", str(args.seconds), "--rounds", str(args.rounds), "--ffmpeg", args.ffmpeg]
-    if "device" in row:
-        command += ["--device", str(row["device"])]
-    if memory:
-        command.append("--memory")
-    return command, dict(os.environ, VMAF_FAST_DIST=str(dist))
+class Worker:
+    """An implementation's child process at a size, driven a line at a time."""
+
+    def __init__(self, args, row: dict, size: str, seconds: float):
+        tree, dist = builds(args)[row["build"]]
+        command = [sys.executable, str(Path(__file__).resolve()), "child", "--work", args.work, "--size", size,
+                   "--metric", row["metric"], "--kind", row["kind"], "--tree", str(tree), "--dist", str(dist),
+                   "--seconds", str(seconds), "--ffmpeg", args.ffmpeg]
+        if "device" in row:
+            command += ["--device", str(row["device"])]
+        self.row = row
+        self._log = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")  # noqa: SIM115 (closed in close)
+        self._process = subprocess.Popen(command, env=dict(os.environ, VMAF_FAST_DIST=str(dist)),
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log, text=True)
+
+    def read(self) -> dict:
+        """The child's next reply (its other output, what a library prints, skipped); RuntimeError if it died."""
+        while line := self._process.stdout.readline():
+            if line.startswith("{"):
+                return json.loads(line)
+        self._process.wait()
+        self._log.seek(0)
+        raise RuntimeError(self._log.read().strip()[-2000:] or f"exit code {self._process.returncode}")
+
+    def send(self, command: str) -> dict:
+        self._process.stdin.write(command + "\n")
+        self._process.stdin.flush()
+        return self.read()
+
+    def close(self) -> None:
+        if self._process.poll() is None:
+            self._process.kill()
+        self._process.wait()
+        self._log.close()
 
 
 def run(args) -> int:
@@ -626,52 +663,72 @@ def run(args) -> int:
         temporary.replace(path)
         (out_dir / f"{name}.md").write_text(markdown(results), encoding="utf-8")
 
+    def failed(row: dict, size: str, error: Exception) -> None:
+        results["runs"].append({"id": row["id"], "size": size, "round": 0, "quiet": True, "error": str(error)})
+
     # One warm-up before anything is timed, so the CPU and every GPU are at the clocks and temperatures they keep
     # for the rest of the run, which then goes on back to back: the new build at 4K, --warmup seconds on the CPU,
     # then as long on each GPU (not counted).
     if args.warmup > 0:
         print(f"Warming up: {args.warmup:g} s on the CPU and on each GPU", flush=True)
-        warm = [row for row in rows if row["build"] == "new" and row["metric"] == "vmaf_neg"
-                and row["kind"] in ("cpu", "vulkan")]
-        for row in warm:
-            command, environment = child_command(args, row, sizes[-1])
-            command[command.index("--seconds") + 1], command[command.index("--rounds") + 1] = str(args.warmup), "1"
-            unchecked(command, env=environment, capture_output=True)
-    total = len(sizes) * len(rows)
-    done = 0
-    for size in sizes:
         for row in rows:
-            done += 1
-            quiet = wait_quiet(args.cpu_quiet)
-            # libvmaf CUDA's GPU memory at 4K, VMAF + NEG: read while the process is set up and scoring.
-            memory = row["kind"] == "cuda" and size == "2160"
-            command, environment = child_command(args, row, size, memory)
-            process = subprocess.Popen(command, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, text=True)
-            if memory:
-                ready = process.stdout.readline().split()
-                if ready[:1] == ["READY"]:
-                    results["memory"][row["id"]] = dedicated_gpu_memory(int(ready[1]))
-            out, err = process.communicate("\n" if memory else None)
-            line = out.strip().splitlines()[-1:] if process.returncode == 0 else []
+            if row["build"] == "new" and row["metric"] == "vmaf_neg" and row["kind"] in ("cpu", "vulkan"):
+                worker = Worker(args, row, sizes[-1], args.warmup)
+                with contextlib.suppress(RuntimeError):
+                    worker.read()
+                    worker.send("round")
+                worker.close()
+    # Each metric at each size, a device at a time (its CPU implementations, its CUDA ones, each GPU's): those
+    # set up first, each in its process, then their rounds taking turns (round 1 of each, round 2 of each, ...),
+    # so what the PC does from one minute to the next falls on all of them alike. A device's: the comparisons
+    # that are close are between those; and a whole metric's processes alive at once (8 at 4K) held enough
+    # memory to slow the iGPU (3.2.0-fast.1 at 4K 15.3 -> 11.2 fps), where no device's few did.
+    def place(row: dict) -> str:
+        return {"cpu": "cpu", "ffmpeg": "cpu", "cuda": "cuda"}.get(row["kind"], f"gpu {row.get('device')}")
+
+    groups = [(size, metric, here) for size in sizes for metric in METRICS
+              for here in dict.fromkeys(place(row) for row in rows if row["metric"] == metric)]
+    for size, metric, here in groups:
+        workers = []
+        for row in (row for row in rows if row["metric"] == metric and place(row) == here):
+            worker = Worker(args, row, size, args.seconds)
             try:
-                result = json.loads(line[0])
-            except (IndexError, json.JSONDecodeError):
-                result = {"error": (err or out).strip()[-2000:]}
-            if "scores" in result:
-                results["scores"].setdefault(row["id"], {})[size] = result["scores"]
-            for number, measured in enumerate(result.get("rounds", []), 1):
-                results["runs"].append({"id": row["id"], "size": size, "round": number, "quiet": quiet, **measured,
-                                        "libvmaf": result.get("libvmaf", "")})
-            if "error" in result:
-                results["runs"].append({"id": row["id"], "size": size, "round": 0, "quiet": quiet,
-                                        "error": result["error"]})
-            fps = [measured["fps"] for measured in result.get("rounds", [])]
-            state = " ".join(f"{value:8.1f}" for value in fps) + " fps" if fps else "FAILED"
-            print(f"[{done}/{total}] {SIZE_NAMES[size]:5} {METRICS[row['metric']]:10} {row['label']:58} "
-                  f"{state}{'' if quiet else ' (not quiet)'}", flush=True)
-            save()
-            time.sleep(args.cooldown)
+                ready = worker.read()
+            except RuntimeError as error:
+                failed(row, size, error)
+                worker.close()
+                continue
+            if row["kind"] == "cuda" and size == "2160":  # libvmaf CUDA's GPU memory, set up and scoring
+                results["memory"][row["id"]] = dedicated_gpu_memory(int(ready["ready"]))
+            workers.append(worker)
+        for number in range(1, args.rounds + 1):
+            quiet = wait_quiet(args.cpu_quiet)
+            for worker in list(workers):
+                try:
+                    measured = worker.send("round")
+                except RuntimeError as error:
+                    failed(worker.row, size, error)
+                    workers.remove(worker)
+                    worker.close()
+                    continue
+                results["runs"].append({"id": worker.row["id"], "size": size, "round": number, "quiet": quiet,
+                                        **measured})
+                time.sleep(args.cooldown)
+        for worker in workers:
+            try:
+                final = worker.send("finish")
+                results["scores"].setdefault(worker.row["id"], {})[size] = final["scores"]
+                for record in results["runs"]:
+                    if record["id"] == worker.row["id"] and record["size"] == size:
+                        record["libvmaf"] = final.get("libvmaf", "")
+            except RuntimeError as error:
+                failed(worker.row, size, error)
+            worker.close()
+            fps = [record["fps"] for record in results["runs"]
+                   if record["id"] == worker.row["id"] and record["size"] == size and "fps" in record]
+            print(f"{SIZE_NAMES[size]:5} {METRICS[metric]:10} {worker.row['label']:58} "
+                  + " ".join(f"{value:8.1f}" for value in fps) + " fps", flush=True)
+        save()
     save()
     print(f"\n{path}\n{path.with_suffix('.md')}")
     return 0
@@ -770,8 +827,9 @@ def markdown(results: dict) -> str:
              f"{info.get('os', '')}; NVIDIA driver {info.get('nvidia_driver') or '-'}; "
              f"{info.get('power_scheme', '')}" + ("" if info.get("on_ac_power", True) else "; ON BATTERY"), "",
              (f"Frames: {results['frames']['reference']} from frame {results['frames']['start']}, 10-bit; each "
-              "implementation in a process of its own, set up once and given the frames once untimed, then "
-              f"{settings['rounds']} rounds of {settings['seconds']} s or more: each number the rounds' median."), ""]
+              "implementation in a process of its own, set up once and given the frames once untimed; then "
+              f"{settings['rounds']} rounds of {settings['seconds']} s or more each, a metric's implementations on "
+              "the same device taking turns round by round: each number the rounds' median."), ""]
     for size in results["frames"]["sizes"]:
         entries = [entry for entry in results.get("summary", []) if entry["size"] == size]
         if not entries:
@@ -842,8 +900,6 @@ def main() -> int:
         p.add_argument(option)
     p.add_argument("--device", type=int)
     p.add_argument("--seconds", type=float, default=10.0)
-    p.add_argument("--rounds", type=int, default=3)
-    p.add_argument("--memory", action="store_true")
     p = commands.add_parser("report")
     p.add_argument("results", nargs="+")
     p.add_argument("--out")
