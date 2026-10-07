@@ -35,6 +35,7 @@ import tempfile
 import time
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -49,6 +50,8 @@ BUILD_NAMES = {"official": "official libvmaf", "release": "libvmaf-fast 3.2.0-fa
                "ffmpeg": "FFmpeg"}
 #: libvmaf's CPU features: the extractor, the score read, its decimals (as FFmpeg's filters write them).
 CPU_FEATURES = {"psnr": ("psnr", "psnr_y", 6), "ssim": ("float_ssim", "float_ssim", 6), "xpsnr": ("xpsnr", "xpsnr_y", 4)}
+#: Threads copying the frames into libvmaf's pictures for its CPU code (LibvmafCpu.add).
+COPY_THREADS = 4
 #: Other sessions' benchmarks, which this one must not time over (nor they over it).
 FOREIGN = re.compile(r"bench_|vship_runs|compare_vmaf|diagnose_vmaf|clean_runs|sweep_")
 #: Official libvmaf: Netflix's master of 2026-10-05 (release 3.2.1 does not build with Visual Studio).
@@ -285,6 +288,7 @@ class LibvmafCpu:
                         f"Starting {feature}")
         self._check(lib.vmaf_preallocate_pictures(self._context, _PictureConfiguration(
             _PictureParameters(width, height, BITS, 1), 2 * (max(1, threads) + 2))), "Allocating pictures")
+        self._copier = ThreadPoolExecutor(COPY_THREADS)
         luma, chroma = width * height * 2, (width // 2) * (height // 2) * 2
         #: (offset, rows, row bytes) of each plane in a packed frame.
         self._planes = ((0, height, width * 2), (luma, height // 2, width), (luma + chroma, height // 2, width))
@@ -297,13 +301,22 @@ class LibvmafCpu:
     def add(self, reference, distorted) -> None:
         np, lib = self._np, self._lib
         pictures = (self._picture(), self._picture())
+        copies = []
         for picture, frame in zip(pictures, (reference, distorted), strict=True):
             self._check(lib.vmaf_fetch_preallocated_picture(self._context, ctypes.byref(picture)), "Taking a picture")
             source = np.frombuffer(frame, dtype=np.uint8)
             for plane, (offset, rows, row_bytes) in enumerate(self._planes):
                 target = np.ctypeslib.as_array(ctypes.cast(picture.data[plane], ctypes.POINTER(ctypes.c_uint8)),
                                                shape=(rows, picture.stride[plane]))
-                target[:, :row_bytes] = source[offset:offset + rows * row_bytes].reshape(rows, row_bytes)
+                plane_source = source[offset:offset + rows * row_bytes].reshape(rows, row_bytes)
+                step = -(-rows // COPY_THREADS)
+                copies += [(target[start:start + step, :row_bytes], plane_source[start:start + step])
+                           for start in range(0, rows, step)]
+        # The planes copied in row bands on COPY_THREADS threads (numpy lets go of the GIL to copy): one
+        # thread copied 12 GB/s on the main PC, which held this to about 240 pairs a second at 4K -- less
+        # than libvmaf-fast's PSNR and SSIM score -- where 4 copy 26 GB/s, most of what its memory gives.
+        for done in self._copier.map(lambda pair: np.copyto(pair[0], pair[1]), copies):
+            del done
         self._check(lib.vmaf_read_pictures(self._context, ctypes.byref(pictures[0]), ctypes.byref(pictures[1]),
                                            self._count), f"Scoring frame {self._count}")
         self._count += 1
@@ -329,6 +342,7 @@ class LibvmafCpu:
         return np.arange(self._count), scores
 
     def close(self) -> None:
+        self._copier.shutdown()
         for model in self._models.values():
             self._lib.vmaf_model_destroy(model)
         self._models = {}
@@ -661,6 +675,21 @@ def run(args) -> int:
                "builds": builds_info(args)}
     path = out_dir / f"{name}.json"
 
+    def place(row: dict) -> str:
+        return {"cpu": "cpu", "ffmpeg": "cpu", "cuda": "cuda"}.get(row["kind"], f"gpu {row.get('device')}")
+
+    def chosen(row: dict) -> bool:  # --only: the CPU's rows, or the GPUs' (CUDA's among them)
+        return not args.only or (place(row) == "cpu") == (args.only == "cpu")
+
+    if args.only and path.exists():  # this run's rows replace theirs in the results already there
+        earlier = json.loads(path.read_text(encoding="utf-8"))
+        redone = {row["id"] for row in rows if chosen(row)}
+        results["runs"] = [record for record in earlier["runs"] if record["id"] not in redone]
+        results["scores"] = {key: value for key, value in earlier["scores"].items() if key not in redone}
+        results["memory"] = {key: value for key, value in earlier.get("memory", {}).items() if key not in redone}
+        results["settings"]["earlier"] = {"settings": earlier["settings"], "builds": earlier["builds"],
+                                          "rows not redone": sorted({record["id"] for record in results["runs"]})}
+
     def save() -> None:
         results["summary"] = summarize(results)
         temporary = path.with_suffix(".tmp")
@@ -677,7 +706,8 @@ def run(args) -> int:
     if args.warmup > 0:
         print(f"Warming up: {args.warmup:g} s on the CPU and on each GPU", flush=True)
         for row in rows:
-            if row["build"] == "new" and row["metric"] == "vmaf_neg" and row["kind"] in ("cpu", "vulkan"):
+            if (row["build"] == "new" and row["metric"] == "vmaf_neg" and row["kind"] in ("cpu", "vulkan")
+                    and chosen(row)):
                 worker = Worker(args, row, sizes[-1], args.warmup)
                 with contextlib.suppress(RuntimeError):
                     worker.read()
@@ -688,11 +718,8 @@ def run(args) -> int:
     # so what the PC does from one minute to the next falls on all of them alike. A device's: the comparisons
     # that are close are between those; and a whole metric's processes alive at once (8 at 4K) held enough
     # memory to slow the iGPU (3.2.0-fast.1 at 4K 15.3 -> 11.2 fps), where no device's few did.
-    def place(row: dict) -> str:
-        return {"cpu": "cpu", "ffmpeg": "cpu", "cuda": "cuda"}.get(row["kind"], f"gpu {row.get('device')}")
-
     groups = [(size, metric, here) for size in sizes for metric in METRICS
-              for here in dict.fromkeys(place(row) for row in rows if row["metric"] == metric)]
+              for here in dict.fromkeys(place(row) for row in rows if row["metric"] == metric and chosen(row))]
     for size, metric, here in groups:
         workers = []
         for row in (row for row in rows if row["metric"] == metric and place(row) == here):
@@ -900,6 +927,8 @@ def main() -> int:
     p.add_argument("--cooldown", type=float, default=0.0, help="seconds of rest after each implementation")
     p.add_argument("--cpu-quiet", type=float, default=15.0, help="CPU use (percent) a run waits to be under")
     p.add_argument("--name", help="the results' file name (default: the computer's name)")
+    p.add_argument("--only", choices=("cpu", "gpu"), help="only the CPU's rows or the GPUs', replacing those in the "
+                                                          "results already there")
     p.add_argument("--ffmpeg")
     p = commands.add_parser("child")
     for option in ("--work", "--size", "--metric", "--kind", "--tree", "--dist", "--ffmpeg"):

@@ -31,7 +31,9 @@ runs with decoding.
   medium.mkv`. 10-bit, decoded once into memory. VMAF v1 with
   VideoMetricsLab's models: `vmaf_v1.0.16_3d0h` at 1080p,
   `vmaf_v1.0.16_1d5h_2160` at 4K. The CPU code gets 4:2:0 pictures, as
-  FFmpeg's libvmaf filter gives it, and all of the CPU's threads.
+  FFmpeg's libvmaf filter gives it, and all of the CPU's threads; the frames
+  are copied into its pictures on 4 threads (on one, the copying itself held
+  the fastest CPU rows to about 240 frame pairs a second at 4K).
 - **Method**: first a warm-up (20 s of the new build on the CPU, then on each
   GPU). Then, metric by metric and device by device (the CPU, CUDA, each
   GPU), its implementations there are set up, each in a process of its own,
@@ -115,5 +117,7 @@ PATH, and a Python with numpy and psutil for the benchmark.
    `fast/benchmark-results/<computer>.*` on a branch of their own if he says
    so).
 
+`run --only cpu` (or `--only gpu`) times only the CPU's rows (or the GPUs')
+and puts them in place of those in the results already there.
 `bench_release.py report A.json B.json --out all.md` puts several computers'
 results in one file.
