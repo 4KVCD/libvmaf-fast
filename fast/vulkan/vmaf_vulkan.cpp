@@ -2345,6 +2345,8 @@ int vv_context::staging(uint8_t **ref, uint8_t **dis)
                 return error;
         }
     }
+    if (pictures)  // given by vv_pictures before the frame's commit (which refuses it without)
+        slot.pictureRef = slot.pictureDis = slot.picturePrev = -1;
     pending = &slot;
     *ref = (uint8_t *)slot.staging.mapped;
     *dis = (uint8_t *)slot.staging.mapped + disOffset;
@@ -2429,6 +2431,8 @@ int vv_context::commit(bool score)
 {
     if (!pending)
         return fail(-3, "no frame was started");
+    if (pictures && pending->pictureRef < 0)  // (its staging buffer has no planes: a few bytes)
+        return fail(-3, "vv_pictures: the frame's pictures were not given");
     Slot &slot = *pending;
     pending = nullptr;
     nextSlot = (nextSlot + 1) % (unsigned)slots.size();
@@ -2688,6 +2692,11 @@ int vv_context::set_pictures(HANDLE reference, uint32_t referenceW, uint32_t ref
         return fail(-3, "this context does not take a decoder's textures");
     if (!pending)
         return fail(-3, "no frame was started");
+    auto inside = [&](uint32_t textureW, uint32_t textureH, int x, int y) {
+        return x >= 0 && y >= 0 && (uint64_t)x + w <= textureW && (uint64_t)y + h <= textureH;
+    };
+    if (!inside(referenceW, referenceH, referenceX, referenceY) || !inside(distortedW, distortedH, distortedX, distortedY))
+        return fail(-3, "vv_pictures: a picture is not inside its texture");
     const int ref = import_picture(reference, referenceW, referenceH);
     if (ref < 0)
         return ref;
@@ -3040,6 +3049,8 @@ VV_EXPORT int vv_test_fill_slot(vv_context *context, int slot, const uint8_t *re
 {
     if (!context->shared || slot < 0 || slot >= (int)context->slots.size())
         return fail(-3, "no such shared buffer");
+    if (context->pictures)  // (the staging buffers are then a few bytes)
+        return fail(-3, "this context reads the pictures where a decoder left them (vv_pictures)");
     std::vector<uint8_t> planes((size_t)context->disOffset + context->planeBytes);
     memcpy(planes.data(), reference, context->planeBytes);
     memcpy(planes.data() + context->disOffset, distorted, context->planeBytes);
