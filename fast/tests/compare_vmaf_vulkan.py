@@ -117,21 +117,9 @@ def special(kind: str, width: int, height: int, bits: int, frames: int, seed: in
     return reference, distorted
 
 
-class _LumaScorer(vmaf_cuda.GpuScorer):
-    """GpuScorer for any size: it copies the chroma as rows of (width + 1) / 2
-    samples, which libvmaf's pictures do not hold for an odd width. VMAF
-    uses the luma alone, so only that is copied here."""
-
-    def _fill(self, picture, frame) -> None:
-        offset, rows, row_bytes = self._planes[0]
-        source = np.frombuffer(frame, dtype=np.uint8)
-        target = np.ctypeslib.as_array(
-            ctypes.cast(picture.data[0], ctypes.POINTER(ctypes.c_uint8)), shape=(rows, picture.stride[0]))
-        target[:, :row_bytes] = source[offset:offset + rows * row_bytes].reshape(rows, row_bytes)
-
-
 def cuda_run(width, height, bits, reference, distorted, step):
-    scorer = _LumaScorer(width, height, bits, MODELS, step)
+    # Any size: GpuScorer uploads the luma alone, all VMAF reads.
+    scorer = vmaf_cuda.GpuScorer(width, height, bits, MODELS, step)
     try:
         started = time.perf_counter()
         for ref, dis in zip(reference, distorted, strict=True):

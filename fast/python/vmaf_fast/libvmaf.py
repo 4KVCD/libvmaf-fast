@@ -15,10 +15,6 @@ LIBRARY_PATH = DIST / "libvmaf" / "libvmaf.dll"
 
 _VMAF_PIX_FMT_YUV420P = 1
 _VMAF_LOG_LEVEL_ERROR = 1
-#: Pictures libvmaf holds in its pool: enough for the feeder to stay ahead of
-#: the GPU without holding more host memory than it needs (25 MB each at
-#: 4K 10-bit).
-_PICTURES = 8
 
 class VmafGpuError(RuntimeError):
     """VMAF could not be calculated on the GPU; the CPU calculates it."""
@@ -129,17 +125,142 @@ def path_bytes(path) -> bytes:
     raise VmafGpuError(f"libvmaf cannot open {path}: its name has letters outside this PC's code page")
 
 
+# ------------------------------------------------- frames from system memory
+
+class _Copy2D(ctypes.Structure):
+    """CUDA_MEMCPY2D."""
+
+    _fields_ = [("srcXInBytes", ctypes.c_size_t), ("srcY", ctypes.c_size_t), ("srcMemoryType", ctypes.c_uint),
+                ("srcHost", ctypes.c_void_p), ("srcDevice", ctypes.c_uint64), ("srcArray", ctypes.c_void_p),
+                ("srcPitch", ctypes.c_size_t),
+                ("dstXInBytes", ctypes.c_size_t), ("dstY", ctypes.c_size_t), ("dstMemoryType", ctypes.c_uint),
+                ("dstHost", ctypes.c_void_p), ("dstDevice", ctypes.c_uint64), ("dstArray", ctypes.c_void_p),
+                ("dstPitch", ctypes.c_size_t),
+                ("WidthInBytes", ctypes.c_size_t), ("Height", ctypes.c_size_t)]
+
+
+_CU_MEMORYTYPE_HOST, _CU_MEMORYTYPE_DEVICE = 1, 2
+_CU_MEMHOSTALLOC_PORTABLE = 1
+_CU_STREAM_NON_BLOCKING = 1
+
+_cuda_library: ctypes.CDLL | None = None
+
+
+def _cuda() -> ctypes.CDLL:
+    """CUDA's driver API (nvcuda.dll, the NVIDIA driver's), which libvmaf loads too."""
+    global _cuda_library
+    if _cuda_library is None:
+        lib = ctypes.CDLL("nvcuda.dll")
+        handle, pointer = ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)
+        for name, argtypes in (
+            ("cuInit", [ctypes.c_uint]),
+            ("cuDeviceGet", [ctypes.POINTER(ctypes.c_int), ctypes.c_int]),
+            ("cuDevicePrimaryCtxRetain", [pointer, ctypes.c_int]),
+            ("cuDevicePrimaryCtxRelease_v2", [ctypes.c_int]),
+            ("cuCtxPushCurrent_v2", [handle]),
+            ("cuCtxPopCurrent_v2", [pointer]),
+            ("cuMemHostAlloc", [pointer, ctypes.c_size_t, ctypes.c_uint]),
+            ("cuMemFreeHost", [handle]),
+            ("cuStreamCreate", [pointer, ctypes.c_uint]),
+            ("cuStreamDestroy_v2", [handle]),
+            ("cuMemcpy2DAsync_v2", [ctypes.POINTER(_Copy2D), handle]),
+            ("cuStreamSynchronize", [handle]),
+        ):
+            function = getattr(lib, name)
+            function.restype, function.argtypes = ctypes.c_int, argtypes
+        _cuda_library = lib
+    return _cuda_library
+
+
+def _cuda_check(error: int, what: str) -> None:
+    if error:
+        raise VmafGpuError(f"{what} failed (CUDA error {error})")
+
+
+class _HostUpload:
+    """Copies frames' luma from system memory into libvmaf's pictures on the
+    GPU, through one page-locked buffer a side, allocated once, on a stream of
+    its own (as VideoMetricsLab does). libvmaf's own way with frames in system
+    memory, a pool of CPU pictures each uploaded from pageable memory when it
+    is read, uploads the chroma planes VMAF does not read too: about 160 4K
+    10-bit pairs a second on an RTX 5090. In libvmaf's CUDA context, the
+    primary one of GPU 0, made current around each use."""
+
+    def __init__(self, width: int, height: int, sample: int):
+        self._cu = cu = _cuda()
+        self._row_bytes, self._rows = width * sample, height
+        self.luma_bytes = self._row_bytes * height
+        self._device = ctypes.c_int()
+        self._context = ctypes.c_void_p()
+        self._stream = ctypes.c_void_p()
+        self._staging = [ctypes.c_void_p(), ctypes.c_void_p()]
+        _cuda_check(cu.cuInit(0), "Starting CUDA")
+        _cuda_check(cu.cuDeviceGet(ctypes.byref(self._device), 0), "Finding the GPU")
+        _cuda_check(cu.cuDevicePrimaryCtxRetain(ctypes.byref(self._context), self._device), "Taking the GPU")
+        try:
+            with self:
+                # Non-blocking: waited for by itself, not with libvmaf's own work.
+                _cuda_check(cu.cuStreamCreate(ctypes.byref(self._stream), _CU_STREAM_NON_BLOCKING),
+                            "Starting the upload")
+                for buffer in self._staging:
+                    _cuda_check(cu.cuMemHostAlloc(ctypes.byref(buffer), self.luma_bytes, _CU_MEMHOSTALLOC_PORTABLE),
+                                "Allocating the upload's memory")
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self) -> _HostUpload:  # noqa: PYI034 (the class is private)
+        _cuda_check(self._cu.cuCtxPushCurrent_v2(self._context), "Taking the GPU")
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._cu.cuCtxPopCurrent_v2(ctypes.byref(ctypes.c_void_p()))
+
+    def send(self, side: int, frame, address: int, pitch: int) -> None:
+        """Starts the copy of `frame`'s luma to the picture at `address` (rows
+        `pitch` bytes apart); wait() says when `side` may be sent again."""
+        source = np.frombuffer(frame, dtype=np.uint8)
+        if source.size < self.luma_bytes:
+            raise VmafGpuError(f"a frame of {source.size} bytes, where its luma alone is {self.luma_bytes}")
+        staging = self._staging[side].value
+        ctypes.memmove(staging, source.ctypes.data, self.luma_bytes)
+        copy = _Copy2D(srcMemoryType=_CU_MEMORYTYPE_HOST, srcHost=staging, srcPitch=self._row_bytes,
+                       dstMemoryType=_CU_MEMORYTYPE_DEVICE, dstDevice=address, dstPitch=pitch,
+                       WidthInBytes=self._row_bytes, Height=self._rows)
+        _cuda_check(self._cu.cuMemcpy2DAsync_v2(ctypes.byref(copy), self._stream), "Uploading a frame")
+
+    def wait(self) -> None:
+        _cuda_check(self._cu.cuStreamSynchronize(self._stream), "Uploading a frame")
+
+    def close(self) -> None:
+        if not self._context:
+            return
+        cu = self._cu
+        if cu.cuCtxPushCurrent_v2(self._context) == 0:
+            if self._stream:
+                cu.cuStreamSynchronize(self._stream)
+                cu.cuStreamDestroy_v2(self._stream)
+            for buffer in self._staging:
+                if buffer:
+                    cu.cuMemFreeHost(buffer)
+            cu.cuCtxPopCurrent_v2(ctypes.byref(ctypes.c_void_p()))
+        self._stream = ctypes.c_void_p()
+        self._staging = [ctypes.c_void_p(), ctypes.c_void_p()]
+        cu.cuDevicePrimaryCtxRelease_v2(self._device)
+        self._context = ctypes.c_void_p()
+
+
 class GpuScorer:
-    """One libvmaf context on the GPU, given frame pairs in order: the luma
-    and chroma planes of 4:2:0 frames, packed as FFmpeg's rawvideo writes
-    them, at `bit_depth` bits (16-bit little-endian samples above 8) --
-    or, with `on_device`, pictures in GPU memory that add_on_device has
-    filled (their luma: VMAF reads nothing else)."""
+    """One libvmaf context on the GPU, given frame pairs in order: 4:2:0
+    frames packed as FFmpeg's rawvideo writes them, at `bit_depth` bits
+    (16-bit little-endian samples above 8), whose luma is uploaded (add;
+    VMAF reads nothing else) -- or, with `on_device`, pictures in GPU memory
+    that add_on_device has filled, and nothing allocated for uploads."""
 
     def __init__(self, width: int, height: int, bit_depth: int, models: dict[str, str], n_subsample: int = 1,
                  on_device: bool = False):
         self._lib = lib = _load()
-        self._on_device = on_device
+        self._upload: _HostUpload | None = None
         self._step = max(1, n_subsample)
         self._context = ctypes.c_void_p()
         self._models: dict[str, ctypes.c_void_p] = {}
@@ -157,29 +278,37 @@ class GpuScorer:
                        f"Loading the {version} model")
                 self._models[name] = model
                 _check(lib.vmaf_use_features_from_model(self._context, model), f"Setting up {version}")
+            # libvmaf's pictures in GPU memory, whoever fills them: _HostUpload
+            # from frames in system memory, or the caller (add_on_device).
             parameters = _PictureParameters(width, height, bit_depth, _VMAF_PIX_FMT_YUV420P)
-            if on_device:
-                pictures = _CudaPictureConfiguration(parameters, _PREALLOCATE_ON_DEVICE)
-                _check(lib.vmaf_cuda_preallocate_pictures(self._context, pictures), "Allocating pictures")
-            else:
-                _check(lib.vmaf_preallocate_pictures(self._context, _PictureConfiguration(parameters, _PICTURES)),
-                       "Allocating pictures")
+            pictures = _CudaPictureConfiguration(parameters, _PREALLOCATE_ON_DEVICE)
+            _check(lib.vmaf_cuda_preallocate_pictures(self._context, pictures), "Allocating pictures")
+            if not on_device:
+                self._upload = _HostUpload(width, height, 1 if bit_depth <= 8 else 2)
         except BaseException:
             self.close()
             raise
-        self._sample = sample = 1 if bit_depth <= 8 else 2
-        chroma_w, chroma_h = (width + 1) // 2, (height + 1) // 2
-        #: (plane offset in a frame, rows, bytes per row) for Y, U and V.
-        self._planes = [(0, height, width * sample)]
-        offset = width * height * sample
-        for _ in range(2):
-            self._planes.append((offset, chroma_h, chroma_w * sample))
-            offset += chroma_w * chroma_h * sample
-        self.frame_bytes = offset
+        sample = 1 if bit_depth <= 8 else 2
+        #: A frame as FFmpeg writes it: the luma, then the chroma planes, which FFmpeg rounds up for an odd size.
+        self.frame_bytes = (width * height + 2 * ((width + 1) // 2) * ((height + 1) // 2)) * sample
 
     def add(self, reference: bytearray, distorted: bytearray) -> None:
-        """Scores one more pair (frame index = how many came before)."""
-        self._add(lambda picture: self._fill(picture, reference), lambda picture: self._fill(picture, distorted))
+        """Scores one more pair (frame index = how many came before). The
+        frames are the caller's again when it returns."""
+        upload = self._upload
+        if upload is None:
+            raise VmafGpuError("this scorer takes pictures in GPU memory only")
+
+        def fill_distorted(picture: _Picture) -> None:
+            # Both copies are under way together; the reference's is waited
+            # for too when this one could not be started.
+            try:
+                upload.send(1, distorted, picture.data[0], picture.stride[0])
+            finally:
+                upload.wait()
+
+        with upload:
+            self._add(lambda picture: upload.send(0, reference, picture.data[0], picture.stride[0]), fill_distorted)
 
     def add_on_device(self, reference: Callable[[int, int], None], distorted: Callable[[int, int], None]) -> None:
         """Scores one more pair of pictures in GPU memory: `reference` and
@@ -189,8 +318,7 @@ class GpuScorer:
                   lambda picture: distorted(picture.data[0], picture.stride[0]))
 
     def _add(self, fill_reference, fill_distorted) -> None:
-        fetch = (self._lib.vmaf_cuda_fetch_preallocated_picture if self._on_device
-                 else self._lib.vmaf_fetch_preallocated_picture)
+        fetch = self._lib.vmaf_cuda_fetch_preallocated_picture
         ref, dist = _Picture(), _Picture()
         _check(fetch(self._context, ctypes.byref(ref)), "Taking a picture")
         try:
@@ -211,20 +339,6 @@ class GpuScorer:
         _check(self._lib.vmaf_read_pictures(self._context, ctypes.byref(ref), ctypes.byref(dist), self._count),
                f"Scoring frame {self._count}")
         self._count += 1
-
-    def _fill(self, picture: _Picture, frame: bytearray) -> None:
-        source = np.frombuffer(frame, dtype=np.uint8)
-        for plane, (offset, rows, row_bytes) in enumerate(self._planes):
-            stride = picture.stride[plane]
-            # Of an odd size FFmpeg rounds the chroma planes up and libvmaf
-            # down (w >> 1, h >> 1): FFmpeg's last row and last sample have
-            # no place in the picture. VMAF reads the luma plane only.
-            kept_rows = min(rows, picture.h[plane])
-            kept_bytes = min(row_bytes, picture.w[plane] * self._sample)
-            target = np.ctypeslib.as_array(
-                ctypes.cast(picture.data[plane], ctypes.POINTER(ctypes.c_uint8)), shape=(kept_rows, stride))
-            plane_rows = source[offset:offset + rows * row_bytes].reshape(rows, row_bytes)
-            target[:, :kept_bytes] = plane_rows[:kept_rows, :kept_bytes]
 
     def finish(self) -> tuple[np.ndarray, dict[str, np.ndarray]]:
         """The frame numbers scored (every n_subsample-th) and each model's
@@ -252,6 +366,9 @@ class GpuScorer:
         if self._context:
             self._lib.vmaf_close(self._context)
             self._context = ctypes.c_void_p()
+        if self._upload is not None:
+            self._upload.close()
+            self._upload = None
 
 
 def probe() -> tuple[bool, str]:
