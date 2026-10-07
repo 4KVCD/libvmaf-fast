@@ -4,6 +4,9 @@ An unofficial fork of [Netflix/vmaf](https://github.com/Netflix/vmaf) (libvmaf),
 not affiliated with or endorsed by Netflix. It adds GPU code that gives
 libvmaf's own numbers:
 
+******Upcoming release will have extremely optimized VMAF v0.6.1 and v1 on Vulkan. It will be several times faster than the official CUDA VMAF v0.6.1. PSNR, SSIM, and XPSNR will also speed up several times******
+
+Current features: 
 - **VMAF v0.6.1 and VMAF NEG on any GPU with Vulkan.** The features are
   bit-identical to libvmaf's CUDA code, which is upstream's only GPU code and
   runs on NVIDIA GPUs only. libvmaf predicts the score from them on the CPU,
@@ -18,10 +21,7 @@ libvmaf's own numbers:
   own makes CUDA about five times as fast with CPU-decoded frames.
 
 **Ready-made tool:** [VideoMetricsLab](https://github.com/4KVCD/VideoMetricsLab)
-is a Windows app for scoring and comparing video encodes. From version 1.5 it
-calculates VMAF, VMAF NEG and VMAF v1 on the GPU with these libraries (on its
-`release/v1.5` branch for now). The current release, 1.4, has GPU VMAF on
-NVIDIA only.
+is a Windows app for scoring and comparing video encodes. Calculate VMAF and VMAF NEG on NVIDIA GPUs, and SSIMULACRA2, Butteraugli and ColorVideo VDP on NVIDIA, AMD and Intel GPUs, alongside PSNR, SSIM and XPSNR. Compare encodes with frame-exact playback that switches between the source and each encode instantly to easily spot differences.
 
 Windows x64 only; not built or tested on Linux. The Vulkan engine needs
 Vulkan 1.1 and 64-bit integers in shaders. It is a DLL with a small C API
