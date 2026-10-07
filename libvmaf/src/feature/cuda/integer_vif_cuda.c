@@ -141,8 +141,9 @@ static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt
     s->buf.stride_tmp =
         ALIGN_CEIL(w * sizeof(uint32_t));
     const size_t frame_size = s->buf.stride * h;
-    const size_t data_sz = 2 * frame_size +
-        2 * (h * s->buf.stride_16) + 5 * (h * s->buf.stride_32) + 8 * (s->buf.stride_tmp * h); // intermediater buffers
+    // The next scale's pictures and the eight planes of filter1d's
+    // intermediate results (tmp, the last padding).
+    const size_t data_sz = 2 * frame_size + 8 * (s->buf.stride_tmp * h);
     int ret = vmaf_cuda_buffer_alloc(fex->cu_state, &s->buf.data, data_sz);
     if (ret) goto free_ref;
 
@@ -158,13 +159,14 @@ static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt
 
     s->buf.ref = data; data += frame_size;
     s->buf.dis = data; data += frame_size;
-    s->buf.mu1 = (uint16_t*)data; data += h * s->buf.stride_16;
-    s->buf.mu2 = (uint16_t*)data; data += h * s->buf.stride_16;
-    s->buf.mu1_32 = (uint32_t*)data; data += h * s->buf.stride_32;
-    s->buf.mu2_32 = (uint32_t*)data; data += h * s->buf.stride_32;
-    s->buf.ref_sq = (uint32_t*)data; data += h * s->buf.stride_32;
-    s->buf.dis_sq = (uint32_t*)data; data += h * s->buf.stride_32;
-    s->buf.ref_dis = (uint32_t*)data; data += h * s->buf.stride_32;
+    // No kernel reads or writes these: not allocated.
+    s->buf.mu1 = NULL;
+    s->buf.mu2 = NULL;
+    s->buf.mu1_32 = NULL;
+    s->buf.mu2_32 = NULL;
+    s->buf.ref_sq = NULL;
+    s->buf.dis_sq = NULL;
+    s->buf.ref_dis = NULL;
     s->buf.tmp.mu1 = (uint32_t*)data; data += s->buf.stride_tmp * h;
     s->buf.tmp.mu2 = (uint32_t*)data; data += s->buf.stride_tmp * h;
     s->buf.tmp.ref = (uint32_t*)data; data += s->buf.stride_tmp * h;

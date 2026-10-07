@@ -1034,11 +1034,19 @@ static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt
 
     ret = vmaf_cuda_buffer_alloc(fex->cu_state, &s->buf.data_buf, buf_sz_one * NUM_BUFS_ADM);
     if (ret) goto free_ref;
-    ret = vmaf_cuda_buffer_alloc(fex->cu_state, &s->buf.tmp_ref, (s->integer_stride * 4 * ((h + 1) / 2)));
+    // The sizes the kernels use. tmp_ref and tmp_dis: scales 1-3's vertical
+    // DWT, two rows of int32 (lo, hi) for each output row of the scale's
+    // input, at most scale 1's ((w + 1) / 2 wide, (h + 1) / 2 high, half as
+    // many output rows; adm_dwt2.cu's dwt_s123_combined_*_kernel).
+    // tmp_accum: contrast masking's per-position int32 values, three bands
+    // of at most scale 0's band size (adm_cm.cu).
+    const size_t w1 = (w + 1) / 2, h1 = (h + 1) / 2;
+    const size_t dwt_tmp_sz = sizeof(int32_t) * 2 * w1 * ((h1 + 1) / 2);
+    ret = vmaf_cuda_buffer_alloc(fex->cu_state, &s->buf.tmp_ref, dwt_tmp_sz);
     if (ret) goto free_ref;
-    ret = vmaf_cuda_buffer_alloc(fex->cu_state, &s->buf.tmp_dis, (s->integer_stride * 4 * ((h + 1) / 2)));
+    ret = vmaf_cuda_buffer_alloc(fex->cu_state, &s->buf.tmp_dis, dwt_tmp_sz);
     if (ret) goto free_ref;
-    ret = vmaf_cuda_buffer_alloc(fex->cu_state, &s->buf.tmp_accum, sizeof(uint64_t) * 3 * w * h);
+    ret = vmaf_cuda_buffer_alloc(fex->cu_state, &s->buf.tmp_accum, sizeof(int32_t) * 3 * w1 * h1);
     if (ret) goto free_ref;
     ret = vmaf_cuda_buffer_alloc(fex->cu_state, &s->buf.tmp_accum_h, sizeof(uint64_t) * 3 * h);
     if (ret) goto free_ref;
