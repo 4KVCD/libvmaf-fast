@@ -71,7 +71,8 @@ def unchecked(command, **options) -> subprocess.CompletedProcess:
 
 
 def git(*args: str) -> str:
-    return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout.strip()
+    return subprocess.run(["git", *args], capture_output=True, encoding="utf-8", errors="replace",
+                          check=True).stdout.strip()
 
 
 def sha256(path: Path) -> str:
@@ -362,7 +363,7 @@ def ffmpeg_xpsnr(ffmpeg: str, work: Path, size: str, frames: int, loops: int) ->
                                   str(loops), *raw, "-i", str(work / f"ref_{size}.yuv"), "-stream_loop", str(loops),
                                   *raw, "-i", str(work / f"dis_{size}.yuv"), "-lavfi",
                                   f"[0:v][1:v]xpsnr=stats_file='{target}'", "-f", "null", "-"],
-                                 capture_output=True, text=True, check=True)
+                                 capture_output=True, encoding="utf-8", errors="replace", check=True)
         seconds = float(re.findall(r"rtime=([0-9.]+)s", process.stderr)[-1])
         values = [float(match) for match in re.findall(r"XPSNR y: *([0-9.]+|inf)", stats.read_text())]
     return seconds, values[:frames]
@@ -464,7 +465,9 @@ def child(args) -> int:
 # ---------------------------------------------------------------------- run
 
 def powershell(script: str) -> str:
-    return unchecked(["powershell", "-NoProfile", "-Command", script], capture_output=True, text=True).stdout
+    # Windows' own tools write in the console's code page (936 on a Chinese Windows, say), not UTF-8.
+    return unchecked(["powershell", "-NoProfile", "-Command", script], capture_output=True, encoding="oem",
+                     errors="replace").stdout
 
 
 def machine() -> dict:
@@ -483,9 +486,9 @@ def machine() -> dict:
     ).splitlines() if line.strip()]
     with contextlib.suppress(OSError):
         info["nvidia_driver"] = unchecked(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-                                               capture_output=True, text=True).stdout.strip()
-    info["power_scheme"] = unchecked(["powercfg", "/getactivescheme"], capture_output=True,
-                                          text=True).stdout.strip()
+                                               capture_output=True, encoding="oem", errors="replace").stdout.strip()
+    info["power_scheme"] = unchecked(["powercfg", "/getactivescheme"], capture_output=True, encoding="oem",
+                                     errors="replace").stdout.strip()
     battery = powershell("Get-CimInstance Win32_Battery | ForEach-Object { $_.BatteryStatus }").strip()
     if battery:
         info["on_ac_power"] = battery.splitlines()[0].strip() == "2"
@@ -510,7 +513,8 @@ def others_running() -> bool:
 def nvidia_busy() -> float:
     """Other processes' use of NVIDIA GPUs (percent of the SMs), 0 without nvidia-smi."""
     try:
-        out = unchecked(["nvidia-smi", "pmon", "-c", "1", "-s", "u"], capture_output=True, text=True).stdout
+        out = unchecked(["nvidia-smi", "pmon", "-c", "1", "-s", "u"], capture_output=True, encoding="oem",
+                        errors="replace").stdout
     except OSError:
         return 0.0
     busy = 0.0
@@ -615,7 +619,8 @@ class Worker:
         self.row = row
         self._log = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")  # noqa: SIM115 (closed in close)
         self._process = subprocess.Popen(command, env=dict(os.environ, VMAF_FAST_DIST=str(dist)),
-                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log, text=True)
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log, encoding="utf-8",
+                                         errors="replace")
 
     def read(self) -> dict:
         """The child's next reply (its other output, what a library prints, skipped); RuntimeError if it died."""
@@ -735,7 +740,8 @@ def run(args) -> int:
 
 
 def builds_info(args) -> dict:
-    info = {"ffmpeg": unchecked([args.ffmpeg, "-version"], capture_output=True, text=True).stdout.split("\n")[0]}
+    info = {"ffmpeg": unchecked([args.ffmpeg, "-version"], capture_output=True, encoding="utf-8",
+                                errors="replace").stdout.split("\n")[0]}
     for name, (tree, dist) in builds(args).items():
         if name == "ffmpeg":
             continue
