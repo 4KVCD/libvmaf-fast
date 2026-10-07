@@ -4,9 +4,10 @@
 // (https://opensource.org/licenses/BSDplusPatent); see LICENSE at the root
 // of this repository.
 //
-// ADM's decouple step, shared by adm_decouple.slang and adm_dcm.slang (which
-// include it after declaring divTable and defining COS_MANTISSA): the
-// one-degree test, the division table's reading and saturation.
+// ADM's decouple step, shared by adm_decouple.slang, adm_dcm.slang and
+// adm_fused.slang (VMAF v1's), which include it after declaring divTable and
+// defining COS_MANTISSA: the one-degree test, the division table's reading
+// and saturation.
 
 // (float)v of a non-negative integer: m * 2^e, m below 2^24.
 void to_float(uint64_t v, out uint m, out int e)
