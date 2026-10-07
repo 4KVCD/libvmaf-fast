@@ -44,7 +44,8 @@ int mirror(int idx, int size)
 #define GROUP 256
 groupshared int gDiff[SPAN_H * SPAN_W];     // previous - current around the tile (mirrored at the edges)
 groupshared int gColumn[TILE_H * SPAN_W];   // the vertical pass, rounded, per output row and column
-groupshared uint gSum[GROUP / 32];
+// Each subgroup's sum: room for subgroups as small as 8 lanes (Intel's).
+groupshared uint gSum[GROUP / 8];
 
 // One output of the horizontal pass: (sum of filter * column + 32768) >> 16.
 // The sum's magnitude reaches 2^32: in 32-bit integers, it is split into the

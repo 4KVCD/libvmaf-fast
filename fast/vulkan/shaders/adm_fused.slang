@@ -345,7 +345,9 @@ int64_t wave_sum64(int64_t v)
 #define OWN (GROUP - 2)
 groupshared int gRingF[3 * GROUP];
 groupshared int gRingRF[3 * GROUP];
-groupshared int64_t gRow[(GROUP / 32) * 9];
+// Each subgroup's row sums: room for subgroups as small as 8 lanes (Intel's;
+// 32 or 64 on NVIDIA's and AMD's), more of them in the group than 32 lanes give.
+groupshared int64_t gRow[(GROUP / 8) * 9];
 
 // Row i at the thread's column j: decoupled into the ring, and (`center`)
 // what the masking of row i itself needs, and its denominator's terms.
