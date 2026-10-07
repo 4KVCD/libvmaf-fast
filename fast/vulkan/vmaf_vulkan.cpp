@@ -887,12 +887,23 @@ struct vv_context {
     std::condition_variable copyStart, copyDone;
     unsigned copyGeneration = 0, copyPending = 0;
     bool copyQuit = false;
+    // A plane to copy: rows of rowBytes from `from` (fromStride apart) to `to`
+    // (toStride apart). VMAF v0.6.1's two lumas, or VMAF v1's lumas and the
+    // chroma planes SpEED reads.
+    struct CopyPlane {
+        uint8_t *to;
+        size_t toStride;
+        const uint8_t *from;
+        ptrdiff_t fromStride;
+        size_t rowBytes;
+        uint32_t rows;
+    };
     struct {
-        uint8_t *to[2];
-        const uint8_t *from[2];
-        ptrdiff_t stride[2];
+        CopyPlane planes[6];
+        int count;
     } copyJob = {};
     void copy_part(unsigned part);
+    void copy_planes();
     void copier(unsigned part);
     int submit_v1(const uint8_t *const planes[6], const ptrdiff_t strides[6], bool score);
     int staging(uint8_t **ref, uint8_t **dis);
@@ -3056,25 +3067,53 @@ int vv_context::staging(uint8_t **ref, uint8_t **dis)
     return 0;
 }
 
-// Rows [h * part / copyThreads, h * (part + 1) / copyThreads) of each plane
-// of copyJob.
+// Rows [rows * part / copyThreads, rows * (part + 1) / copyThreads) of each
+// plane of copyJob.
 void vv_context::copy_part(unsigned part)
 {
-    const size_t rowBytes = (size_t)w * (bpc > 8 ? 2 : 1);
-    const int y0 = (int)((uint64_t)h * part / copyThreads), y1 = (int)((uint64_t)h * (part + 1) / copyThreads);
-    for (int plane = 0; plane < 2 && y1 > y0; ++plane) {
-        const uint8_t *from = copyJob.from[plane];
-        if (!from)
+    for (int index = 0; index < copyJob.count; ++index) {
+        const CopyPlane &plane = copyJob.planes[index];
+        const uint32_t y0 = (uint32_t)((uint64_t)plane.rows * part / copyThreads);
+        const uint32_t y1 = (uint32_t)((uint64_t)plane.rows * (part + 1) / copyThreads);
+        if (y1 <= y0)
             continue;
-        uint8_t *to = copyJob.to[plane] + (size_t)y0 * strideBytes;
-        from += (ptrdiff_t)y0 * copyJob.stride[plane];
-        if ((size_t)copyJob.stride[plane] == strideBytes) {
+        uint8_t *to = plane.to + (size_t)y0 * plane.toStride;
+        const uint8_t *from = plane.from + (ptrdiff_t)y0 * plane.fromStride;
+        if (plane.fromStride == (ptrdiff_t)plane.toStride) {
             // The last row without its padding, which the caller's plane need not have.
-            memcpy(to, from, (size_t)(y1 - y0) * strideBytes - (y1 == h ? strideBytes - rowBytes : 0));
+            memcpy(to, from, (size_t)(y1 - y0 - 1) * plane.toStride + (y1 == plane.rows ? plane.rowBytes
+                                                                                           : plane.toStride));
         } else {
-            for (int y = y0; y < y1; ++y, to += strideBytes, from += copyJob.stride[plane])
-                memcpy(to, from, rowBytes);
+            for (uint32_t y = y0; y < y1; ++y, to += plane.toStride, from += plane.fromStride)
+                memcpy(to, from, plane.rowBytes);
         }
+    }
+}
+
+// copyJob's planes copied: split by rows among copyThreads threads (the
+// caller's and the copiers, started the first time).
+void vv_context::copy_planes()
+{
+    if (copiers.empty() && copyThreads > 1) {
+        try {
+            for (unsigned part = 1; part < copyThreads; ++part)
+                copiers.emplace_back(&vv_context::copier, this, part);
+        } catch (const std::system_error &) {
+            copyThreads = (unsigned)copiers.size() + 1;  // the parts the threads made take
+        }
+    }
+    if (!copiers.empty()) {
+        {
+            std::lock_guard<std::mutex> lock(copyMutex);
+            ++copyGeneration;
+            copyPending = (unsigned)copiers.size();
+        }
+        copyStart.notify_all();
+    }
+    copy_part(0);
+    if (!copiers.empty()) {
+        std::unique_lock<std::mutex> lock(copyMutex);
+        copyDone.wait(lock, [&] { return copyPending == 0; });
     }
 }
 
@@ -3103,28 +3142,12 @@ int vv_context::submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *d
     if (int error = staging(&targets[0], &targets[1]))
         return error;
     const double copyBegun = profile ? now_ns() : 0.0;
-    copyJob = { { targets[0], targets[1] }, { ref, score ? dis : nullptr }, { refStride, disStride } };
-    if (copiers.empty() && copyThreads > 1) {
-        try {
-            for (unsigned part = 1; part < copyThreads; ++part)
-                copiers.emplace_back(&vv_context::copier, this, part);
-        } catch (const std::system_error &) {
-            copyThreads = (unsigned)copiers.size() + 1;  // the parts the threads made take
-        }
-    }
-    if (!copiers.empty()) {
-        {
-            std::lock_guard<std::mutex> lock(copyMutex);
-            ++copyGeneration;
-            copyPending = (unsigned)copiers.size();
-        }
-        copyStart.notify_all();
-    }
-    copy_part(0);
-    if (!copiers.empty()) {
-        std::unique_lock<std::mutex> lock(copyMutex);
-        copyDone.wait(lock, [&] { return copyPending == 0; });
-    }
+    const size_t rowBytes = (size_t)w * (bpc > 8 ? 2 : 1);
+    copyJob.count = 0;
+    copyJob.planes[copyJob.count++] = { targets[0], strideBytes, ref, refStride, rowBytes, (uint32_t)h };
+    if (score)
+        copyJob.planes[copyJob.count++] = { targets[1], strideBytes, dis, disStride, rowBytes, (uint32_t)h };
+    copy_planes();
     if (profile) {
         cpuNs[kCpuCopy] += now_ns() - copyBegun;
         ++cpuCount[kCpuCopy];
@@ -3150,26 +3173,25 @@ int vv_context::submit_v1(const uint8_t *const planes[6], const ptrdiff_t stride
     if (int error = staging(&targets[0], &targets[1]))
         return error;
     const double copyStart = profile ? now_ns() : 0.0;
-    auto copy = [](uint8_t *to, uint32_t toStride, const uint8_t *from, ptrdiff_t fromStride, size_t rowBytes,
-                   uint32_t rows) {
-        if (fromStride == (ptrdiff_t)toStride) {
-            memcpy(to, from, (size_t)toStride * (rows - 1) + rowBytes);
-        } else {
-            for (uint32_t y = 0; y < rows; ++y)
-                memcpy(to + (size_t)y * toStride, from + (ptrdiff_t)y * fromStride, rowBytes);
-        }
-    };
+    // The planes copied as VMAF v0.6.1's are, on copyThreads threads (one
+    // thread held VMAF v1 from system memory to its copying speed: RTX 5090,
+    // 4K 10-bit, about 420 frame pairs a second).
     const size_t sampleBytes = bpc > 8 ? 2 : 1;
-    copy(targets[0], strideBytes, planes[0], strides[0], (size_t)w * sampleBytes, (uint32_t)h);
+    copyJob.count = 0;
+    copyJob.planes[copyJob.count++] = { targets[0], strideBytes, planes[0], strides[0], (size_t)w * sampleBytes,
+                                        (uint32_t)h };
     if (score)
-        copy(targets[1], strideBytes, planes[3], strides[3], (size_t)w * sampleBytes, (uint32_t)h);
+        copyJob.planes[copyJob.count++] = { targets[1], strideBytes, planes[3], strides[3], (size_t)w * sampleBytes,
+                                            (uint32_t)h };
     if (speed && score) {
         uint8_t *chroma = (uint8_t *)pending->speedChroma.mapped;
         const int order[4] = { 1, 2, 4, 5 };  // ref U, ref V, dis U, dis V
         for (int i = 0; i < 4; ++i)
-            copy(chroma + (size_t)i * chromaPlaneBytes, chromaStrideBytes, planes[order[i]], strides[order[i]],
-                 chromaW * sampleBytes, chromaH);
+            copyJob.planes[copyJob.count++] = { chroma + (size_t)i * chromaPlaneBytes, chromaStrideBytes,
+                                                planes[order[i]], strides[order[i]], chromaW * sampleBytes,
+                                                chromaH };
     }
+    copy_planes();
     if (profile) {
         cpuNs[kCpuCopy] += now_ns() - copyStart;
         ++cpuCount[kCpuCopy];
