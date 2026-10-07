@@ -238,13 +238,20 @@ class _ModelConfig(ctypes.Structure):
     _fields_ = [("name", ctypes.c_char_p), ("flags", ctypes.c_uint64)]
 
 
+class _CudaConfiguration(ctypes.Structure):
+    _fields_ = [("cu_ctx", ctypes.c_void_p)]
+
+
 class LibvmafCpu:
     """libvmaf's CPU code on 4:2:0 pictures (as FFmpeg's libvmaf filter hands
     them over), from all threads: models (built-in versions or .json paths)
-    or one of CPU_FEATURES."""
+    or one of CPU_FEATURES. With `cuda`: libvmaf's stock way with frames in
+    system memory on an NVIDIA GPU, what official libvmaf offers -- the same
+    CPU pictures, its CUDA state imported, libvmaf uploading each picture
+    itself (libvmaf-fast's bindings upload only the luma, their own way)."""
 
     def __init__(self, dll: Path, width: int, height: int, threads: int, models: dict[str, str] | None = None,
-                 feature: str | None = None):
+                 feature: str | None = None, cuda: bool = False):
         import numpy as np
         self._np = np
         self._lib = lib = ctypes.CDLL(str(dll))
@@ -270,6 +277,12 @@ class LibvmafCpu:
         self._feature = feature
         self._count = 0
         self._check(lib.vmaf_init(ctypes.byref(self._context), _Configuration(1, threads, 1, 0, 0)), "Starting libvmaf")
+        if cuda:
+            state = ctypes.c_void_p()
+            lib.vmaf_cuda_state_init.argtypes = [pointer, _CudaConfiguration]
+            lib.vmaf_cuda_import_state.argtypes = [handle, handle]
+            self._check(lib.vmaf_cuda_state_init(ctypes.byref(state), _CudaConfiguration(None)), "Starting CUDA")
+            self._check(lib.vmaf_cuda_import_state(self._context, state), "Starting CUDA")
         for name, model in (models or {}).items():
             loaded, config = ctypes.c_void_p(), _ModelConfig(name.encode(), 0)
             if model.endswith(".json"):
@@ -425,6 +438,8 @@ def child(args) -> int:
         scorer = LibvmafCpu(dll, width, height, threads, models={"vmaf_v1": str(v1_model)})
     elif args.kind == "cpu":
         scorer = LibvmafCpu(dll, width, height, threads, feature=args.metric)
+    elif args.kind == "cuda" and args.stock:  # official libvmaf: its own way (LibvmafCpu)
+        scorer = LibvmafCpu(dll, width, height, 0, models=models, cuda=True)
     elif args.kind == "cuda":
         from vmaf_fast import libvmaf
         scorer = libvmaf.GpuScorer(width, height, BITS, models)
@@ -628,6 +643,8 @@ class Worker:
         command = [sys.executable, str(Path(__file__).resolve()), "child", "--work", args.work, "--size", size,
                    "--metric", row["metric"], "--kind", row["kind"], "--tree", str(tree), "--dist", str(dist),
                    "--seconds", str(seconds), "--ffmpeg", args.ffmpeg]
+        if row["kind"] == "cuda" and row["build"] == "official":
+            command.append("--stock")
         if "device" in row:
             command += ["--device", str(row["device"])]
         self.row = row
@@ -931,6 +948,7 @@ def main() -> int:
                                                           "results already there")
     p.add_argument("--ffmpeg")
     p = commands.add_parser("child")
+    p.add_argument("--stock", action="store_true", help="CUDA libvmaf's own way (official libvmaf)")
     for option in ("--work", "--size", "--metric", "--kind", "--tree", "--dist", "--ffmpeg"):
         p.add_argument(option)
     p.add_argument("--device", type=int)

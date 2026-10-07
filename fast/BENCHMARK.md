@@ -24,7 +24,11 @@ runs with decoding.
   Vulkan engine, built with its scripts; 3.2.0-fast.1 is its GitHub release
   (SHA-256 checked). libvmaf with CUDA where the CUDA Toolkit is installed,
   without it elsewhere (`-NoCuda`): the CPU code is the same. Each build is
-  driven by the Python bindings of its own commit.
+  driven by the Python bindings of its own commit; official libvmaf, which
+  has none, by the benchmark's own: CPU pictures, which libvmaf uploads to
+  the GPU itself for CUDA (its stock way). libvmaf-fast's bindings upload
+  only the luma, VMAF's, through page-locked memory: part of what is
+  measured.
 - **Frames**: `VideoQ_HDR10_UHD_120fps_4m00s.mp4` (HEVC Main 10, HDR10, 120
   fps), frames 0-47, against `VideoQ HDR10 4K H.265 CRF 22 medium.mkv` at 4K
   and, scaled to 1080p (lanczos), against `VideoQ HDR10 1080p H.265 CRF 22
