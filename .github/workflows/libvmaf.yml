@@ -113,12 +113,11 @@ jobs:
           CXX=$(brew --prefix)/opt/llvm/bin/clang++ \
           tox -c python
 
-      - name: Get binary path & Current Release
+      - name: Get binary path
         id: get_info
         run: |
           ldd "./install/bin/vmaf" || true
           echo "path=./install/bin/vmaf" >> $GITHUB_OUTPUT
-          echo "upload_url=$(curl -L https://api.github.com/repos/${{ github.repository }}/releases/tags/$(cut -d/ -f3 <<< ${{ github.ref }}) | jq -r ."upload_url")" >> $GITHUB_OUTPUT
 
       - name: Package vmaf
         id: package
@@ -132,13 +131,3 @@ jobs:
         with:
           name: vmaf-${{ matrix.name }}
           path: ${{ steps.package.outputs.zip_path }}
-      - name: Upload vmaf
-        if: steps.get_info.outputs.upload_url != 'null'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.get_info.outputs.upload_url }}
-          asset_path: ${{ steps.package.outputs.zip_path }}
-          asset_name: ${{ steps.package.outputs.zip_path }}
-          asset_content_type: application/zip
