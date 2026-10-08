@@ -1,171 +1,120 @@
 # libvmaf-fast
 
-An unofficial fork of [Netflix/vmaf](https://github.com/Netflix/vmaf) (libvmaf),
-not affiliated with or endorsed by Netflix. It adds GPU code that gives
-libvmaf's own numbers:
+[Netflix's libvmaf](https://github.com/Netflix/vmaf), faster, with the same
+scores. An unofficial fork, not affiliated with or endorsed by Netflix.
 
-******Upcoming release will have extremely optimized VMAF v0.6.1 and v1 on Vulkan. It will be several times faster than the official CUDA VMAF v0.6.1. PSNR, SSIM, and XPSNR will also speed up several times******
-
-Current features: 
-- **VMAF v0.6.1 and VMAF NEG on any GPU with Vulkan.** The features are
-  bit-identical to libvmaf's CUDA code, which is upstream's only GPU code and
-  runs on NVIDIA GPUs only. libvmaf predicts the score from them on the CPU,
-  as it does with CUDA.
-- **VMAF v1 partly on the GPU.** ADM3 and motion3, about two thirds of its
-  CPU work, are calculated on the GPU, bit-identical to libvmaf's CPU code.
-  CAMBI and SpEED stay on libvmaf's CPU code. The score is libvmaf's CPU
-  score, bit for bit.
-- **libvmaf's CUDA code, fixed.** 11 open upstream pull requests are merged.
-  They fix its build, a crash, races and leaks, and bring it closer to the
-  CPU code. A fix of the fork's
-  own makes CUDA about five times as fast with CPU-decoded frames.
+- **VMAF and VMAF NEG on any GPU: up to 28x as fast as libvmaf on the CPU,
+  and 4.8x to 6.4x as fast as its CUDA code** (RTX 5090), with CUDA's exact
+  values. libvmaf's CUDA runs only on NVIDIA; this runs on Vulkan.
+- **VMAF v1 on the GPU: 2.6x to 9.4x as fast** as libvmaf on the CPU (Intel's
+  iGPU: 0.8x), with its exact scores.
+- **PSNR and SSIM: 1.9x to 4.1x as fast**, the same scores.
+- **XPSNR, new in libvmaf: 5.2x to 16x as fast** as FFmpeg's `xpsnr` filter,
+  the same scores.
+- **libvmaf's CUDA code fixed**: 13 upstream pull requests merged, 35% less
+  GPU memory.
 
 **Ready-made tool:** [VideoMetricsLab](https://github.com/4KVCD/VideoMetricsLab)
 is a Windows app for scoring and comparing video encodes. Calculate VMAF and VMAF NEG on NVIDIA GPUs, and SSIMULACRA2, Butteraugli and ColorVideo VDP on NVIDIA, AMD and Intel GPUs, alongside PSNR, SSIM and XPSNR. Compare encodes with frame-exact playback that switches between the source and each encode instantly to easily spot differences.
 
-Windows x64 only; not built or tested on Linux. The Vulkan engine needs
-Vulkan 1.1 and 64-bit integers in shaders. It is a DLL with a small C API
-beside libvmaf, not a libvmaf feature extractor, so FFmpeg's libvmaf filter
-and `vmaf.exe` cannot use it. A program feeds it frames and predicts with
-libvmaf, as [fast/python](fast/python) does; see
-[fast/README.md](fast/README.md) for building, testing and using it. For VMAF
-itself, see [Netflix/vmaf](https://github.com/Netflix/vmaf). The `master`
-branch here is upstream, unchanged.
+Windows x64 only. Releases carry `libvmaf.dll`, libvmaf with CUDA, and
+`vmaf_vulkan.dll`, the Vulkan engine (needs Vulkan 1.1 with 64-bit shader
+integers). The engine is not a libvmaf feature extractor, so FFmpeg's libvmaf
+filter and `vmaf.exe` cannot use it: a program gives it frames and has
+libvmaf predict the score, as [fast/python](fast/python) does. Building,
+testing and using both: [fast/README.md](fast/README.md). The `master`
+branch is upstream, unchanged.
 
 ## Speed
 
-These were measured with [fast/tests/bench_readme.py](fast/tests/bench_readme.py)
-on one PC: an RTX 5090, a Core Ultra 9 285K (24 cores) and the 285K's
-integrated GPU. The video is HoneyBee, 3840x2160 10-bit, against an x265
-encode of it; the 1080p numbers use the same frames scaled down. Frames are
-decoded before timing, so decoding is not counted. Each number is the mean of
-two runs, rounded to the nearest 10 above 100. The two runs differed by up to
-21%, so small differences are noise.
+Frames per second, official libvmaf → libvmaf-fast:
 
-A GPU's speed depends on where the decoder leaves the frames:
-
-- **CPU-decoded:** a software decoder leaves frames in system memory, and
-  each one is uploaded to the GPU. Frames from Intel's and AMD's hardware
-  decoders reach the engine this way too.
-- **GPU-decoded:** NVIDIA's hardware decoder leaves frames in GPU memory, and
-  they are copied on the GPU. The tables measure NVIDIA's hand-over, which
-  uses CUDA; a decoder on its own Vulkan device (AMD's, in VideoMetricsLab)
-  can take the same way in.
-
-### VMAF v0.6.1 and VMAF NEG
-
-Frames per second. CUDA is libvmaf's own CUDA code (with the fixes below), on
-the RTX 5090.
-
-| | VMAF, 4K | VMAF, 1080p | VMAF + NEG, 4K | VMAF + NEG, 1080p |
+| 4K | RTX 5090, Core Ultra 9 285K | Intel iGPU, Core Ultra 9 285K | Radeon 8060S, Ryzen AI Max+ 395 | Radeon 780M, Ryzen 7 8845HS |
 |---|--:|--:|--:|--:|
-| CPU, 24 threads | 52 | 210 | 24 | 110 |
-| CUDA, CPU-decoded | 340 | 860 | 280 | 680 |
-| CUDA, GPU-decoded | 470 | 1250 | 300 | 850 |
-| Vulkan, RTX 5090, CPU-decoded | 320 | 1160 | 320 | 1120 |
-| Vulkan, RTX 5090, GPU-decoded | 380 | 1070 | 380 | 1030 |
-| Vulkan, Intel iGPU, CPU-decoded | 14 | 54 | 14 | 54 |
+| VMAF + NEG, CPU → Vulkan | 30 → 855 (**28x**) | 30 → 71 (**2.4x**) | 42 → 401 (**9.6x**) | 9 → 92 (**10x**) |
+| VMAF + NEG, CUDA → Vulkan | 177 → 855 (**4.8x**) | | | |
+| VMAF + NEG, CUDA → Optimized CUDA | 177 → 269 (**1.5x**) | | | |
+| VMAF v1, CPU → GPU | 60 → 567 (**9.4x**) | 60 → 51 (**0.8x**) | 118 → 313 (**2.6x**) | 33 → 143 (**4.3x**) |
+| PSNR | 170 → 452 (**2.7x**) | | 135 → 422 (**3.1x**) | 174 → 340 (**2.0x**) |
+| SSIM | 120 → 451 (**3.8x**) | | 220 → 421 (**1.9x**) | 73 → 304 (**4.1x**) |
+| XPSNR, FFmpeg's filter → libvmaf-fast | 58 → 415 (**7.2x**) | | 29 → 457 (**16x**) | 38 → 293 (**7.7x**) |
 
-- **GPU-decoded, VMAF alone: libvmaf's CUDA code is the fastest.** With NEG
-  as well, Vulkan is faster (380 against 300 fps at 4K). Vulkan calculates
-  what VMAF and NEG share once, while libvmaf calculates VIF and ADM twice.
-- **CPU-decoded: Vulkan is as fast or faster.** For VMAF alone at 4K the two
-  are about even. In the other three columns Vulkan is faster.
-- **CUDA with CPU-decoded frames needs this fork's fix.** Upstream libvmaf
-  gives about 60 fps at 4K here, because it allocates a new host picture
-  for every frame (see below).
-- **The Intel integrated GPU is slower than the CPU.**
+| 1080p | RTX 5090, Core Ultra 9 285K | Intel iGPU, Core Ultra 9 285K | Radeon 8060S, Ryzen AI Max+ 395 | Radeon 780M, Ryzen 7 8845HS |
+|---|--:|--:|--:|--:|
+| VMAF + NEG, CPU → Vulkan | 114 → 2933 (**26x**) | 114 → 268 (**2.3x**) | 243 → 1700 (**7.0x**) | 60 → 341 (**5.7x**) |
+| VMAF + NEG, CUDA → Vulkan | 461 → 2933 (**6.4x**) | | | |
+| VMAF + NEG, CUDA → Optimized CUDA | 461 → 674 (**1.5x**) | | | |
+| VMAF v1, CPU → GPU | 251 → 1960 (**7.8x**) | 251 → 192 (**0.8x**) | 495 → 1811 (**3.7x**) | 135 → 533 (**4.0x**) |
+| PSNR | 578 → 1167 (**2.0x**) | | 831 → 1849 (**2.2x**) | 582 → 1131 (**1.9x**) |
+| SSIM | 418 → 945 (**2.3x**) | | 655 → 1289 (**2.0x**) | 247 → 570 (**2.3x**) |
+| XPSNR, FFmpeg's filter → libvmaf-fast | 272 → 1422 (**5.2x**) | | 108 → 1477 (**14x**) | 89 → 972 (**11x**) |
 
-### VMAF v1
+- The Intel iGPU is in the RTX 5090's PC: its CPU rows are in that column.
+- VMAF and NEG on the CPU are libvmaf's own code, not sped up.
 
-Model `vmaf_v1.0.16_3d0h`, frames per second:
+Measured with the [release benchmark](fast/BENCHMARK.md): VideoQ's HDR10
+test clip (3840x2160, 10-bit) against an x265 CRF 22 encode and, scaled to
+1080p, against a 1080p one. 48 frame pairs are decoded into memory first,
+so decoding is not counted; GPUs get them from system memory, and the CPU
+code uses all threads. Each number is the median of three rounds of 10
+seconds or more. Official is Netflix's libvmaf master at
+[acdd9376](https://github.com/Netflix/vmaf/commit/acdd9376) (release 3.2.1
+does not build with Visual Studio). With CUDA, official libvmaf uploads the
+CPU pictures itself; libvmaf-fast's bindings upload only the luma.
 
-| | 4K | 1080p |
-|---|--:|--:|
-| CPU, 12 threads | 55 | 270 |
-| CPU + Vulkan, RTX 5090, CPU-decoded | 100 | 460 |
-| CPU + Vulkan, RTX 5090, GPU-decoded | 130 | 670 |
-| CPU + Vulkan, Intel iGPU, CPU-decoded | 41 | 160 |
+## How it works
 
-- **The RTX 5090 makes VMAF v1 1.7 to 2.5 times as fast** as the CPU alone.
-- **With the Intel GPU, VMAF v1 is slower** than on the CPU alone.
-- On the CPU alone, 16 and 24 threads are no faster than 12.
-- With the GPU, CAMBI and SpEED run on 16 CPU threads.
+**VMAF and NEG on Vulkan.** `fast/vulkan` ports libvmaf's CUDA code for VIF,
+ADM and motion to compute shaders (Slang, embedded in `vmaf_vulkan.dll`).
+Drivers round floats their own way and some GPUs, such as Intel's
+integrated ones, have no doubles. To give CUDA's exact values anyway:
 
-## How it was done
+- double arithmetic is done in integers (VIF's steps rounded to 53 bits,
+  ADM's angle test up to 128 bits), with a float shortcut where the result
+  is certain;
+- float results come from tables made on the host: ADM's reciprocals, and
+  VIF's logarithms from CUDA's own `log2f`;
+- sums are 64-bit and rounded where CUDA rounds them.
 
-### VMAF and NEG on Vulkan
+libvmaf's own expressions make the features from the sums, and libvmaf
+predicts the score. NEG differs from VMAF only in VIF's and ADM's
+enhancement gain limit, so everything the limit does not affect is
+calculated once for both (libvmaf calculates VIF and ADM twice). Passes are
+fused (VIF's filters and statistics; ADM's decoupling and masking, per
+scale), and frames from the CPU go straight into GPU memory where the GPU
+has Resizable BAR.
 
-`fast/vulkan` ports libvmaf's CUDA feature extractors for VIF, ADM and motion
-(`integer_vif_cuda.c`, `integer_adm_cuda.c`, `integer_motion_cuda.c` and
-their kernels) to Vulkan compute shaders. The shaders are written in Slang,
-compiled to SPIR-V and embedded in `vmaf_vulkan.dll`.
+**VMAF v1 on the GPU.** libvmaf has no GPU code for VMAF v1's features, so
+the engine follows its CPU code: ADM3 and motion3 in the same integer
+arithmetic (with the HFR models' five-frame motion window), CAMBI, and
+SpEED's chroma filtering, its float multiplies and adds kept unfused to
+round as libvmaf's do. SpEED's last step (a covariance, eigenvalues, a log)
+is libvmaf's own code, on CPU threads.
 
-The goal was CUDA's exact values. Vulkan lets each driver round floating
-point its own way, and some GPUs, such as this PC's Intel GPU, have no double
-precision. So:
+**PSNR, SSIM and XPSNR** in `libvmaf.dll`: PSNR runs on libvmaf's thread
+pool, and uses XPSNR's squared errors when both are asked for. SSIM is
+decimated straight from the picture's samples, not from two full-size float
+copies. XPSNR is FFmpeg's `xpsnr` filter, ported to a libvmaf feature
+extractor.
 
-- **Double arithmetic is done in integers.** VIF's double steps are each
-  rounded to 53 bits; ADM's one-degree angle test uses integers up to 128
-  bits.
-- **Float results come from tables made on the host.** These are ADM's
-  reciprocals, and VIF's logarithms from CUDA's own `log2f` polynomial (read
-  from the compiled kernel). Float remains on the GPU only in estimates that
-  cannot change the result.
-- **Sums round as CUDA's do.** They are 64-bit, kept as pairs of 32-bit
-  atomics. Partial sums are rounded where CUDA rounds them.
-- **libvmaf's expressions make the features.** `vmaf_vulkan.cpp` uses them,
-  and libvmaf predicts the score (`vmaf_import_feature_score`).
+**Frames from a hardware decoder** need not leave the GPU: CUDA (for
+NVIDIA's decoder) or another Vulkan device (for AMD's) writes into the
+engine's input buffers, and VMAF v1 can read the decoder's Direct3D 11
+textures.
 
-NEG differs from VMAF only in the enhancement gain limit of VIF and ADM (1
-instead of 100), applied partway through both. So everything the limit does
-not affect is calculated once for both. libvmaf, given both models,
-calculates VIF and ADM twice.
+**Driver bugs.** Intel's driver read a push-constant array indexed in a
+loop as zeros; AMD's (Radeon 780M, 8060S) read ADM's reciprocal table's
+entries for values below -1 as zero. The shaders avoid both. A miscompiled
+shader gives wrong numbers, not an error, so a program should run the
+bindings' self-tests, `vulkan.probe()` and `v1.probe()`, before trusting a
+GPU.
 
-Two driver miscompilations were found and worked around:
+## libvmaf's CUDA code
 
-- **Intel:** the driver read a push-constant array indexed by a loop variable
-  as zeros. The shaders take scalars instead.
-- **AMD:** the Radeon 780M's driver (32.0.21028.21 and 32.0.31041.1004) reads
-  the entries of ADM's reciprocal table for values below -1 as zero. The
-  shader reads the entry for the absolute value and negates it.
-
-A miscompiled shader gives wrong numbers, not an error. So a program should
-run the Python bindings' self-tests before trusting a GPU:
-
-- `vulkan.probe()` checks 219 sums at 8 and 10 bits against known SHA-256
-  hashes.
-- `v1.probe()` checks VMAF v1's features against libvmaf's CPU code.
-
-### VMAF v1 with the GPU
-
-VMAF v1 is predicted from ADM3, motion3, CAMBI and SpEED (chroma). On one CPU
-thread at 4K, libvmaf takes 55, 6, 12 and 16 ms a frame for them, so ADM3
-and motion3 are 68% of the work (63% at 1080p).
-
-libvmaf has no CUDA code for ADM3 or motion3. So the engine's VMAF v1 mode
-follows libvmaf's CPU code (`integer_adm.c`, `integer_motion.c`), in the same
-integer arithmetic. That includes ADM3's `adm_csf_mode` 2 and the HFR models'
-five-frame motion window. libvmaf's own CPU extractors calculate CAMBI and
-SpEED on a thread pool beside the GPU. SpEED is floating point throughout,
-which would make a bit-exact GPU port much harder.
-
-### GPU-decoded frames
-
-The engine's input buffers can be exported (`VK_KHR_external_memory_win32`)
-and imported into CUDA (`cuImportExternalMemory`), or into another Vulkan
-device on the same GPU and driver, which `vv_shared_device` identifies. So
-frames from NVIDIA's decoder, or AMD's running on Vulkan, are copied in on
-the GPU (`vv_export`). For VMAF v1, the planes CAMBI
-and SpEED read are downloaded straight into libvmaf's page-locked pictures.
-CPU-decoded frames go through `vv_submit`.
-
-### libvmaf's CUDA code
-
-The `fast` branch is upstream at
-[b41d2340](https://github.com/Netflix/vmaf/commit/b41d2340a881c69682efb08fbffd0856485c57b9)
-(2026-10-05) with these pull requests merged, each at the commit that was
-tested. They are their authors' work:
+Upstream master at
+[b41d2340](https://github.com/Netflix/vmaf/commit/b41d2340a881c69682efb08fbffd0856485c57b9),
+with these pull requests merged, each at the commit tested. They are their
+authors' work:
 
 | Pull request | Author | Fixes |
 |---|---|---|
@@ -176,60 +125,50 @@ tested. They are their authors' work:
 | [#1614](https://github.com/Netflix/vmaf/pull/1614) | BardieJoensen | CUDA VIF: a race giving NaN scores |
 | [#1647](https://github.com/Netflix/vmaf/pull/1647)-[#1651](https://github.com/Netflix/vmaf/pull/1651) | lusoris | CUDA ADM: five differences from the CPU code |
 | [#1652](https://github.com/Netflix/vmaf/pull/1652) | lusoris | `vmaf_read_pictures` leaking its pictures on failure |
+| [#1382](https://github.com/Netflix/vmaf/pull/1382) | shin.han | `cuMemFreeAsync` replaced by `cuMemFree` in `vmaf_cuda_picture_free` |
+| [#1645](https://github.com/Netflix/vmaf/pull/1645) | lusoris | The CUDA extractors' kernel modules unloaded and streams destroyed |
 
-Seven of them (#1644 and #1647 to #1652) have new commits since. The fork
-keeps the tested commits until the new ones are tested.
+The fork's own fixes:
 
-One fix is the fork's own (8ebd5f5d, not yet in a release). With the HOST or
-HOST_PINNED method, `vmaf_cuda_fetch_preallocated_picture` used to allocate
-a new picture for every frame. For HOST_PINNED, that meant a new 25 MB
-page-locked buffer, zeroed, then freed again, about 9 ms per 4K frame pair.
-It now hands out pictures from a pool. It waits for each upload from a
-pinned picture before that picture can be reused, and allocates as before
-if the pool runs out. At 4K, VMAF went from 64 to about 350 fps, with
-scores unchanged.
+- `vmaf_cuda_fetch_preallocated_picture` reuses host pictures from a pool
+  instead of allocating, page-locking and zeroing one per frame: 4K VMAF
+  from system memory about 5.5x as fast (64 to 350 fps).
+- ADM's and VIF's scratch buffers are the size their kernels use: 4K VMAF +
+  NEG in 35% less GPU memory (2644 to 1708 MB).
 
-CUDA still differs slightly from the CPU in motion. The CPU blurs the
-difference of two frames; CUDA blurs each frame and subtracts, which rounds
-differently. This is the second cause in
-[Netflix/vmaf#1562](https://github.com/Netflix/vmaf/issues/1562); #1644
-fixes the first.
-
-On the benchmark video at 4K, VIF and ADM are identical, and motion2 differs
-by at most 0.000029. Per-frame VMAF and NEG scores differ by at most
-0.000033. Vulkan, reproducing CUDA, differs from the CPU in the same way.
-VMAF v1's GPU half follows the CPU code and does not differ.
+CUDA's motion still differs slightly from the CPU's: the CPU blurs the
+difference of two frames, CUDA blurs each frame and subtracts, which rounds
+differently (the second cause in
+[Netflix/vmaf#1562](https://github.com/Netflix/vmaf/issues/1562); #1644 fixes
+the first). On the benchmark's video, CUDA's VMAF and NEG, and so Vulkan's,
+differ from the CPU's by at most 0.000035 a frame. VMAF v1 on the GPU does
+not differ.
 
 ## How it is checked
 
-Every "identical" is an exact comparison: features bit for bit, scores by
-equality. The scripts are in `fast/tests`. On the RTX 5090 and the Intel
-iGPU, with the release's DLLs:
+Comparisons are exact (features bit for bit, scores by equality); the
+scripts are in `fast/tests`.
 
-- **VMAF and NEG** (`compare_vmaf_vulkan.py --matrix`): Vulkan is identical
-  to CUDA in 45 cases. They cover sizes from 33x35 to 8K, 8 and 10 bits,
-  special frames such as black, noise and sharpened, and frame skipping.
-- **VMAF v1** (`compare_vmaf_v1.py --matrix`): identical to libvmaf's CPU
-  code in 71 cases. They cover all eight v1.0.16 models, 640x480 to 4K, 8 and
-  10 bits, special frames and frame skipping.
-- **Real video:** 48 frames of HoneyBee at 4K 10-bit and 1080p 8-bit. VMAF
-  and NEG are identical to CUDA, and VMAF v1 to the CPU.
-- **A whole film:** all 151,919 frames of a 4K 10-bit film (3840x1608),
-  NVIDIA-decoded, scored with VMAF (4K model) and NEG. Every frame is
-  identical to CUDA. On the RTX 5090 this ran with the release's DLLs; on the
-  Intel GPU it ran on 2026-10-04 with an earlier build, from before the AMD
-  workaround.
+- On the RTX 5090 and the Intel iGPU, Vulkan VMAF and NEG equal CUDA's in
+  45 cases: 33x35 to 8K, 8 and 10 bits, special frames (black, noise,
+  sharpened...) and frame skipping.
+- On those and the Radeon 8060S, VMAF v1 on the GPU equals libvmaf's CPU
+  code in 73 cases: all eight v1.0.16 models, 640x480 to 4K, 8 and 10 bits,
+  special frames and frame skipping.
+- On the 8060S, which has no CUDA, every sum of `diagnose_vmaf_vulkan.py`
+  equals the reference.
+- The release benchmark checks every score on all three PCs: PSNR and SSIM
+  equal official libvmaf's, XPSNR FFmpeg's.
+- libvmaf's own C tests pass.
+- The builds are reproducible: the 8060S PC's DLLs, built with a Chinese
+  Visual Studio, are the main PC's byte for byte.
 
-On a Radeon 780M, on another PC without CUDA, the self-test's sums and all 32
-passes of `diagnose_vmaf_vulkan.py` match the reference. VMAF v1 over 48
-frames of 4K film is identical to libvmaf's CPU code there; the 71-case
-matrix was not run.
+## Licence
 
-## Releases and licence
-
-Releases carry `libvmaf.dll` (with CUDA) and `vmaf_vulkan.dll`, with their
-licences and checksums. The licence is BSD-2-Clause-Patent, as for libvmaf
-([LICENSE](LICENSE)). The Vulkan engine, a derived work of libvmaf's feature
-extractors, keeps their licence and Netflix's and NVIDIA's copyright notices.
-Questions about VMAF itself belong upstream; problems with anything under
-`fast/` belong here.
+BSD-2-Clause-Patent, as libvmaf ([LICENSE](LICENSE)), except XPSNR:
+`libvmaf/src/feature/xpsnr.c` and `xpsnr_template.c` are ported from FFmpeg
+and stay under the LGPL 2.1 or later, so `libvmaf.dll`, which includes them,
+is under it too for that code (`licenses/LICENSE.xpsnr.txt` in the release).
+The Vulkan engine, derived from libvmaf's feature extractors, keeps their
+licence and Netflix's and NVIDIA's copyright notices. Questions about VMAF
+itself belong upstream; problems with anything under `fast/` belong here.

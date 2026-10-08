@@ -765,11 +765,11 @@ def _self_test_frames(bits: int, count: int = 4) -> tuple[list[bytearray], list[
 def probe() -> tuple[bool, str]:
     """Whether VMAF v1 is calculated with the GPU on this PC. The GPU is
     accepted only if it gives libvmaf's CPU values exactly: vmaf_vulkan's
-    self-test of the shaders it shares with VMAF v0.6.1, then ADM3 and
-    motion3 of a few frames, at 8 and at 10 bits and with the five-frame
-    motion window, against libvmaf's CPU extractors. A driver that compiles
-    a shader wrongly gives wrong scores, not an error. Run in a process of
-    its own."""
+    self-test of the shaders it shares with VMAF v0.6.1, then ADM3, motion3,
+    CAMBI and SpEED of a few frames, at 8 and at 10 bits and with the
+    five-frame motion window, against libvmaf's CPU extractors. A driver
+    that compiles a shader wrongly gives wrong scores, not an error. Run in
+    a process of its own."""
     try:
         available, device, text = vmaf_vulkan.probe()
         if not available:

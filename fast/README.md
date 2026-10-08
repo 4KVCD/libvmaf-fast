@@ -24,12 +24,15 @@ powershell -ExecutionPolicy Bypass -File fast\scripts\build_vmaf_vulkan.ps1
 ```
 
 They write `fast/dist/libvmaf/libvmaf.dll` and
-`fast/dist/vmaf_vulkan/vmaf_vulkan.dll`, each with its licences. Both link the
-C runtime statically and need only Windows and a GPU driver at run time. Both
-builds are reproducible: the same commit, built with the same versions of the
-tools (Visual Studio, the CUDA Toolkit, meson), gives the same bytes, wherever
-the checkout is. Other tool versions give equivalent code, not identical
-bytes. libvmaf reports the commit it was built from as its version.
+`fast/dist/vmaf_vulkan/vmaf_vulkan.dll`, each with its licences (libvmaf is
+built in `fast/build/libvmaf`). Both link the C runtime statically and need
+only Windows and a GPU driver at run time. Both builds are reproducible: the
+same commit, built with the same versions of the tools (Visual Studio, the
+CUDA Toolkit, meson, Slang), gives the same bytes, wherever the checkout is
+and on any PC (checked on two). Other tool versions give equivalent code,
+not identical bytes. libvmaf reports the commit it was built from as its
+version, and the build stops without AVX-512 (nasm older than 2.14): the
+Vulkan engine's SpEED uses libvmaf's AVX-512 code where the CPU has it.
 
 ## Testing
 
@@ -46,7 +49,7 @@ python fast\tests\bench_readme.py REFERENCE DISTORTED [--size 1920x1080 --pairs 
 - `compare_vmaf_vulkan.py --matrix`: Vulkan's features and VMAF and NEG scores
   against libvmaf's CUDA code, 45 cases. Needs an NVIDIA GPU for the CUDA side.
 - `compare_vmaf_v1.py --matrix`: VMAF v1 with the GPU against libvmaf on the
-  CPU, 71 cases, on any GPU.
+  CPU, 73 cases, on any GPU.
 - `diagnose_vmaf_vulkan.py`: on a GPU whose self-test fails, finds the first
   pass whose sums differ from the reference (`vmaf_vulkan_reference.json`) and,
   for ADM's scale-0 decouple, which step.
@@ -69,16 +72,21 @@ predicts the score with libvmaf (`vmaf_import_feature_score`,
 
 - `vulkan.py`: `VulkanScorer`, VMAF v0.6.1 and NEG; `probe()`, the self-test a
   program should run before trusting a GPU.
-- `v1.py`: `V1Scorer`, VMAF v1 (the GPU's ADM3 and motion3 with libvmaf's CAMBI
-  and SpEED); `probe()`.
+- `v1.py`: `V1Scorer`, VMAF v1's four features with the engine (SpEED's last
+  step on CPU threads; libvmaf's CPU extractors only for CAMBI or SpEED
+  options the engine does not take); `probe()`.
 - `libvmaf.py`: the binding to libvmaf's C API, and `GpuScorer`, its CUDA code.
 
 The engine's exports are in `fast/vulkan/vmaf_vulkan.cpp`'s API section:
-`vv_create` / `vv_create_v1`, `vv_submit` (or `vv_staging` and `vv_commit` to
-write frames in place), `vv_flush`, `vv_features` / `vv_features_v1`,
-`vv_destroy`, and `vv_shared_next` / `vv_export` / `vv_shared_device` to
-share its input buffers with a hardware decoder's CUDA or Vulkan device, so
-decoded pictures never leave the GPU.
+`vv_create` / `vv_create_v1` (with `vv_v1_cambi` and `vv_v1_speed` for VMAF
+v1's CAMBI and SpEED options), `vv_submit` / `vv_submit_v1` (or `vv_staging`
+and `vv_commit` to write frames in place), `vv_flush`, `vv_features` /
+`vv_features_v1`, `vv_destroy`; and to take a hardware decoder's pictures
+without them leaving the GPU: `vv_shared_next` / `vv_export` /
+`vv_shared_device` (and `vv_shared_chroma` for VMAF v1) to share the input
+buffers with its CUDA or Vulkan device, `vv_import_timeline` /
+`vv_commit_after` to wait for its copies on the GPU, and `vv_pictures` to read
+VMAF v1's pictures where it left them (Direct3D 11 textures).
 
 ## Releasing
 
@@ -91,8 +99,10 @@ powershell -ExecutionPolicy Bypass -File fast\scripts\package.ps1 -Version <vers
 
 It writes `fast/release/libvmaf-fast-<version>-windows-x64.zip` with a
 `SHA256SUMS` of every file and a `.sha256` of the archive, and refuses a
-checkout with changes or a libvmaf built from another commit. Tag the commit
-`v<version>` and attach both files to the GitHub release.
+checkout with changes, a DLL built from another commit, a libvmaf without
+CUDA, and any file in `fast/dist` the release does not carry. Tag the commit
+`libvmaf-fast-<version>` (e.g. `-Version v1`, tag `libvmaf-fast-v1`) and
+attach both files to the GitHub release.
 
 ## Keeping up with upstream
 
