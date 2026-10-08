@@ -565,13 +565,15 @@ class V1Scorer:
         if self._gpu:
             self._vulkan.vv_destroy(self._gpu)
             self._gpu = ctypes.c_void_p()
-        if self._cpu:
-            self._lib.vmaf_close(self._cpu)  # waits for the extractors: nothing reads the pictures after it
-            self._cpu = ctypes.c_void_p()
+        # Unpinned once the GPU no longer writes into the pictures, and
+        # before vmaf_close frees them (the CPU's reads do not need the pin).
         for address, stream in self._pinned.items():
             if stream is not None:
                 stream.unpin(address)
         self._pinned = {}
+        if self._cpu:
+            self._lib.vmaf_close(self._cpu)  # waits for the extractors: nothing reads the pictures after it
+            self._cpu = ctypes.c_void_p()
 
 
 def predict(model_path: Path, frames: np.ndarray, values: dict[str, np.ndarray],
