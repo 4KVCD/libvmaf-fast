@@ -21,14 +21,30 @@ $out = if ($OutputDirectory) { $OutputDirectory } else { Join-Path $repository '
 $changes = git -C $repository status --porcelain --untracked-files=no
 if ($changes) { throw "The checkout has uncommitted changes; build and package a commit:`n$changes" }
 $commit = (git -C $repository rev-parse HEAD).Trim()
-foreach ($file in 'libvmaf/libvmaf.dll', 'vmaf_vulkan/vmaf_vulkan.dll') {
-    if (-not (Test-Path (Join-Path $dist $file))) { throw "fast/dist/$file is not built" }
-}
+# What the release carries, and nothing else (the build scripts write into
+# fast/dist, which may hold other files from earlier builds).
+$expected = @(
+    'libvmaf/libvmaf.dll', 'libvmaf/licenses/LICENSE.libvmaf.txt', 'libvmaf/licenses/LICENSE.nv-codec-headers.txt',
+    'libvmaf/licenses/LICENSE.pthreads4w.txt', 'libvmaf/licenses/LICENSE.xpsnr.txt',
+    'vmaf_vulkan/vmaf_vulkan.dll', 'vmaf_vulkan/licenses/LICENSE.libvmaf.txt')
+$built = @(foreach ($folder in 'libvmaf', 'vmaf_vulkan') {
+    $root = Join-Path $dist $folder
+    if (Test-Path $root) {
+        Get-ChildItem -Recurse -File $root | ForEach-Object { $_.FullName.Substring($dist.Length + 1).Replace('\', '/') }
+    }
+})
+$missing = $expected | Where-Object { $_ -notin $built }
+$extra = $built | Where-Object { $_ -notin $expected }
+if ($missing) { throw "fast/dist lacks $($missing -join ', '): build it" }
+if ($extra) { throw "fast/dist holds files the release does not carry: $($extra -join ', ')" }
 $library = Join-Path $dist 'libvmaf/libvmaf.dll'
 $reported = (& $Python -c "import ctypes, sys; lib = ctypes.CDLL(sys.argv[1]); lib.vmaf_version.restype = ctypes.c_char_p; print(lib.vmaf_version().decode())" $library).Trim()
-if (-not $commit.StartsWith($reported)) {
-    throw "libvmaf.dll was built from $reported, not from $($commit.Substring(0, 8)): build it again"
+if (-not $reported -or -not $commit.StartsWith($reported)) {
+    throw "libvmaf.dll was built from '$reported', not from $($commit.Substring(0, 8)): build it again"
 }
+# With CUDA, as BUILD.txt says (not a -NoCuda build).
+$withCuda = (& $Python -c "import ctypes, sys; print(hasattr(ctypes.CDLL(sys.argv[1]), 'vmaf_cuda_state_init'))" $library).Trim()
+if ($withCuda -ne 'True') { throw 'libvmaf.dll was built without CUDA (-NoCuda): build it with CUDA' }
 $vulkan = Join-Path $dist 'vmaf_vulkan/vmaf_vulkan.dll'
 $vulkanReported = (& $Python -c "import ctypes, sys; lib = ctypes.CDLL(sys.argv[1]); lib.vv_version.restype = ctypes.c_char_p; print(lib.vv_version().decode())" $vulkan).Trim()
 if (-not $vulkanReported -or -not $commit.StartsWith($vulkanReported)) {

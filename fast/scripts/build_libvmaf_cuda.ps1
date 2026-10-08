@@ -96,7 +96,11 @@ try {
     New-Item -ItemType Directory -Path $WorkDirectory -Force | Out-Null
     $vmaf = $repository
     $headers = Join-Path $WorkDirectory 'nv-codec-headers'
-    $build = Join-Path $WorkDirectory 'build'
+    # In the checkout, always in the same place in it: the DLL keeps assert's
+    # source paths, relative to the build directory (from one elsewhere they
+    # would name the folders between it and the checkout, and the bytes
+    # would depend on where the checkout is). git ignores build/.
+    $build = Join-Path $vmaf 'fast/build/libvmaf'
 
     if (-not $NoCuda) {
         if (-not (Test-Path (Join-Path $headers '.git'))) {
@@ -114,6 +118,12 @@ try {
     # not get c_args at all; cl, nvcc's host compiler too, reads INCLUDE.
     $nvInclude = Join-Path $headers 'include'
     if (-not $NoCuda) { $env:INCLUDE = "$nvInclude;$env:INCLUDE" }
+    # The same bytes wherever the checkout is: cl keeps the absolute paths of
+    # headers (assert's file names), which /pathmap rewrites, and only with
+    # /experimental:deterministic. Through _CL_, which cl reads (nvcc's host
+    # compiles too), for the reason INCLUDE carries the headers.
+    $env:_CL_ = "/experimental:deterministic `"/pathmap:$([IO.Path]::GetFullPath($vmaf).TrimEnd('\'))=.`" " +
+        "`"/pathmap:$([IO.Path]::GetFullPath($WorkDirectory).TrimEnd('\'))=work`""
     if (Test-Path $build) { Remove-Item -Recurse -Force $build }
     Invoke-Checked 'Configuring libvmaf' {
         & $Python -m mesonbuild.mesonmain setup (Join-Path $vmaf 'libvmaf') $build --buildtype release `
@@ -122,6 +132,12 @@ try {
             -Dc_args=/Brepro -Dcpp_args=/Brepro -Dc_link_args=/Brepro -Dcpp_link_args=/Brepro
     }
     Invoke-Checked 'Building libvmaf' { & $Python -m mesonbuild.mesonmain compile -C $build }
+    # meson leaves AVX-512 out without a word when nasm is older than 2.14;
+    # the Vulkan engine's SpEED picks its AVX-512 kernel from the CPU alone,
+    # so its scores would no longer be this libvmaf's on an AVX-512 CPU.
+    if (-not (Select-String -Path (Join-Path $build 'src/config.h') -Pattern '^#define HAVE_AVX512 1' -Quiet)) {
+        throw 'libvmaf was configured without AVX-512 (nasm 2.14 or newer is needed)'
+    }
 
     # The static library linked into a DLL exporting the public API (libvmaf
     # declares no exports of its own).
@@ -145,6 +161,8 @@ try {
 
     # The notices that ship with it.
     $licenses = Join-Path $outputDirectory 'licenses'
+    # Made afresh: a -NoCuda build after a CUDA one must not keep its notice.
+    if (Test-Path $licenses) { Remove-Item -Recurse -Force $licenses }
     New-Item -ItemType Directory -Path $licenses -Force | Out-Null
     Copy-Item (Join-Path $vmaf 'LICENSE') (Join-Path $licenses 'LICENSE.libvmaf.txt')
     Copy-Item (Join-Path $vmaf 'libvmaf/subprojects/pthread-win32/docs/LICENSE.md') (Join-Path $licenses 'LICENSE.pthreads4w.txt')

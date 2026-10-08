@@ -240,30 +240,41 @@ if ($LASTEXITCODE -ne 0 -or -not $commit) { throw 'The commit being built could 
 if (git -C $repository status --porcelain --untracked-files=no) { $commit += '-dirty' }
 # SpEED's covariance kernels are libvmaf's own files, compiled as libvmaf's
 # meson.build compiles them (/arch:AVX2, /arch:AVX512), so they round as its.
-$x86 = Join-Path $repository 'libvmaf/src/feature/x86'
+# The same bytes wherever the checkout and the work directory are: the
+# compiler runs in the checkout, given the sources relative to it (assert
+# keeps the path it was given), and /pathmap -- with
+# /experimental:deterministic, without which cl ignores it -- rewrites the
+# absolute paths it would keep otherwise (headers', and the source paths
+# its names for anonymous namespaces are made from, which moved code).
+$x86 = 'libvmaf\src\feature\x86'
+$vulkanSource = 'fast\vulkan'
+$deterministic = "/experimental:deterministic `"/pathmap:$([IO.Path]::GetFullPath($repository).TrimEnd('\'))=.`" " +
+    "`"/pathmap:$([IO.Path]::GetFullPath($WorkDirectory).TrimEnd('\'))=work`""
 $kernels = @(
-    "cl /nologo /c /O2 /MT /W3 /Brepro /arch:AVX2 `"$(Join-Path $x86 'speed_avx2.c')`" /Fo`"$build\speed_avx2.obj`"",
+    "cl /nologo /c /O2 /MT /W3 /Brepro $deterministic /arch:AVX2 `"$x86\speed_avx2.c`" /Fo`"$build\speed_avx2.obj`"",
     "if errorlevel 1 exit /b 1",
-    "cl /nologo /c /O2 /MT /W3 /Brepro /arch:AVX512 `"$(Join-Path $x86 'speed_avx512.c')`" /Fo`"$build\speed_avx512.obj`"",
+    "cl /nologo /c /O2 /MT /W3 /Brepro $deterministic /arch:AVX512 `"$x86\speed_avx512.c`" /Fo`"$build\speed_avx512.obj`"",
     "if errorlevel 1 exit /b 1",
     # (and v1_speed_cov.c, their sums four at a time, so with the same flags)
-    "cl /nologo /c /O2 /MT /W3 /Brepro /arch:AVX2 `"$(Join-Path $source 'v1_speed_cov.c')`" /Fo`"$build\cov4_avx2.obj`"",
+    "cl /nologo /c /O2 /MT /W3 /Brepro $deterministic /arch:AVX2 `"$vulkanSource\v1_speed_cov.c`" /Fo`"$build\cov4_avx2.obj`"",
     "if errorlevel 1 exit /b 1",
-    "cl /nologo /c /O2 /MT /W3 /Brepro /arch:AVX512 `"$(Join-Path $source 'v1_speed_cov.c')`" /Fo`"$build\cov4_avx512.obj`"",
+    "cl /nologo /c /O2 /MT /W3 /Brepro $deterministic /arch:AVX512 `"$vulkanSource\v1_speed_cov.c`" /Fo`"$build\cov4_avx512.obj`"",
     "if errorlevel 1 exit /b 1")
-$compile = "cl /nologo /LD /O2 /MT /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4305 /wd4996 /Brepro /DVV_COMMIT=\`"$commit\`" /I`"$build`" /I`"$(Join-Path $headers 'include')`" " +
-    "`"$(Join-Path $source 'vmaf_vulkan.cpp')`" `"$(Join-Path $source 'v1_host.c')`" `"$(Join-Path $source 'v1_speed.c')`" " +
+$compile = "cl /nologo /LD /O2 /MT /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4305 /wd4996 /Brepro $deterministic /DVV_COMMIT=\`"$commit\`" /I`"$build`" /I`"$(Join-Path $headers 'include')`" " +
+    "`"$vulkanSource\vmaf_vulkan.cpp`" `"$vulkanSource\v1_host.c`" `"$vulkanSource\v1_speed.c`" " +
     "`"$build\speed_avx2.obj`" `"$build\speed_avx512.obj`" `"$build\cov4_avx2.obj`" `"$build\cov4_avx512.obj`" /Fo`"$build\\`" /Fe`"$output`" /link /Brepro /IMPLIB:`"$build\vmaf_vulkan.lib`""
 $batch = Join-Path $build 'compile.bat'
 Set-Content -Path $batch -Encoding ascii -Value (@(
     '@echo off',
     "set PATH=$(Split-Path $vswhere);%PATH%",
-    "call `"$visualStudio\VC\Auxiliary\Build\vcvars64.bat`" >nul") + $kernels + @($compile))
+    "call `"$visualStudio\VC\Auxiliary\Build\vcvars64.bat`" >nul",
+    "cd /d `"$repository`"") + $kernels + @($compile))
 Invoke-Checked 'Compiling vmaf_vulkan.dll' { cmd /c $batch }
 
 # The notice that ships with it: the shaders and the engine are a port of
 # libvmaf's feature extractors.
 $licenses = Join-Path $outputDirectory 'licenses'
+if (Test-Path $licenses) { Remove-Item -Recurse -Force $licenses }  # made afresh
 New-Item -ItemType Directory -Path $licenses -Force | Out-Null
 Copy-Item (Join-Path $repository 'LICENSE') (Join-Path $licenses 'LICENSE.libvmaf.txt')
 Remove-Item (Join-Path $outputDirectory 'vmaf_vulkan.lib'), (Join-Path $outputDirectory 'vmaf_vulkan.exp') -ErrorAction SilentlyContinue
