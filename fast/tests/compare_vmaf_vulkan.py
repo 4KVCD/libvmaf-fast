@@ -41,8 +41,11 @@ def decode(path: str, start: float, frames: int, size: tuple[int, int] | None, b
         [shutil.which("ffprobe") or "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
          "stream=width,height", "-of", "csv=p=0", path], capture_output=True, text=True, check=True)
     width, height = (int(part) for part in probe.stdout.strip().split(",")[:2])
+    # Every decoded frame once (passthrough): for raw output FFmpeg otherwise
+    # makes the rate constant, dropping or repeating frames, and the two
+    # videos' frames no longer pair up.
     command = [shutil.which("ffmpeg") or "ffmpeg", "-v", "error", "-ss", str(start), "-i", path, "-map", "0:v:0",
-               "-frames:v", str(frames)]
+               "-fps_mode", "passthrough", "-frames:v", str(frames)]
     if size:
         width, height = size
         command += ["-vf", f"scale={width}:{height}:flags=bicubic"]
