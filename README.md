@@ -3,16 +3,16 @@
 [Netflix's libvmaf](https://github.com/Netflix/vmaf), faster, with the same
 scores. An unofficial fork, not affiliated with or endorsed by Netflix.
 
-- **VMAF and VMAF NEG on any GPU: up to 28x as fast as libvmaf on the CPU,
-  and 4.8x to 6.4x as fast as its CUDA code** (RTX 5090), with CUDA's exact
-  values. libvmaf's CUDA runs only on NVIDIA; this runs on Vulkan.
-- **VMAF v1 on the GPU: 2.6x to 9.4x as fast** as libvmaf on the CPU (Intel's
-  iGPU: 0.8x), with its exact scores.
-- **PSNR and SSIM: 1.9x to 4.1x as fast**, the same scores.
-- **XPSNR, new in libvmaf: 5.2x to 16x as fast** as FFmpeg's `xpsnr` filter,
-  the same scores.
+- **VMAF and VMAF NEG on any GPU, bit-exact with libvmaf's CUDA code: up to
+  28x as fast as libvmaf on the CPU, and 4.8x to 6.4x as fast as its CUDA
+  code** (RTX 5090). libvmaf's CUDA runs only on NVIDIA; this runs on Vulkan.
+- **VMAF v1 on the GPU, bit-exact with libvmaf's CPU code: 2.6x to 9.4x as
+  fast** (Intel's iGPU: 0.8x).
+- **PSNR and SSIM, bit-exact: 1.9x to 4.1x as fast.**
+- **XPSNR, new in libvmaf, bit-exact with FFmpeg's `xpsnr` filter: 5.2x to
+  16x as fast.**
 - **libvmaf's CUDA code fixed**: 13 upstream pull requests merged, 35% less
-  GPU memory.
+  GPU memory, scores closer to the CPU's.
 
 **Ready-made tool:** [VideoMetricsLab](https://github.com/4KVCD/VideoMetricsLab)
 is a Windows app for scoring and comparing video encodes. Calculate VMAF and VMAF NEG on NVIDIA GPUs, and SSIMULACRA2, Butteraugli and ColorVideo VDP on NVIDIA, AMD and Intel GPUs, alongside PSNR, SSIM and XPSNR. Compare encodes with frame-exact playback that switches between the source and each encode instantly to easily spot differences.
