@@ -19,6 +19,7 @@ and .md there; report puts several computers' results in one markdown file.
 from __future__ import annotations
 
 import argparse
+import codecs
 import contextlib
 import ctypes
 import hashlib
@@ -493,10 +494,21 @@ def child(args) -> int:
 
 # ---------------------------------------------------------------------- run
 
+def console_encoding() -> str:
+    """The code page Windows' own tools write in: the console's (936 on a Chinese Windows, say), not UTF-8.
+    The one the console has now, not the OEM code page it starts with: a UTF-8 terminal (chcp 65001) has
+    powercfg write UTF-8, which "oem" read as GBK. Without a console, or with one Python has no codec for
+    (GB18030's 54936), the OEM code page."""
+    code_page = ctypes.windll.kernel32.GetConsoleOutputCP()
+    try:
+        return codecs.lookup(f"cp{code_page}").name if code_page else "oem"
+    except LookupError:
+        return "oem"
+
+
 def powershell(script: str) -> str:
-    # Windows' own tools write in the console's code page (936 on a Chinese Windows, say), not UTF-8.
-    return unchecked(["powershell", "-NoProfile", "-Command", script], capture_output=True, encoding="oem",
-                     errors="replace").stdout
+    return unchecked(["powershell", "-NoProfile", "-Command", script], capture_output=True,
+                     encoding=console_encoding(), errors="replace").stdout
 
 
 def machine() -> dict:
@@ -516,8 +528,8 @@ def machine() -> dict:
     with contextlib.suppress(OSError):
         info["nvidia_driver"] = unchecked(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
                                                capture_output=True, encoding="oem", errors="replace").stdout.strip()
-    info["power_scheme"] = unchecked(["powercfg", "/getactivescheme"], capture_output=True, encoding="oem",
-                                     errors="replace").stdout.strip()
+    info["power_scheme"] = unchecked(["powercfg", "/getactivescheme"], capture_output=True,
+                                     encoding=console_encoding(), errors="replace").stdout.strip()
     battery = powershell("Get-CimInstance Win32_Battery | ForEach-Object { $_.BatteryStatus }").strip()
     if battery:
         info["on_ac_power"] = battery.splitlines()[0].strip() == "2"
