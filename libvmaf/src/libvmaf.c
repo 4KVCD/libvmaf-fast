@@ -944,6 +944,29 @@ static void release_picture_pair(VmafPicture *ref, VmafPicture *dist)
     vmaf_picture_unref(dist);
 }
 
+#ifdef HAVE_CUDA
+/**
+ * libvmaf-fast: what translate_picture() made for a picture beyond the
+ * caller's own -- the ring-buffer picture a host picture was uploaded to,
+ * or the host picture a device picture was downloaded to -- released on a
+ * failure before the end of vmaf_read_pictures() would release them, as
+ * it does there. A copy that is the caller's picture itself (the same ref)
+ * is left to release_picture_pair().
+ */
+static void release_translated(VmafContext *vmaf, const VmafPicture *in,
+                               VmafPicture *host, VmafPicture *device)
+{
+    if (host->priv && host->ref != in->ref)
+        vmaf_picture_unref(host);
+    if (device->priv && device->ref != in->ref) {
+        CudaFunctions *cu_f = vmaf->cuda.state.f;
+        CHECK_CUDA(cu_f, cuEventRecord(vmaf_cuda_picture_get_finished_event(device),
+                                       vmaf_cuda_picture_get_stream(device)));
+        vmaf_picture_unref(device);
+    }
+}
+#endif
+
 int vmaf_read_pictures(VmafContext *vmaf, VmafPicture *ref, VmafPicture *dist,
                        unsigned index)
 {
@@ -993,6 +1016,14 @@ int vmaf_read_pictures(VmafContext *vmaf, VmafPicture *ref, VmafPicture *dist,
 
     VmafPicture dist_host = { 0 }, dist_device = { 0 };
     err = translate_picture(vmaf, dist, &dist_host, &dist_device, hw_flags);
+    // libvmaf-fast: a failure here went on to the extractors with an empty
+    // distorted picture, the error overwritten by theirs.
+    if (err) {
+        release_translated(vmaf, ref_in, &ref_host, &ref_device);
+        release_translated(vmaf, dist_in, &dist_host, &dist_device);
+        release_picture_pair(ref_in, dist_in);
+        return err;
+    }
 
     // Host pictures are released below, or by the thread pool, and a pooled
     // one is then reused at once. An upload from page-locked memory runs on
@@ -1056,6 +1087,10 @@ int vmaf_read_pictures(VmafContext *vmaf, VmafPicture *ref, VmafPicture *dist,
         }
 
         if (err) {
+#ifdef HAVE_CUDA
+            release_translated(vmaf, ref_in, &ref_host, &ref_device);
+            release_translated(vmaf, dist_in, &dist_host, &dist_device);
+#endif
             release_picture_pair(ref_in, dist_in);
             return err;
         }

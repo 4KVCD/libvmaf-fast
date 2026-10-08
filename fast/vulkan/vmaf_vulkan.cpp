@@ -669,7 +669,6 @@ struct vv_context {
     // adm_fused.slang's BAND (scale 0's; 16 at the others, which are small) and OWN.
     enum { kAdmParams = 56, kAdmBandRows = 32, kAdmBandRowsSmall = 8, kAdmOwnColumns = 126 };
     Buffer admParams, admPartial;
-    VkDeviceSize admPartialWords = 0;  // its int64s: every row's sums per workgroup, of the largest scale
     std::vector<int32_t> admParamValues;
     int skip = 0;  // timing tests: 1 = no motion, 2 = no VIF, 4 = no ADM
     int passLimit = 0;  // timing tests: only the first N scored passes
@@ -854,6 +853,7 @@ struct vv_context {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkImageView views[2] = {};  // luma, chroma (UINT)
     };
+    enum { kPictureCacheSize = 64 };
     std::vector<Picture> pictureCache;
     int lastPicture = -1;
     uint32_t lastPlace[2] = {};
@@ -1349,9 +1349,14 @@ VkDescriptorSet vv_context::descriptor_set(int shader, const std::vector<Bound> 
 int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_list<Bound> bound,
                          const void *constants, uint32_t constantBytes, uint32_t gx, uint32_t gy)
 {
+    if (bound.size() > kMaxBindings)
+        return fail(-1, std::string("too many buffers bound to the shader ") + kShaders[shader].name);
     if (!pipelines[shader].module) {  // its pipeline compiled by compile_pipelines, once every pass is in
         if (int error = make_layouts(shader, (uint32_t)bound.size()))
             return error;
+    } else if (pipelines[shader].bindings != (uint32_t)bound.size()) {
+        // The layout was made for the first pass's bindings: every pass of a shader binds the same number.
+        return fail(-1, std::string("the shader ") + kShaders[shader].name + " is bound a different number of buffers");
     }
     Pass pass = {};
     pass.shader = shader;
@@ -1455,9 +1460,12 @@ int ceil_log2(int value) { return (int)ceil(log2((double)value)); }
 
 } // namespace
 
-// Copies `data` into a device buffer through slot 0's staging buffer.
+// Copies `data` into a device buffer through slot 0's command buffer (and
+// a staging buffer of its own): slot 0's frame, if one is in flight, first.
 int vv_context::upload(Buffer &target, const void *data, size_t bytes)
 {
+    if (int error = collect(slots[0]))
+        return error;
     Buffer staging;
     if (int error = create_buffer(staging, bytes, true)) {
         destroy_last_buffer(staging);
@@ -2023,7 +2031,6 @@ int vv_context::build_passes_v1()
             if (!error)
                 error = add_pass(scored, kShader_adm_rowsum, { &bandsRef[set], &bandsDis[set], &divTable, &admParams, &acc,
                                  &admPartial }, constants, sizeof constants, groups(rows * 9, 256), 1);
-            admPartialWords = std::max<VkDeviceSize>(admPartialWords, (VkDeviceSize)rows * chunks * 9);
         }
         inW = bw;
         inH = bh;
@@ -2588,7 +2595,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // the previous blur (as the CUDA code's memset) and the band images.
     std::vector<uint32_t> table(65536);
     for (uint32_t i = 0; i < 32768; ++i)
-        table[i] = cuda_log_generate(32768 + i);  // 30720..32768
+        table[i] = cuda_log_generate(32768 + i);  // log2(32768..65535) * 2048: values 30720..32768
     // Two entries a word (vif_stats.slang's log_generate).
     for (uint32_t i = 0; i < 16384; ++i)
         table[i] = table[2 * i] | (table[2 * i + 1] << 16);
@@ -3220,6 +3227,11 @@ int vv_context::commit(bool score)
     Slot &slot = *pending;
     pending = nullptr;
     nextSlot = (nextSlot + 1) % (unsigned)slots.size();
+    if (pictures) {  // the frame's reference: the next frame's previous one (its motion), now that it is committed
+        lastPicture = slot.pictureRef;
+        lastPlace[0] = slot.places[2];
+        lastPlace[1] = slot.places[3];
+    }
     const double recordStart = profile ? now_ns() : 0.0;
     const size_t slotIndex = (size_t)(&slot - slots.data());
     const uint32_t queryBase = (uint32_t)(slotIndex * kQueriesPerSlot);
@@ -3516,6 +3528,8 @@ int vv_context::import_texture(void *handle, int *index)
 // texture again before completed() counts this frame.
 int vv_context::commit_textures(int ref, int dis, bool score)
 {
+    if (pictures)  // (its staging buffers hold no planes: a few bytes, which the copy would overrun)
+        return fail(-3, "this context reads the pictures where a decoder left them (vv_pictures)");
     const int count = (int)imported.size();
     if (ref < 0 || ref >= count || (score && (dis < 0 || dis >= count)))
         return fail(-3, "no such imported texture");
@@ -3553,8 +3567,11 @@ int vv_context::import_picture(HANDLE handle, uint32_t width, uint32_t height)
     for (size_t i = 0; i < pictureCache.size(); ++i)
         if (pictureCache[i].handle == handle && pictureCache[i].width == width && pictureCache[i].height == height)
             return (int)i;
-    if (pictureCache.size() >= 64)
-        return fail(-3, "vv_pictures: more pictures than a decoder has");
+    // The decoders' pools, which they reuse: a bound, not a cache that
+    // evicts (a picture in flight or the next frame's previous must stay).
+    if (pictureCache.size() >= kPictureCacheSize)
+        return fail(-3, "vv_pictures: more than " + std::to_string(kPictureCacheSize)
+                        + " different pictures (larger decoder pools than this context keeps)");
     Picture picture;
     picture.handle = handle;
     picture.width = width;
@@ -3637,6 +3654,9 @@ int vv_context::set_pictures(HANDLE reference, uint32_t referenceW, uint32_t ref
     const int dis = import_picture(distorted, distortedW, distortedH);
     if (dis < 0)
         return dis;
+    // The previous picture is the last committed frame's reference (commit
+    // records it): given twice for one frame, or for a frame never
+    // committed, this leaves the motion's previous as it was.
     Slot &slot = *pending;
     slot.pictureRef = ref;
     slot.pictureDis = dis;
@@ -3645,9 +3665,6 @@ int vv_context::set_pictures(HANDLE reference, uint32_t referenceW, uint32_t ref
                                  lastPicture >= 0 ? lastPlace[1] : (uint32_t)referenceY,
                                  (uint32_t)referenceX, (uint32_t)referenceY, (uint32_t)distortedX, (uint32_t)distortedY };
     memcpy(slot.places, places, sizeof places);
-    lastPicture = ref;
-    lastPlace[0] = (uint32_t)referenceX;
-    lastPlace[1] = (uint32_t)referenceY;
     return 0;
 }
 
@@ -3752,8 +3769,10 @@ VV_EXPORT int vv_device(int index, char *name, int nameBytes, uint32_t *vendor, 
 // same; see shaders/vif_hori.slang); bits 8-15 = frames in flight (0: 3).
 // Bits 16-18 leave out motion, VIF or ADM, and bits 20-27 all but the first
 // N passes of VIF and ADM, to time the others. Bit 19: the frames come from
-// GPU memory a decoder shares (vv_shared_next, vv_export). Bits 28-30: the
-// scale-0 decouple shader's VARIANT, for the diagnosis.
+// GPU memory a decoder shares (vv_shared_next, vv_export); with it, bit 2:
+// VMAF v1's pictures read where the decoder left them (vv_pictures, where
+// the context can: vv_pictures_mode). Bits 28-30: the scale-0 decouple
+// shader's VARIANT, for the diagnosis.
 VV_EXPORT int vv_create(vv_context **out, int device, int width, int height, int bitDepth, int flags)
 {
     vv_context *context = new vv_context();
@@ -3808,7 +3827,9 @@ VV_EXPORT int vv_commit(vv_context *context, int score) { return context->commit
 // decoder then waits for its copies before vv_commit, as without).
 VV_EXPORT int vv_import_timeline(vv_context *context, void *handle)
 {
-    if (!context->shared || !context->timelines)
+    if (!context->shared)
+        return fail(-3, "this context takes its frames from host memory");
+    if (!context->timelines)
         return fail(-4, "this GPU's Vulkan takes no timeline semaphores from other APIs");
     if (context->copied)
         return fail(-3, "a timeline semaphore is already imported");
@@ -4172,7 +4193,7 @@ VV_EXPORT int vv_sums(vv_context *context, unsigned index, uint64_t *out, int co
 {
     if (index >= context->sums.size())
         return fail(-3, "no such frame");
-    memcpy(out, context->sums[index].slots, sizeof(uint64_t) * (size_t)std::min(count, (int)kSlots));
+    memcpy(out, context->sums[index].slots, sizeof(uint64_t) * (size_t)std::clamp(count, 0, (int)kSlots));
     return kSlots;
 }
 
@@ -4190,6 +4211,8 @@ VV_EXPORT int vv_read_buffer(vv_context *context, int which, void *out, uint64_t
                       &context->bandsARef[0], &context->bandsADis[0], &context->bandsARef[1], &context->bandsADis[1] };
     if (which < 0 || which >= (int)(sizeof all / sizeof all[0]))
         return fail(-3, "no such buffer");
+    if (int error = context->collect(context->slots[0]))  // slot 0's command buffer: not while its frame is in flight
+        return error;
     Buffer *source = all[which];
     bytes = std::min<uint64_t>(bytes, source->size);
     Buffer staging;

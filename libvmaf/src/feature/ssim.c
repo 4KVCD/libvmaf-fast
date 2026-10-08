@@ -90,8 +90,8 @@ static int decimate_picture(VmafPicture *pic, int scale, float *dst,
     const ptrdiff_t stride = wide ? pic->stride[0] / 2 : pic->stride[0];
     const uint8_t *data8 = pic->data[0];
     const uint16_t *data16 = pic->data[0];
-    /* _iqa_filter_pixel's window: -uc .. uc - even, around x * scale */
-    const int uc = scale / 2, even = (scale & 1) ? 0 : 1;
+    /* _iqa_filter_pixel's window: the scale samples from x * scale - uc */
+    const int uc = scale / 2;
     double *acc = malloc(sizeof(double) * sw);
     int *columns = malloc(sizeof(int) * sw * scale);
     if (!acc || !columns) {
@@ -132,7 +132,6 @@ static int decimate_picture(VmafPicture *pic, int scale, float *dst,
         for (int x = 0; x < sw; x++)
             out[x] = (float)(table ? acc[x] : acc[x] * unit);
     }
-    (void) even;
     free(acc);
     free(columns);
     return 0;
