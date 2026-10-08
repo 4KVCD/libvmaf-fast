@@ -6,8 +6,8 @@ scores. An unofficial fork, not affiliated with or endorsed by Netflix.
 - **VMAF and VMAF NEG on any GPU, bit-exact with libvmaf's CUDA code: up to
   28x as fast as libvmaf on the CPU, and 4.8x to 6.4x as fast as its CUDA
   code** (RTX 5090). libvmaf's CUDA runs only on NVIDIA; this runs on Vulkan.
-- **VMAF v1 on the GPU, bit-exact with libvmaf's CPU code: 2.6x to 9.4x as
-  fast** (Intel's iGPU: 0.8x).
+- **VMAF v1 on any GPU with Vulkan, bit-exact with libvmaf's CPU code: 2.6x
+  to 9.4x as fast** (Intel's iGPU: 0.8x).
 - **PSNR and SSIM, bit-exact: 1.9x to 4.1x as fast.**
 - **XPSNR, new in libvmaf, bit-exact with FFmpeg's `xpsnr` filter: 5.2x to
   16x as fast.**
