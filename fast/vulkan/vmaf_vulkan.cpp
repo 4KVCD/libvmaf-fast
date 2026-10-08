@@ -1151,9 +1151,21 @@ int vv_context::compile_pipelines()
         if (!queued)
             jobs.push_back({ pass->shader, words });
     }
+    // A thread each; where no more can be started (std::system_error, or
+    // bad_alloc), the rest are compiled on this one, and every thread
+    // started is joined: an exception must not leave this C API.
     std::vector<std::thread> threads;
-    for (Job &job : jobs)
-        threads.emplace_back([this, &job] { job.result = compile_pipeline(job.shader, job.words, &job.made); });
+    size_t started = 0;
+    try {
+        threads.reserve(jobs.size());
+        for (; started < jobs.size(); started++) {
+            Job &job = jobs[started];
+            threads.emplace_back([this, &job] { job.result = compile_pipeline(job.shader, job.words, &job.made); });
+        }
+    } catch (const std::exception &) {
+    }
+    for (size_t i = started; i < jobs.size(); i++)
+        jobs[i].result = compile_pipeline(jobs[i].shader, jobs[i].words, &jobs[i].made);
     for (std::thread &thread : threads)
         thread.join();
     int error = 0;
@@ -3835,7 +3847,9 @@ VV_EXPORT int vv_commit_after(vv_context *context, uint64_t value)
 // imported it -- *slot says which (they take turns), the reference's rows
 // start at offset 0 and the distorted's at *disOffset, *stride bytes apart.
 // Once they are written (and that API has finished writing), vv_commit.
-// Returns how many slots there are.
+// Returns how many slots there are. A context reading a decoder's pictures
+// (vv_pictures) begins each frame here too, but its buffers hold no planes
+// (they are 4096 bytes): nothing may be written into them.
 VV_EXPORT int vv_shared_next(vv_context *context, int *slot, uint32_t *stride, uint32_t *disOffset)
 {
     if (!context->shared)
