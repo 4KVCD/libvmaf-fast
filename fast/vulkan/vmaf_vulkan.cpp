@@ -49,11 +49,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <system_error>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -199,11 +199,45 @@ enum {
     kFeatures = 12
 };
 
-struct FrameSums {
-    bool scored = false;
-    uint64_t slots[kSlots] = {};
-    double cambiPooled[V1_CAMBI_SCALES] = {};  // spatial_pooling on the CPU, where the GPU's top k was not exact
-    unsigned cambiPooledScales = 0;           // which scales those are (bits)
+// What the API reads of a frame (vv_features, vv_features_v1,
+// vv_v1_cambi_scores), made from its sums when the GPU is done with it
+// (collect), by the same functions on the same sums as when they were
+// read later, so the sums themselves (kSlots 64-bit values, about 750
+// bytes) need not be kept: only the first kRawFrames frames' are, for
+// vv_sums. Motion stays as its SAD sum: a frame's motion2 needs the next
+// frame's.
+struct FrameRecord {
+    uint64_t sad = 0;
+    float vif[2][kScales] = {};  // VIF per scale, gain limit 100 and 1: vif_scores' quotients are floats
+    double adm[2] = {};          // ADM2, gain limit 100 and 1
+    double v1Adm[3] = {};        // VMAF v1's adm3, aim and adm2 (v1_adm)
+    double cambi = 0.0;          // VMAF v1's CAMBI
+    uint8_t scored = 0;
+    int8_t cambiError = 0;       // -5 or -6: vv_v1_cambi_scores fails at this frame
+};
+enum { kRawFrames = 256 };
+
+// Items in blocks of kBlock, so that adding one never moves the others: a
+// std::vector's growth copies them all and holds up to twice their size.
+template <typename T>
+class Blocks {
+public:
+    size_t size() const { return count; }
+    T &operator[](size_t i) { return blocks[i / kBlock][i % kBlock]; }
+    const T &operator[](size_t i) const { return blocks[i / kBlock][i % kBlock]; }
+
+    // One more item, value-initialized.
+    void add()
+    {
+        if (count % kBlock == 0)
+            blocks.emplace_back(new T[kBlock]());
+        ++count;
+    }
+
+private:
+    enum { kBlock = 1024 };
+    std::vector<std::unique_ptr<T[]>> blocks;
+    size_t count = 0;
 };
 
 // As libvmaf: write_scores() of integer_vif_cuda.c.
@@ -573,10 +607,9 @@ public:
     bool result(unsigned index, double out[3])
     {
         std::lock_guard<std::mutex> lock(mutex);
-        auto found = results.find(index);
-        if (found == results.end())
+        if (index >= results.size() || !results[index].done)
             return false;
-        memcpy(out, found->second.data(), 3 * sizeof(double));
+        memcpy(out, results[index].scores, 3 * sizeof(double));
         return true;
     }
 
@@ -607,7 +640,10 @@ private:
             const double ns = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - started).count();
             std::lock_guard<std::mutex> lock(mutex);
-            results[job.first] = scores;
+            while (results.size() <= job.first)  // frames finish in any order
+                results.add();
+            memcpy(results[job.first].scores, scores.data(), sizeof results[job.first].scores);
+            results[job.first].done = true;
             spare.push_back(std::move(job.second));
             busyNs += ns;
             ++jobs;
@@ -636,7 +672,11 @@ private:
     std::condition_variable work, done;
     std::deque<std::pair<unsigned, std::vector<float>>> queue;
     std::vector<std::vector<float>> spare;
-    std::unordered_map<unsigned, std::array<double, 3>> results;
+    struct Result {
+        double scores[3];
+        bool done;
+    };
+    Blocks<Result> results;  // by frame
     std::vector<std::thread> threads;
     std::vector<V1Speed *> states;
     size_t floats = 0, pending = 0;
@@ -810,7 +850,9 @@ struct vv_context {
     std::vector<Slot> slots;
     unsigned nextSlot = 0;
     unsigned frames = 0;
-    std::vector<FrameSums> sums;
+    Blocks<FrameRecord> records;                        // every frame's, from its commit on
+    std::vector<std::array<uint64_t, kSlots>> rawSums;  // the first kRawFrames frames' sums (vv_sums)
+    int cambi_score(const uint64_t *sums, const double *pooled, unsigned pooledScales, double &out) const;
     bool failed = false;
 
     // Timing tests (VV_GPU_TIME=<file>): the profiler's (enable_profile), its
@@ -3030,26 +3072,44 @@ int vv_context::collect(Slot &slot)
             }
         }
     }
-    FrameSums &frame = sums[slot.index];
-    frame.scored = slot.scored;
+    uint64_t sums[kSlots];
     const uint32_t *words = (const uint32_t *)slot.result.mapped;
     for (int i = 0; i < kSlots; ++i)
-        frame.slots[i] = (uint64_t)words[2 * i] | ((uint64_t)words[2 * i + 1] << 32);
+        sums[i] = (uint64_t)words[2 * i] | ((uint64_t)words[2 * i + 1] << 32);
+    if (slot.index < rawSums.size())
+        memcpy(rawSums[slot.index].data(), sums, sizeof sums);
     const double tailStart = profile ? now_ns() : 0.0;
+    double cambiPooled[V1_CAMBI_SCALES] = {};  // spatial_pooling on the CPU, where the GPU's top k was not exact
+    unsigned cambiPooledScales = 0;           // which scales those are (bits)
     if (cambi && slot.scored) {
         const float *kept = (const float *)slot.cambiKeep.mapped;
         for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
-            if (!(frame.slots[kSlotCambi + scale * 4 + 3] & 2))
+            if (!(sums[kSlotCambi + scale * 4 + 3] & 2))
                 continue;
             const int sw = cambiConst.scale_w[scale], sh = cambiConst.scale_h[scale];
             std::vector<float> values(kept + cambiKeepOffset[scale], kept + cambiKeepOffset[scale] + (size_t)sw * sh);
-            frame.cambiPooled[scale] = v1_cambi_pool(values.data(), cambiOptions.topk, (unsigned)sw, (unsigned)sh);
-            frame.cambiPooledScales |= 1u << scale;
+            cambiPooled[scale] = v1_cambi_pool(values.data(), cambiOptions.topk, (unsigned)sw, (unsigned)sh);
+            cambiPooledScales |= 1u << scale;
         }
     }
     if (profile) {
         cpuNs[kCpuCambiPool] += now_ns() - tailStart;
         ++cpuCount[kCpuCambiPool];
+    }
+    FrameRecord &frame = records[slot.index];
+    frame.sad = sums[kSlotSad];
+    frame.scored = slot.scored ? 1 : 0;
+    if (slot.scored) {  // the options all of this reads are fixed before the first frame
+        for (int limit = 0; limit < 2; ++limit) {
+            double vif[kScales];
+            vif_scores(sums, limit, vif);
+            for (int scale = 0; scale < kScales; ++scale)
+                frame.vif[limit][scale] = (float)vif[scale];  // exact: each is a float quotient
+            frame.adm[limit] = adm_score(sums, limit, (unsigned)w, (unsigned)h);
+        }
+        v1_adm(*this, sums, frame.v1Adm);
+        if (cambi)
+            frame.cambiError = (int8_t)cambi_score(sums, cambiPooled, cambiPooledScales, frame.cambi);
     }
     if (speed && slot.scored)  // est_params on the pool's threads, from a copy of the planes
         speedPool.submit(slot.index, (const float *)slot.speedKeep.mapped);
@@ -3237,7 +3297,9 @@ int vv_context::commit(bool score)
     const uint32_t queryBase = (uint32_t)(slotIndex * kQueriesPerSlot);
 
     const unsigned index = frames++;
-    sums.emplace_back();
+    records.add();
+    if (index < kRawFrames)
+        rawSums.emplace_back();
     slot.index = index;
     slot.scored = score;
 
@@ -3991,6 +4053,33 @@ bool cambi_units(uint32_t bits, uint64_t &units)
 
 }  // namespace
 
+// A scored frame's CAMBI score (cambi.c's, with cambi_max_val) from its
+// sums and the scales pooled on the CPU (`pooled`, bits `pooledScales`):
+// 0, or -5 when it has a sample above its bit depth's largest (as cambi.c
+// fails), -6 when its top k is not exact in a double.
+int vv_context::cambi_score(const uint64_t *sums, const double *pooled, unsigned pooledScales, double &out) const
+{
+    const V1CambiConstants &c = cambiConst;
+    if (sums[kSlotCambiInvalid] & 1)
+        return -5;
+    double scores[V1_CAMBI_SCALES];
+    for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
+        if (pooledScales & (1u << scale)) {
+            scores[scale] = pooled[scale];
+            continue;
+        }
+        const uint64_t *s = &sums[kSlotCambi + scale * 4];
+        uint64_t threshold;
+        const bool exact = (s[3] & 1) == 0 && cambi_units((uint32_t)s[1], threshold);
+        const uint64_t total = exact ? s[0] + s[2] * threshold : 0;
+        if (!exact || total >= (1ull << 53))
+            return -6;
+        scores[scale] = (double)total * (1.0 / 16777216.0) / c.topk_elements[scale];
+    }
+    out = v1_cambi_score(scores, c.pixels_in_window, cambiOptions.max_val);
+    return 0;
+}
+
 // Every frame's CAMBI score (cambi.c's, with cambi_max_val), after vv_flush;
 // NaN for a frame that was not scored. Returns the number of frames, or -5
 // when a frame has a sample above its bit depth's largest (as cambi.c fails).
@@ -3998,33 +4087,19 @@ VV_EXPORT int vv_v1_cambi_scores(vv_context *context, double *out, unsigned fram
 {
     if (!context->cambi)
         return fail(-3, "CAMBI is not calculated in this context");
-    const std::vector<FrameSums> &sums = context->sums;
-    const V1CambiConstants &c = context->cambiConst;
-    const unsigned n = (unsigned)std::min<size_t>(frames, sums.size());
+    const Blocks<FrameRecord> &records = context->records;
+    const unsigned n = (unsigned)std::min<size_t>(frames, records.size());
     for (unsigned i = 0; i < n; ++i) {
         out[i] = NAN;
-        if (!sums[i].scored)
+        if (!records[i].scored)
             continue;
-        const uint64_t *slots = sums[i].slots;
-        if (slots[kSlotCambiInvalid] & 1)
+        if (records[i].cambiError == -5)
             return fail(-5, "CAMBI: frame " + std::to_string(i) + " has a sample above its bit depth's largest");
-        double scores[V1_CAMBI_SCALES];
-        for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
-            if (sums[i].cambiPooledScales & (1u << scale)) {  // pooled on the CPU when the frame was done
-                scores[scale] = sums[i].cambiPooled[scale];
-                continue;
-            }
-            const uint64_t *s = &slots[kSlotCambi + scale * 4];
-            uint64_t threshold;
-            const bool exact = (s[3] & 1) == 0 && cambi_units((uint32_t)s[1], threshold);
-            const uint64_t total = exact ? s[0] + s[2] * threshold : 0;
-            if (!exact || total >= (1ull << 53))
-                return fail(-6, "CAMBI: frame " + std::to_string(i) + "'s top k is not exact in a double");
-            scores[scale] = (double)total * (1.0 / 16777216.0) / c.topk_elements[scale];
-        }
-        out[i] = v1_cambi_score(scores, c.pixels_in_window, context->cambiOptions.max_val);
+        if (records[i].cambiError == -6)
+            return fail(-6, "CAMBI: frame " + std::to_string(i) + "'s top k is not exact in a double");
+        out[i] = records[i].cambi;
     }
-    return (int)sums.size();
+    return (int)records.size();
 }
 
 // For tests and benchmarks of a context made with flag bit 19 (frames from
@@ -4110,13 +4185,13 @@ VV_EXPORT int vv_v1_speed_scores(vv_context *context, double *out, unsigned fram
     if (!context->speed)
         return fail(-3, "SpEED is not calculated in this context");
     context->speedPool.wait();
-    const std::vector<FrameSums> &sums = context->sums;
-    const unsigned n = (unsigned)std::min<size_t>(frames, sums.size());
+    const size_t count = context->records.size();
+    const unsigned n = (unsigned)std::min<size_t>(frames, count);
     for (unsigned i = 0; i < n; ++i) {
         if (!context->speedPool.result(i, out + 3 * (size_t)i))
             out[3 * (size_t)i] = out[3 * (size_t)i + 1] = out[3 * (size_t)i + 2] = NAN;
     }
-    return (int)sums.size();
+    return (int)count;
 }
 
 // Profiling, for the speed work: started before the first frame, it times
@@ -4157,43 +4232,48 @@ VV_EXPORT int vv_profile_text(vv_context *context, char *out, int bytes)
 // the frame was scored, 0 when only its motion was (the others are 0 then).
 VV_EXPORT int vv_features(vv_context *context, unsigned index, double *out)
 {
-    if (index >= context->sums.size())
+    const Blocks<FrameRecord> &records = context->records;
+    if (index >= records.size())
         return fail(-3, "no such frame");
-    const std::vector<FrameSums> &sums = context->sums;
     const unsigned w = (unsigned)context->w, h = (unsigned)context->h;
     for (int i = 0; i < kFeatures; ++i)
         out[i] = 0.0;
     // As libvmaf (integer_motion_cuda.c): the first frame's motion is 0, and
     // motion2 is the lesser of a frame's motion and the next frame's.
     auto motion = [&](unsigned frame) {
-        return frame == 0 ? 0.0 : normalize_and_scale_sad(sums[frame].slots[kSlotSad], w, h);
+        return frame == 0 ? 0.0 : normalize_and_scale_sad(records[frame].sad, w, h);
     };
     const double own = motion(index);
     out[kMotion] = own;
     if (index == 0) {
         out[kMotion2] = 0.0;
-    } else if (index + 1 < sums.size()) {
+    } else if (index + 1 < records.size()) {
         const double next = motion(index + 1);
         out[kMotion2] = own < next ? own : next;
     } else {
         out[kMotion2] = own;
     }
-    const FrameSums &frame = sums[index];
+    const FrameRecord &frame = records[index];
     if (!frame.scored)
         return 0;
-    vif_scores(frame.slots, 0, &out[kVifScale0]);
-    vif_scores(frame.slots, 1, &out[kVifScale0Neg]);
-    out[kAdm2] = adm_score(frame.slots, 0, w, h);
-    out[kAdm2Neg] = adm_score(frame.slots, 1, w, h);
+    for (int scale = 0; scale < kScales; ++scale) {
+        out[kVifScale0 + scale] = frame.vif[0][scale];
+        out[kVifScale0Neg + scale] = frame.vif[1][scale];
+    }
+    out[kAdm2] = frame.adm[0];
+    out[kAdm2Neg] = frame.adm[1];
     return 1;
 }
 
-// A frame's raw sums (kSlots 64-bit values), for tests.
+// A frame's raw sums (kSlots 64-bit values), for tests: kept for the first
+// kRawFrames (256) frames only, -3 for a later one.
 VV_EXPORT int vv_sums(vv_context *context, unsigned index, uint64_t *out, int count)
 {
-    if (index >= context->sums.size())
+    if (index >= context->records.size())
         return fail(-3, "no such frame");
-    memcpy(out, context->sums[index].slots, sizeof(uint64_t) * (size_t)std::clamp(count, 0, (int)kSlots));
+    if (index >= context->rawSums.size())
+        return fail(-3, "a frame's raw sums are kept for the first " + std::to_string((int)kRawFrames) + " frames only");
+    memcpy(out, context->rawSums[index].data(), sizeof(uint64_t) * (size_t)std::clamp(count, 0, (int)kSlots));
     return kSlots;
 }
 
@@ -4281,33 +4361,34 @@ VV_EXPORT int vv_create_v1(vv_context **out, int device, int width, int height, 
 // derives it from all the frames' SAD scores. Returns the number of frames.
 VV_EXPORT int vv_features_v1(vv_context *context, double *out, unsigned frames)
 {
-    const std::vector<FrameSums> &sums = context->sums;
+    const Blocks<FrameRecord> &records = context->records;
+    const size_t count = records.size();
     const V1Options &o = context->options;
-    const unsigned n = (unsigned)std::min<size_t>(frames, sums.size());
+    const unsigned n = (unsigned)std::min<size_t>(frames, count);
     const unsigned w = (unsigned)context->w, h = (unsigned)context->h;
     const unsigned min_idx = o.fiveFrameWindow ? 2 : 1, stride = o.fiveFrameWindow ? 2 : 1;
-    std::vector<double> sad(sums.size());
-    for (size_t i = 0; i < sums.size(); ++i) {
+    std::vector<double> sad(count);
+    for (size_t i = 0; i < count; ++i) {
         double score = 0.;
         if (i >= min_idx) {
-            const double scaled = (double)sums[i].slots[kSlotSad] / 256. / (w * h) * 1.0;  // motion_fps_weight
+            const double scaled = (double)records[i].sad / 256. / (w * h) * 1.0;  // motion_fps_weight
             score = scaled < o.motionMax ? scaled : o.motionMax;
         }
         sad[i] = score;
     }
     // motion_blend() with the default blend factor 1: the score itself.
     double stamp_value = 0.;
-    if (sums.size() > min_idx)
+    if (count > min_idx)
         stamp_value = sad[min_idx] < o.motionMax ? sad[min_idx] : o.motionMax;
     double prev_processed = 0.;
-    for (size_t i = 0; i < sums.size(); ++i) {
+    for (size_t i = 0; i < count; ++i) {
         double motion2;
         if (i < min_idx) {
             motion2 = 0.;
         } else {
             const int lo_idx = (int)i - (int)(stride - 1);
             const size_t hi_idx = i + 1;
-            if (hi_idx >= sums.size()) {
+            if (hi_idx >= count) {
                 motion2 = sad[i];
             } else if (lo_idx >= (int)min_idx) {
                 motion2 = sad[(size_t)lo_idx] < sad[hi_idx] ? sad[(size_t)lo_idx] : sad[hi_idx];
@@ -4327,12 +4408,12 @@ VV_EXPORT int vv_features_v1(vv_context *context, double *out, unsigned frames)
         if (i < n) {
             double *row = out + i * 6;
             row[0] = row[1] = row[2] = 0.0;
-            if (sums[i].scored)
-                v1_adm(*context, sums[i].slots, row);
+            if (records[i].scored)
+                memcpy(row, records[i].v1Adm, sizeof records[i].v1Adm);
             row[3] = motion3;
             row[4] = motion2;
             row[5] = sad[i];
         }
     }
-    return (int)sums.size();
+    return (int)count;
 }
