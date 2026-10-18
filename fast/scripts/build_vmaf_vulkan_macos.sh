@@ -10,12 +10,19 @@
 # else as the system finds it. Whoever loads it points the loader at
 # MoltenVK (VK_DRIVER_FILES, or MoltenVK installed).
 #
-# clang without contraction (-ffp-contract=off), as MSVC compiles the DLL:
-# the host's float and double arithmetic rounds as Windows'. The SpEED
-# covariance kernels are libvmaf's x86/speed_avx2.c and v1_speed_cov.c's
-# AVX2 sums, their intrinsics in plain C (fast/vulkan/portable/immintrin.h),
-# lane by lane the same operations: a Mac's VMAF v1 is that of an x86 CPU
-# with AVX2.
+# The engine turns the GPU's sums into features with libvmaf's expressions,
+# so it is compiled as libvmaf is on this machine: with clang's own
+# floating-point settings, which fuse a multiply and an add on Apple's chips
+# (as libvmaf's macOS builds, Homebrew's and VideoMetricsLab's, are made).
+# Built without that contraction, VMAF v1's ADM3 differed from libvmaf's in
+# the last bit on some 10-bit frames. SpEED chroma's host code is libvmaf's
+# x86 code instead -- its covariance kernels x86/speed_avx2.c and
+# v1_speed_cov.c's AVX2 sums, their intrinsics in plain C
+# (fast/vulkan/portable/immintrin.h, lane by lane the same operations) -- and
+# is compiled without contraction (-ffp-contract=off), as MSVC compiles it:
+# it gives an x86 CPU's SpEED with AVX2, not libvmaf's on arm64 (its NEON
+# code), which a caller holding the GPU to libvmaf on this machine leaves to
+# libvmaf.
 #
 #     fast/scripts/build_vmaf_vulkan_macos.sh [OUTPUT_FOLDER]   (default fast/dist/vmaf_vulkan)
 #
@@ -55,13 +62,13 @@ if [[ -n "$(git -C "$repository" status --porcelain --untracked-files=no)" ]]; t
     commit+="-dirty"
 fi
 
-flags=(-O2 -arch arm64 -mmacosx-version-min="$deployment_target" -ffp-contract=off -fPIC
-       -I "$repository/fast/vulkan/portable")
+flags=(-O2 -arch arm64 -mmacosx-version-min="$deployment_target" -fPIC -I "$repository/fast/vulkan/portable")
 cd "$repository"
 mkdir -p "$output"
-for file in libvmaf/src/feature/x86/speed_avx2.c fast/vulkan/v1_speed_cov.c fast/vulkan/v1_host.c fast/vulkan/v1_speed.c; do
-    clang "${flags[@]}" -std=c11 -w -c "$file" -o "$work/build/$(basename "$file" .c).o"
+for file in libvmaf/src/feature/x86/speed_avx2.c fast/vulkan/v1_speed_cov.c fast/vulkan/v1_speed.c; do
+    clang "${flags[@]}" -ffp-contract=off -std=c11 -w -c "$file" -o "$work/build/$(basename "$file" .c).o"
 done
+clang "${flags[@]}" -std=c11 -w -c fast/vulkan/v1_host.c -o "$work/build/v1_host.o"
 clang++ "${flags[@]}" -std=c++17 -w -fvisibility=hidden -DVV_COMMIT="\"$commit\"" -I "$work/build" \
     -I "$work/Vulkan-Headers/include" fast/vulkan/vmaf_vulkan.cpp "$work/build"/*.o -shared \
     -install_name @rpath/vmaf_vulkan.dylib -Wl,-rpath,@loader_path/../vulkan -o "$output/vmaf_vulkan.dylib"

@@ -56,7 +56,12 @@ The shaders are build_vmaf_vulkan.ps1's, compiled by
 difference: Metal has no 64-bit subgroup arithmetic, so those sums
 (`wave_sum_u64` in `shaders/common.slang`) are three 32-bit sums of 24-, 24-
 and 16-bit pieces (`WAVE_INT64=0`), which add up to the same bits. Windows'
-SPIR-V is unchanged by this (`WAVE_INT64=1`, the default). The frame-sharing
+SPIR-V is unchanged by this (`WAVE_INT64=1`, the default). The engine is
+compiled as libvmaf is on the Mac, with clang's own floating-point settings
+(which fuse multiplies and adds on Apple's chips): its conversion of the sums
+into features is libvmaf's expressions, and built without that, VMAF v1's
+ADM3 differed from libvmaf's in the last bit on some 10-bit frames. The
+frame-sharing
 code (Win32 handles) is compiled but never runs: no driver there has its
 extensions.
 
