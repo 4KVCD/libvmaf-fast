@@ -4,7 +4,8 @@ What this fork adds and how it works is on the [landing page](../README.md).
 Everything the fork adds lives under `fast/`:
 
 - `fast/vulkan`: the Vulkan engine (Slang compute shaders and
-  `vmaf_vulkan.cpp`), built into `vmaf_vulkan.dll`.
+  `vmaf_vulkan.cpp`), built into `vmaf_vulkan.dll` (and on macOS
+  `vmaf_vulkan.dylib`).
 - `fast/scripts`: the build and packaging scripts.
 - `fast/python/vmaf_fast`: Python bindings, the reference for using the DLLs.
 - `fast/tests`: the bit-exact comparisons, the driver diagnosis and the
@@ -33,6 +34,41 @@ and on any PC (checked on two). Other tool versions give equivalent code,
 not identical bytes. libvmaf reports the commit it was built from as its
 version, and the build stops without AVX-512 (nasm older than 2.14): the
 Vulkan engine's SpEED uses libvmaf's AVX-512 code where the CPU has it.
+
+### macOS
+
+The Vulkan engine also builds on macOS (Apple silicon), as
+`vmaf_vulkan.dylib`, with the Command Line Tools' clang, git, curl and
+python3; Slang (the same release as on Windows) and the Vulkan headers are
+downloaded:
+
+```sh
+fast/scripts/build_vmaf_vulkan_macos.sh [OUTPUT_FOLDER]   # default fast/dist/vmaf_vulkan
+```
+
+macOS has no Vulkan of its own: the engine runs on MoltenVK (Khronos' Vulkan
+on Metal) through Khronos' loader, which it loads as `@rpath/libvulkan.1.dylib`
+(its rpath is `@loader_path/../vulkan`), else as the system finds it, and
+the caller points the loader at MoltenVK (`VK_DRIVER_FILES`, or MoltenVK
+installed). The instance asks for portability drivers, as MoltenVK is one.
+The shaders are build_vmaf_vulkan.ps1's, compiled by
+`build_vmaf_vulkan_shaders.py` from that script's list, with one
+difference: Metal has no 64-bit subgroup arithmetic, so those sums
+(`wave_sum_u64` in `shaders/common.slang`) are three 32-bit sums of 24-, 24-
+and 16-bit pieces (`WAVE_INT64=0`), which add up to the same bits. Windows'
+SPIR-V is unchanged by this (`WAVE_INT64=1`, the default). The frame-sharing
+code (Win32 handles) is compiled but never runs: no driver there has its
+extensions.
+
+On an M1 Pro (macOS 27, MoltenVK 1.4.2) the engine passes the self-test's
+exact sums (`vmaf_vulkan.probe`) for VMAF v0.6.1 and NEG at 8 and 10 bits,
+and VMAF v1's ADM3, motion3 and CAMBI are libvmaf's CPU values bit for bit.
+SpEED chroma's covariance code is libvmaf's x86 AVX2 code, its intrinsics in
+plain C (`fast/vulkan/portable/immintrin.h`, lane by lane the same
+operations, built without contraction), so it gives an x86 CPU's values: not
+libvmaf's own on arm64, whose SpEED is its NEON code (another filter and
+fused multiply-adds). A caller that holds the GPU to libvmaf on the same
+machine leaves SpEED to libvmaf there.
 
 ## Testing
 

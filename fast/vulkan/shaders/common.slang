@@ -30,6 +30,26 @@ void acc_add64(RWStructuredBuffer<uint> acc, uint slot, uint64_t value)
         InterlockedAdd(acc[2 * slot + 1], high);
 }
 
+// A subgroup's sum of 64-bit integers. Metal has no 64-bit subgroup
+// arithmetic (Vulkan needs shaderSubgroupExtendedTypes for it), so for
+// MoltenVK (WAVE_INT64=0, build_vmaf_vulkan_macos.sh) it is three 32-bit
+// sums of 24-, 24- and 16-bit pieces -- below 2^31 for up to 128 lanes --
+// put together modulo 2^64: the same bits as the 64-bit sum.
+#ifndef WAVE_INT64
+#define WAVE_INT64 1
+#endif
+uint64_t wave_sum_u64(uint64_t v)
+{
+#if WAVE_INT64
+    return WaveActiveSum(v);
+#else
+    const uint low = WaveActiveSum(uint(v) & 0xFFFFFFu);
+    const uint middle = WaveActiveSum(uint(v >> 24) & 0xFFFFFFu);
+    const uint high = WaveActiveSum(uint(v >> 48));
+    return uint64_t(low) + (uint64_t(middle) << 24) + (uint64_t(high) << 48);
+#endif
+}
+
 // A picture's luma sample: rows of bytes (or 16-bit little-endian samples)
 // packed into 32-bit words, each row starting on a word.
 uint pixel(StructuredBuffer<uint> picture, int x, int y, int strideWords)

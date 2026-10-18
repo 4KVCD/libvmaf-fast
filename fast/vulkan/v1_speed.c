@@ -21,7 +21,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_MSC_VER)
 #include <intrin.h>
+#endif
 #include <immintrin.h>
 
 #include "v1_speed.h"
@@ -1223,6 +1225,11 @@ bool vif_validate_kernelscale(float kernelscale) {
 
 enum { V1_CPU_AVX2 = 1, V1_CPU_AVX512 = 2 };
 
+#if !defined(_M_X64) && !defined(__x86_64__)
+// No x86: the AVX2 kernels in plain C (portable/immintrin.h), lane by lane
+// the same operations, so the scores of an x86 CPU with AVX2.
+static unsigned v1_cpu_flags(void) { return V1_CPU_AVX2; }
+#else
 static unsigned v1_cpu_flags(void)
 {
     int r[4];
@@ -1251,6 +1258,7 @@ static unsigned v1_cpu_flags(void)
     }
     return flags;
 }
+#endif
 
 #undef X
 
@@ -1371,10 +1379,12 @@ V1Speed *v1_speed_new(const V1SpeedOptions *options, unsigned w, unsigned h)
         s->compute_cov_kernel = compute_cov_kernel_avx2;
         s->cov4 = v1_cov4_avx2;
     }
+#if defined(_M_X64) || defined(__x86_64__)
     if (flags & V1_CPU_AVX512) {
         s->compute_cov_kernel = compute_cov_kernel_avx512;
         s->cov4 = v1_cov4_avx512;
     }
+#endif
     s->converted = malloc(dim->truncated_height * dim->operating_width * sizeof(double));
     if (!s->buffers.independent_term || !s->buffers.linear_system_sol || !s->buffers.cov_mat ||
         !s->buffers.eigenvalues || !s->buffers.tmp_buffer || !s->ref_results.entropies ||

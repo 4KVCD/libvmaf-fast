@@ -328,7 +328,11 @@ int64_t wave_sum64(int64_t v)
     const int64_t limit = int64_t(0x80000000u / WaveGetLaneCount());
     if (WaveActiveAllTrue(v >= 0 && v < limit))
         return int64_t(WaveActiveSum(uint(v)));
+#if WAVE_INT64
     return WaveActiveSum(v);
+#else
+    return int64_t(wave_sum_u64(uint64_t(v)));
+#endif
 }
 
 #if SLIDE

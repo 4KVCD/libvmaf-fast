@@ -30,13 +30,19 @@
 //
 // Built by fast/scripts/build_vmaf_vulkan.ps1 with MSVC and the static C runtime,
 // as the bundled libvmaf is: powf(), pow() and log2() below then are the
-// same functions as in libvmaf's own conversion of the sums.
+// same functions as in libvmaf's own conversion of the sums. On macOS, by
+// fast/scripts/build_vmaf_vulkan_macos.sh with clang, on MoltenVK (Vulkan on
+// Metal), libvmaf's functions those of the system's libm as this one's.
 #define _USE_MATH_DEFINES
 #define VK_NO_PROTOTYPES
+#ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #include <math.h>
 #include <stdint.h>
@@ -57,13 +63,27 @@
 #include <vector>
 
 #include <vulkan/vulkan.h>
+#ifndef _WIN32
+// The Win32 types of vulkan_win32.h, so that the code sharing frames with a
+// Windows decoder compiles everywhere; no other driver has its extensions,
+// so it is never run.
+typedef void *HANDLE, *HINSTANCE, *HWND, *HMONITOR;
+typedef uint32_t DWORD;
+typedef const wchar_t *LPCWSTR;
+typedef struct _SECURITY_ATTRIBUTES SECURITY_ATTRIBUTES;
+#include <vulkan/vulkan_win32.h>
+#endif
 
 #include "shaders_spv.h"
 #include "v1_host.h"
 #include "v1_speed.h"
 #include "cambi_lut.h"
 
+#ifdef _WIN32
 #define VV_EXPORT extern "C" __declspec(dllexport)
+#else
+#define VV_EXPORT extern "C" __attribute__((visibility("default")))
+#endif
 
 // ------------------------------------------------------------------ Vulkan
 
@@ -91,7 +111,11 @@
 namespace {
 
 struct InstanceApi {
+#ifdef _WIN32
     HMODULE library = nullptr;
+#else
+    void *library = nullptr;
+#endif
     VkInstance instance = VK_NULL_HANDLE;
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
 #define X(name) PFN_##name name = nullptr;
@@ -123,6 +147,7 @@ InstanceApi *instance_api()
     static std::string why;
     static std::once_flag once;
     std::call_once(once, [] {
+#ifdef _WIN32
         api.library = LoadLibraryW(L"vulkan-1.dll");
         if (!api.library) {
             why = "vulkan-1.dll was not found (no Vulkan driver)";
@@ -130,6 +155,21 @@ InstanceApi *instance_api()
         }
         api.vkGetInstanceProcAddr =
             (PFN_vkGetInstanceProcAddr)GetProcAddress(api.library, "vkGetInstanceProcAddr");
+#else
+        // The loader next to this library (its rpath), else the system's.
+#ifdef __APPLE__
+        for (const char *name : { "@rpath/libvulkan.1.dylib", "libvulkan.1.dylib" })
+#else
+        for (const char *name : { "libvulkan.so.1" })
+#endif
+            if (!api.library)
+                api.library = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        if (!api.library) {
+            why = "the Vulkan loader was not found (no Vulkan driver)";
+            return;
+        }
+        api.vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(api.library, "vkGetInstanceProcAddr");
+#endif
         auto create = api.vkGetInstanceProcAddr
             ? (PFN_vkCreateInstance)api.vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance") : nullptr;
         if (!create) {
@@ -141,6 +181,13 @@ InstanceApi *instance_api()
         application.apiVersion = VK_API_VERSION_1_1;
         VkInstanceCreateInfo info = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
         info.pApplicationInfo = &application;
+#ifdef __APPLE__
+        // MoltenVK is a portability driver, listed only when asked for.
+        const char *portability = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+        info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        info.enabledExtensionCount = 1;
+        info.ppEnabledExtensionNames = &portability;
+#endif
         VkInstance instance;
         VkResult result = create(&info, nullptr, &instance);
         if (result != VK_SUCCESS) {
@@ -2224,6 +2271,10 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         return false;
     };
     std::vector<const char *> extensions;
+    // A portability driver's (MoltenVK's) subset of Vulkan, enabled where
+    // offered, as the specification asks.
+    if (has("VK_KHR_portability_subset"))
+        extensions.push_back("VK_KHR_portability_subset");
     // Win32 external memory, where the driver has it: for frames from a
     // decoder (shared, or Direct3D textures imported).
     const bool externalMemory = has(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
@@ -3005,6 +3056,10 @@ int vv_context::enable_speed(const double *values)
 
 double vv_context::now_ns() const
 {
+#ifndef _WIN32
+    return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+#else
     static const double period = [] {
         LARGE_INTEGER frequency;
         QueryPerformanceFrequency(&frequency);
@@ -3013,6 +3068,7 @@ double vv_context::now_ns() const
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
     return (double)counter.QuadPart * period;
+#endif
 }
 
 int vv_context::enable_profile()

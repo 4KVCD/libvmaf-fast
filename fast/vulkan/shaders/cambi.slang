@@ -654,7 +654,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
         InterlockedAdd(gHist[bin], 1u);
     }
     if (level == 0) {
-        const uint64_t total = WaveActiveSum(sum);
+        const uint64_t total = wave_sum_u64(sum);
         if (WaveIsFirstLane() && total != 0) acc_add64(state, STATE_SUM + scale, total);
         if (WaveActiveAnyTrue(inexact) && WaveIsFirstLane()) InterlockedOr(state[STATE_INEXACT + scale], 1u);
     }
