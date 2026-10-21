@@ -1135,8 +1135,7 @@ VkPipeline vv_context::find_pipeline(int shader, const std::vector<uint32_t> &wo
 }
 
 // Compiles `shader` for these push constants (its specialization constants,
-// constant k: word k, where it has any). Touches nothing of the context's:
-// called from several threads at once.
+// constant k: word k, where it has any).
 VkResult vv_context::compile_pipeline(int shader, const std::vector<uint32_t> &words, VkPipeline *out) const
 {
     const Pipeline &pipeline = pipelines[shader];
@@ -1164,9 +1163,14 @@ VkResult vv_context::compile_pipeline(int shader, const std::vector<uint32_t> &w
     return vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, out);
 }
 
-// Every pass's pipeline: those not made yet compiled at once, a thread each
-// (the driver compiles on the calling thread, and a specialized shader anew
-// for each size of picture it meets), then given to the passes.
+// Every pass's pipeline: those not made yet compiled (a specialized shader
+// anew for each size of picture the driver meets), then given to the passes.
+// One at a time in the process: NVIDIA's driver crashed inside
+// vkCreateComputePipelines (an access violation in nvoglv64.dll) while these
+// were compiled a thread each, although the calls may run at once. One at a
+// time costs nothing where the driver's shader cache has the pipelines, and
+// up to a second for a size it has not met (a 10-bit VMAF context near 4K on
+// an RTX 5090: 0.65 s instead of 0.18 s).
 int vv_context::compile_pipelines()
 {
     struct Job { int shader; std::vector<uint32_t> words; VkPipeline made = VK_NULL_HANDLE; VkResult result = VK_SUCCESS; };
@@ -1193,23 +1197,12 @@ int vv_context::compile_pipelines()
         if (!queued)
             jobs.push_back({ pass->shader, words });
     }
-    // A thread each; where no more can be started (std::system_error, or
-    // bad_alloc), the rest are compiled on this one, and every thread
-    // started is joined: an exception must not leave this C API.
-    std::vector<std::thread> threads;
-    size_t started = 0;
-    try {
-        threads.reserve(jobs.size());
-        for (; started < jobs.size(); started++) {
-            Job &job = jobs[started];
-            threads.emplace_back([this, &job] { job.result = compile_pipeline(job.shader, job.words, &job.made); });
-        }
-    } catch (const std::exception &) {
+    {
+        static std::mutex compiling;  // every context's, in this process
+        const std::lock_guard<std::mutex> lock(compiling);
+        for (Job &job : jobs)
+            job.result = compile_pipeline(job.shader, job.words, &job.made);
     }
-    for (size_t i = started; i < jobs.size(); i++)
-        jobs[i].result = compile_pipeline(jobs[i].shader, jobs[i].words, &jobs[i].made);
-    for (std::thread &thread : threads)
-        thread.join();
     int error = 0;
     for (Job &job : jobs) {
         Pipeline &pipeline = pipelines[job.shader];
