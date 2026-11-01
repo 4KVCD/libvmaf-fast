@@ -518,6 +518,11 @@ struct Slot {
     // (vv_chroma_staging): then speedPassesHost.
     bool chromaFromHost = false;
     std::vector<Pass> speedPassesHost;
+    // With frames from a decoder (shared): a luma plane the CPU wrote instead
+    // (vv_shared_host_plane: [0] the reference's, [1] the distorted's), made at
+    // its first use, and whether this frame's came that way.
+    Buffer hostPlane[2];
+    bool planeFromHost[2] = { false, false };
     Buffer speedKeep;                 // and the filtered planes est_params reads (host-visible)
     std::vector<Pass> speedPasses;
     // vv_pictures: the frame's pictures (indices of vv_context::pictureCache:
@@ -3360,7 +3365,17 @@ int vv_context::commit(bool score)
             copy.srcOffset = disOffset;
             vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picDis.buffer, 1, &copy);
         }
+    } else if (shared) {
+        // A plane the CPU wrote (vv_shared_host_plane) goes where the decoder
+        // writes the other: the reference's at 0, the distorted's at disOffset.
+        for (int i = 0; i < 2; ++i) {
+            if (slot.planeFromHost[i] && (i == 0 || score)) {
+                const VkBufferCopy copy = { 0, i ? (VkDeviceSize)disOffset : 0, planeBytes };
+                vk.vkCmdCopyBuffer(cb, slot.hostPlane[i].buffer, slot.staging.buffer, 1, &copy);
+            }
+        }
     }
+    slot.planeFromHost[0] = slot.planeFromHost[1] = false;  // the next frame's: from the decoder unless it says
     vk.vkCmdFillBuffer(cb, acc.buffer, 0, VK_WHOLE_SIZE, 0);
     if (admFused && score) {
         for (const Buffer &rows : admRows)
@@ -4150,6 +4165,33 @@ VV_EXPORT int vv_chroma_staging(vv_context *context, uint8_t **planes, uint32_t 
     *stride = context->chromaStrideBytes;
     if (context->shared)
         context->pending->chromaFromHost = true;  // SpEED reads this frame's from here
+    return 0;
+}
+
+// For a frame begun with vv_shared_next (a context made with flag bit 19):
+// host memory for one of its luma planes -- `which` 0 the reference's, 1 the
+// distorted's -- rows *stride bytes apart, written by the CPU instead of by
+// the API that imported the slot (whose copy into the slot then carries only
+// the other plane). vv_commit copies it into the slot on the GPU before the
+// frame's passes. For a pair of which only one video is decoded on the GPU.
+VV_EXPORT int vv_shared_host_plane(vv_context *context, int which, uint8_t **plane, uint32_t *stride)
+{
+    if (!context->shared)
+        return fail(-3, "this context takes its frames from host memory (vv_staging)");
+    if (which != 0 && which != 1)
+        return fail(-3, "no such plane");
+    if (!context->pending)
+        return fail(-3, "no frame was started");
+    if (context->pictures)
+        return fail(-3, "this context reads the pictures where a decoder left them (vv_pictures)");
+    Slot &slot = *context->pending;
+    if (!slot.hostPlane[which].mapped) {  // made at its first use: most pairs never need it
+        if (int error = context->create_buffer(slot.hostPlane[which], context->planeBytes, true, false, true))
+            return error;
+    }
+    slot.planeFromHost[which] = true;
+    *plane = (uint8_t *)slot.hostPlane[which].mapped;
+    *stride = context->strideBytes;
     return 0;
 }
 
