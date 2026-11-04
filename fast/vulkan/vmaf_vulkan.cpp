@@ -565,6 +565,11 @@ struct Slot {
     // (vv_chroma_staging): then speedPassesHost.
     bool chromaFromHost = false;
     std::vector<Pass> speedPassesHost;
+    // With frames from a decoder (shared): a luma plane the CPU wrote instead
+    // (vv_shared_host_plane: [0] the reference's, [1] the distorted's), made at
+    // its first use, and whether this frame's came that way.
+    Buffer hostPlane[2];
+    bool planeFromHost[2] = { false, false };
     Buffer speedKeep;                 // and the filtered planes est_params reads (host-visible)
     std::vector<Pass> speedPasses;
     // vv_pictures: the frame's pictures (indices of vv_context::pictureCache:
@@ -1182,8 +1187,7 @@ VkPipeline vv_context::find_pipeline(int shader, const std::vector<uint32_t> &wo
 }
 
 // Compiles `shader` for these push constants (its specialization constants,
-// constant k: word k, where it has any). Touches nothing of the context's:
-// called from several threads at once.
+// constant k: word k, where it has any).
 VkResult vv_context::compile_pipeline(int shader, const std::vector<uint32_t> &words, VkPipeline *out) const
 {
     const Pipeline &pipeline = pipelines[shader];
@@ -1211,9 +1215,14 @@ VkResult vv_context::compile_pipeline(int shader, const std::vector<uint32_t> &w
     return vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, out);
 }
 
-// Every pass's pipeline: those not made yet compiled at once, a thread each
-// (the driver compiles on the calling thread, and a specialized shader anew
-// for each size of picture it meets), then given to the passes.
+// Every pass's pipeline: those not made yet compiled (a specialized shader
+// anew for each size of picture the driver meets), then given to the passes.
+// One at a time in the process: NVIDIA's driver crashed inside
+// vkCreateComputePipelines (an access violation in nvoglv64.dll) while these
+// were compiled a thread each, although the calls may run at once. One at a
+// time costs nothing where the driver's shader cache has the pipelines, and
+// up to a second for a size it has not met (a 10-bit VMAF context near 4K on
+// an RTX 5090: 0.65 s instead of 0.18 s).
 int vv_context::compile_pipelines()
 {
     struct Job { int shader; std::vector<uint32_t> words; VkPipeline made = VK_NULL_HANDLE; VkResult result = VK_SUCCESS; };
@@ -1240,23 +1249,12 @@ int vv_context::compile_pipelines()
         if (!queued)
             jobs.push_back({ pass->shader, words });
     }
-    // A thread each; where no more can be started (std::system_error, or
-    // bad_alloc), the rest are compiled on this one, and every thread
-    // started is joined: an exception must not leave this C API.
-    std::vector<std::thread> threads;
-    size_t started = 0;
-    try {
-        threads.reserve(jobs.size());
-        for (; started < jobs.size(); started++) {
-            Job &job = jobs[started];
-            threads.emplace_back([this, &job] { job.result = compile_pipeline(job.shader, job.words, &job.made); });
-        }
-    } catch (const std::exception &) {
+    {
+        static std::mutex compiling;  // every context's, in this process
+        const std::lock_guard<std::mutex> lock(compiling);
+        for (Job &job : jobs)
+            job.result = compile_pipeline(job.shader, job.words, &job.made);
     }
-    for (size_t i = started; i < jobs.size(); i++)
-        jobs[i].result = compile_pipeline(jobs[i].shader, jobs[i].words, &jobs[i].made);
-    for (std::thread &thread : threads)
-        thread.join();
     int error = 0;
     for (Job &job : jobs) {
         Pipeline &pipeline = pipelines[job.shader];
@@ -3423,7 +3421,17 @@ int vv_context::commit(bool score)
             copy.srcOffset = disOffset;
             vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picDis.buffer, 1, &copy);
         }
+    } else if (shared) {
+        // A plane the CPU wrote (vv_shared_host_plane) goes where the decoder
+        // writes the other: the reference's at 0, the distorted's at disOffset.
+        for (int i = 0; i < 2; ++i) {
+            if (slot.planeFromHost[i] && (i == 0 || score)) {
+                const VkBufferCopy copy = { 0, i ? (VkDeviceSize)disOffset : 0, planeBytes };
+                vk.vkCmdCopyBuffer(cb, slot.hostPlane[i].buffer, slot.staging.buffer, 1, &copy);
+            }
+        }
     }
+    slot.planeFromHost[0] = slot.planeFromHost[1] = false;  // the next frame's: from the decoder unless it says
     vk.vkCmdFillBuffer(cb, acc.buffer, 0, VK_WHOLE_SIZE, 0);
     if (admFused && score) {
         for (const Buffer &rows : admRows)
@@ -4213,6 +4221,33 @@ VV_EXPORT int vv_chroma_staging(vv_context *context, uint8_t **planes, uint32_t 
     *stride = context->chromaStrideBytes;
     if (context->shared)
         context->pending->chromaFromHost = true;  // SpEED reads this frame's from here
+    return 0;
+}
+
+// For a frame begun with vv_shared_next (a context made with flag bit 19):
+// host memory for one of its luma planes -- `which` 0 the reference's, 1 the
+// distorted's -- rows *stride bytes apart, written by the CPU instead of by
+// the API that imported the slot (whose copy into the slot then carries only
+// the other plane). vv_commit copies it into the slot on the GPU before the
+// frame's passes. For a pair of which only one video is decoded on the GPU.
+VV_EXPORT int vv_shared_host_plane(vv_context *context, int which, uint8_t **plane, uint32_t *stride)
+{
+    if (!context->shared)
+        return fail(-3, "this context takes its frames from host memory (vv_staging)");
+    if (which != 0 && which != 1)
+        return fail(-3, "no such plane");
+    if (!context->pending)
+        return fail(-3, "no frame was started");
+    if (context->pictures)
+        return fail(-3, "this context reads the pictures where a decoder left them (vv_pictures)");
+    Slot &slot = *context->pending;
+    if (!slot.hostPlane[which].mapped) {  // made at its first use: most pairs never need it
+        if (int error = context->create_buffer(slot.hostPlane[which], context->planeBytes, true, false, true))
+            return error;
+    }
+    slot.planeFromHost[which] = true;
+    *plane = (uint8_t *)slot.hostPlane[which].mapped;
+    *stride = context->strideBytes;
     return 0;
 }
 
