@@ -175,6 +175,19 @@ try {
               'GNU Lesser General Public License, version 2.1 or later; the rest of libvmaf under BSD+Patent', '') +
             (Get-Content (Join-Path $vmaf 'libvmaf/COPYING.LGPLv2.1')))
     }
+    # Part of the AVX2 code of PSNR and SSIM is copied from VMAFx: its
+    # notice, and iqa's, whose BSD licence VMAFx's SSIM code keeps.
+    if (Test-Path (Join-Path $vmaf 'libvmaf/src/feature/x86/convolve_avx2.c')) {
+        $iqa = Get-Content (Join-Path $vmaf 'libvmaf/src/feature/iqa/convolve.c')
+        $iqaEnd = [Array]::FindIndex($iqa, [Predicate[string]] { param($line) $line.Trim() -eq '*/' })
+        Set-Content -Path (Join-Path $licenses 'LICENSE.simd.txt') -Encoding utf8 -Value (
+            @('Part of the AVX2 code of PSNR and SSIM (libvmaf/src/feature/x86) is copied from VMAFx.', '',
+              'From VMAFx (https://github.com/VMAFx/vmafx): psnr_avx2.c, convolve_avx2.c and ssim_avx2.c.',
+              'Copyright 2016-2023 Netflix, Inc.; Copyright (c) 2011, Tom Distler; Copyright 2026 Lusoris.',
+              'Under BSD-2-Clause-Patent (LICENSE.libvmaf.txt); convolve_avx2.c and ssim_avx2.c also under',
+              'iqa''s BSD licence:', '') +
+            ($iqa[1..($iqaEnd - 1)] | ForEach-Object { $_ -replace '^ \* ?', '' }))
+    }
     # nv-codec-headers' CUDA loader is compiled in; its MIT notice is the
     # comment its headers open with.
     if (-not $NoCuda) {

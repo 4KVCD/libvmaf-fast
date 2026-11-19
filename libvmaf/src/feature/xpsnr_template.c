@@ -25,11 +25,23 @@
  */
 
 /* FFmpeg's sse_line_16bit, a row at a time: its sum of a row is 32 bits. */
-static uint64_t FN(sse_block)(const T *org, ptrdiff_t so, const T *rec, ptrdiff_t sr,
-                              uint32_t block_width, uint32_t block_height)
+static uint64_t FN(sse_block)(const XpsnrState *s, const T *org, ptrdiff_t so, const T *rec,
+                              ptrdiff_t sr, uint32_t block_width, uint32_t block_height)
 {
     uint64_t sse = 0;
 
+#if ARCH_X86
+    if (s->avx2) {
+        for (uint32_t y = 0; y < block_height; y++) {
+            sse += FN(sse_line_avx2)(org, rec, block_width);
+            org += so;
+            rec += sr;
+        }
+        return sse;
+    }
+#else
+    (void) s;
+#endif
     for (uint32_t y = 0; y < block_height; y++) {
         unsigned m2 = 0;
         for (uint32_t x = 0; x < block_width; x++) {
@@ -109,16 +121,14 @@ static uint64_t FN(block)(const XpsnrState *s, const XpsnrPlanes *p, const uint3
     const T *o_m2 = (const T *) p->m2  + offset_y * o2 + offset_x;
     const T *r_m0 = (const T *) p->rec + offset_y * p->sr + offset_x;
     const int b_val = s->b_val;
-    const int x_act = (offset_x > 0 ? 0 : b_val);
-    const int y_act = (offset_y > 0 ? 0 : b_val);
-    const int w_act = (offset_x + block_width  < s->w ? (int) block_width  : (int) block_width  - b_val);
-    const int h_act = (offset_y + block_height < s->h ? (int) block_height : (int) block_height - b_val);
+    const XpsnrActivity a = block_activity(s, offset_x, offset_y, block_width, block_height);
+    const int x_act = a.x_act, y_act = a.y_act, w_act = a.w_act, h_act = a.h_act;
 
-    const uint64_t sse = FN(sse_block)(o_m0, o, r_m0, p->sr, block_width, block_height);
+    const uint64_t sse = FN(sse_block)(s, o_m0, o, r_m0, p->sr, block_width, block_height);
     uint64_t sa_act = 0;  /* spatial abs. activity */
     uint64_t ta_act = 0; /* temporal abs. activity */
 
-    if (w_act <= x_act || h_act <= y_act) /* small */
+    if (too_small(&a))
         return sse;
 
     if (b_val > 1) { /* highpass with downsampling */
@@ -135,9 +145,6 @@ static uint64_t FN(block)(const XpsnrState *s, const XpsnrPlanes *p, const uint3
             }
         }
     }
-
-    /* calculate weight (average squared activity) */
-    *ms_act = (double) sa_act / ((double) (w_act - x_act) * (double) (h_act - y_act));
 
     if (b_val > 1) { /* highpass with downsampling */
         if (s->frame_rate < 32) /* 1st-order diff */
@@ -164,14 +171,7 @@ static uint64_t FN(block)(const XpsnrState *s, const XpsnrPlanes *p, const uint3
         }
     }
 
-    /* weight += mean squared temporal activity */
-    *ms_act += (double) ta_act / ((double) block_width * (double) block_height);
-
-    /* lower limit, accounts for high-pass gain */
-    if (*ms_act < (double) (1 << (s->bpc - 6)))
-        *ms_act = (double) (1 << (s->bpc - 6));
-
-    *ms_act *= *ms_act; /* since SSE is squared */
+    *ms_act = block_ms_act(s, &a, sa_act, ta_act, block_width, block_height);
 
     /* return nonweighted sum of squared errors */
     return sse;

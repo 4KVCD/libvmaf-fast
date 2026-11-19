@@ -304,12 +304,20 @@ if is_asm_enabled
           feature_src_dir + 'x86/adm_avx2.c',
           feature_src_dir + 'x86/cambi_avx2.c',
           feature_src_dir + 'x86/speed_avx2.c',
+          feature_src_dir + 'x86/convolve_avx2.c',
+          feature_src_dir + 'x86/ssim_avx2.c',
+          feature_src_dir + 'x86/ssim_decimate_avx2.c',
+          feature_src_dir + 'x86/xpsnr_any_avx2.c',
+          feature_src_dir + 'x86/psnr_avx2.c',
       ]
 
       if cc.get_id() == 'msvc'
           avx2_cflags = ['/arch:AVX2']
       else
-          avx2_cflags = ['-mavx2', '-mavx', '-mfma']
+          # -ffp-contract=off: with -mfma, GCC and clang may fuse a multiply
+          # and an add (intrinsics too) into one FMA, which rounds once and
+          # would change the SSIM code's exact results
+          avx2_cflags = ['-mavx2', '-mavx', '-mfma', '-ffp-contract=off']
       endif
       x86_avx2_static_lib = static_library(
           'x86_avx2',

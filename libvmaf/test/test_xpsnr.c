@@ -448,6 +448,7 @@ static char *test_every_frame_is_ffmpegs()
         /* downsampled: a last block of 40 columns, one of 10 (too narrow
          * for the spatial activity), 4K */
         { 2560, 1440, 10, 24, 4, 1, 1, 5, 15, VMAF_PIX_FMT_YUV400P },
+        { 2560, 1440, 12, 60, 2, 1, 0, 4, 60, VMAF_PIX_FMT_YUV400P },
         { 3850, 2160, 8, 60, 4, 1, 1, 4, 8, VMAF_PIX_FMT_YUV400P },
         { 3840, 2160, 10, 23, 4, 2, 1, 5, 20, VMAF_PIX_FMT_YUV400P },
         { 3840, 2160, 10, 60, 0, 1, 0, 4, 20, VMAF_PIX_FMT_YUV400P },

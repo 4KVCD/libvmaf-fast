@@ -74,6 +74,12 @@ struct _kernel {
  */
 void _iqa_convolve(float *img, int w, int h, const struct _kernel *k, float *result, int *rw, int *rh);
 
+/* libvmaf-fast: _iqa_convolve with its w * h cache in cache (kept by the
+ * caller; any contents, every cell read is written first), or allocated if
+ * it is NULL. */
+void _iqa_convolve_ws(float *img, int w, int h, const struct _kernel *k, float *result,
+                      int *rw, int *rh, float *cache);
+
 /**
  * The same as _iqa_convolve() except the kernel is applied to the entire image.
  * In other words, the kernel is applied to all areas where the top-left corner
