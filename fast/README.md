@@ -85,7 +85,8 @@ and `vv_commit` to write frames in place), `vv_flush`, `vv_features` /
 without them leaving the GPU: `vv_shared_next` / `vv_export` /
 `vv_shared_device` (and `vv_shared_chroma` for VMAF v1) to share the input
 buffers with its CUDA or Vulkan device, `vv_import_timeline` /
-`vv_commit_after` to wait for its copies on the GPU, and `vv_pictures` to read
+`vv_commit_after` to have each frame submitted once its copies are done (by a
+thread of the context, so that neither side waits for them), and `vv_pictures` to read
 VMAF v1's pictures where it left them (Direct3D 11 textures).
 
 ## Releasing

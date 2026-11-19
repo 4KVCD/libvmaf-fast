@@ -534,6 +534,9 @@ struct Slot {
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool busy = false;
+    // Committed, but not yet submitted by the submit thread (vv_context::
+    // submitter): its fence cannot signal before. Under submitMutex.
+    bool queued = false;
     bool scored = false;
     unsigned index = 0;
 };
@@ -759,14 +762,41 @@ struct vv_context {
     bool split = false;
     PFN_vkGetMemoryWin32HandleKHR getMemoryHandle = nullptr;
     // A decoder's timeline semaphore (vv_import_timeline): its GPU copies into
-    // the slots signal it, and a frame's submission waits for the value of its
-    // own (vv_commit_after), so that the decoder need not wait for its copies.
+    // the slots signal it, and a frame is submitted once the value of its own
+    // (vv_commit_after) is reached, so that neither the decoder nor the
+    // caller waits for the copies.
     bool timelines = false;  // the device takes timeline semaphores from other APIs
     VkSemaphore copied = VK_NULL_HANDLE;
     uint64_t copiedValue = 0;  // the next commit's, 0: none
     PFN_vkImportSemaphoreWin32HandleKHR importSemaphore = nullptr;
     PFN_vkCreateSemaphore createSemaphore = nullptr;
     PFN_vkDestroySemaphore destroySemaphore = nullptr;
+    PFN_vkWaitSemaphores waitSemaphores = nullptr;
+    // The submit thread, started by vv_import_timeline: it takes every
+    // committed frame in order, waits on the CPU (asleep) until the decoder's
+    // copies of it are done, then submits it. Not a submission that waits on
+    // the GPU: NVIDIA's driver (616.92, RTX 5090) services a GPU wait on a
+    // semaphore of another device with a thread of its own that polls the
+    // clock, one per waiting device (1080p VMAF, NEG and v1 of a minute: the
+    // run's CPU time 18.5 s with the GPU waiting, 13.3 s waited here, same
+    // wall time).
+    struct Submission {
+        size_t slot;
+        uint64_t after;  // the timeline value to wait for, 0: none
+    };
+    std::thread submitter;
+    std::mutex submitMutex;  // the members below and the slots' `queued`
+    std::condition_variable submitWork, submitDone;
+    std::deque<Submission> submissions;
+    bool submitStop = false;
+    std::string submitError;  // the thread's failure, reported on the caller's thread
+    // The queue is used from two threads once the submit thread runs:
+    // vkQueueSubmit and vkDeviceWaitIdle hold this.
+    std::mutex queueMutex;
+    void submit_thread();
+    VkResult submit_frame(Slot &slot, uint64_t after);
+    bool queued(const Slot &slot);
+    VkResult run_now(VkCommandBuffer commands);
     uint8_t deviceUuid[VK_UUID_SIZE] = {}, driverUuid[VK_UUID_SIZE] = {};
     // Or a decoder on this GPU writes them into Direct3D 11 textures, which
     // the context imports (vv_import_texture) and copies from on the GPU
@@ -982,6 +1012,17 @@ vv_context::~vv_context()
         copyStart.notify_all();
         for (std::thread &thread : copiers)
             thread.join();
+    }
+    if (submitter.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(submitMutex);
+            submitStop = true;
+        }
+        submitWork.notify_all();
+        submitter.join();  // a wait for the decoder ends within its 100 ms
+        for (const Submission &dropped : submissions)  // (a run stopped early): never submitted
+            slots[dropped.slot].busy = slots[dropped.slot].queued = false;
+        submissions.clear();
     }
     if (!device)
         return;
@@ -1531,12 +1572,7 @@ int vv_context::upload(Buffer &target, const void *data, size_t bytes)
     VkBufferCopy region = { 0, 0, bytes };
     vk.vkCmdCopyBuffer(commands, staging.buffer, target.buffer, 1, &region);
     vk.vkEndCommandBuffer(commands);
-    VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &commands;
-    VkResult result = vk.vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
-    if (result == VK_SUCCESS)
-        result = vk.vkDeviceWaitIdle(device);
+    const VkResult result = run_now(commands);
     destroy_last_buffer(staging);
     return result == VK_SUCCESS ? 0 : fail(-1, "uploading a table to the GPU failed");
 }
@@ -2274,7 +2310,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
                             kShader_adm_fused_0_16_img })
             subgroupSizes[shader] = narrowSubgroup;
     }
-    // A decoder's copies waited for on the GPU (vv_import_timeline,
+    // A decoder's copies waited for by the context (vv_import_timeline,
     // vv_commit_after), where the driver has timeline semaphores it can share;
     // else the decoder waits for its copies itself.
     if (shared && has(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) && has(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME)
@@ -2507,7 +2543,8 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
                                                                                         "vkImportSemaphoreWin32HandleKHR");
         createSemaphore = (PFN_vkCreateSemaphore)api->vkGetDeviceProcAddr(device, "vkCreateSemaphore");
         destroySemaphore = (PFN_vkDestroySemaphore)api->vkGetDeviceProcAddr(device, "vkDestroySemaphore");
-        timelines = importSemaphore && createSemaphore && destroySemaphore;
+        waitSemaphores = (PFN_vkWaitSemaphores)api->vkGetDeviceProcAddr(device, "vkWaitSemaphores");
+        timelines = importSemaphore && createSemaphore && destroySemaphore && waitSemaphores;
     }
     vk.vkGetDeviceQueue(device, queueFamily, 0, &queue);
     if (shared) {
@@ -2677,11 +2714,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
                                 &admRB, &admAB, &admFB, &picPrev[0], &picPrev[1] })
             vk.vkCmdFillBuffer(cb, buffer->buffer, 0, VK_WHOLE_SIZE, 0);
         vk.vkEndCommandBuffer(cb);
-        VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &cb;
-        if (vk.vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS ||
-            vk.vkDeviceWaitIdle(device) != VK_SUCCESS)
+        if (run_now(cb) != VK_SUCCESS)
             return fail(-1, "clearing the GPU buffers failed");
     }
     if (int error = build_passes())
@@ -3058,11 +3091,119 @@ int vv_context::enable_profile()
     return 0;
 }
 
+// A committed frame's work, its fence signalled at the end. After the
+// decoder's copies of it (`after`, 0: none): on the submit thread the value
+// is reached already, but the wait stays in the submission as the copies'
+// memory dependency between the two devices. Reached, it costs little:
+// NVIDIA's polling thread of the device then ran 0.8-1.2 G cycles a 1080p
+// minute, 9-10 G while the value was still to come.
+VkResult vv_context::submit_frame(Slot &slot, uint64_t after)
+{
+    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &slot.commands;
+    VkTimelineSemaphoreSubmitInfo timeline = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+    const VkPipelineStageFlags afterStages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if (copied && after) {
+        timeline.waitSemaphoreValueCount = 1;
+        timeline.pWaitSemaphoreValues = &after;
+        submitInfo.pNext = &timeline;
+        submitInfo.waitSemaphoreCount = 1;
+        submitInfo.pWaitSemaphores = &copied;
+        submitInfo.pWaitDstStageMask = &afterStages;
+    }
+    std::lock_guard<std::mutex> lock(queueMutex);
+    return vk.vkQueueSubmit(queue, 1, &submitInfo, slot.fence);
+}
+
+// The submit thread (vv_import_timeline): the committed frames in order, each
+// once the decoder's copies of it are done. After a failure it submits no
+// more; the caller's next call reports it.
+void vv_context::submit_thread()
+{
+    std::unique_lock<std::mutex> lock(submitMutex);
+    for (;;) {
+        submitWork.wait(lock, [&] { return submitStop || (!submissions.empty() && submitError.empty()); });
+        if (submitStop)
+            return;
+        const Submission next = submissions.front();
+        lock.unlock();
+        std::string error;
+        if (next.after) {
+            // Asleep until the decoder's copies are done, waking every 100 ms
+            // to see a stop (a run that ends before the decoder copied a frame
+            // it was given).
+            VkSemaphoreWaitInfo wait = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+            wait.semaphoreCount = 1;
+            wait.pSemaphores = &copied;
+            wait.pValues = &next.after;
+            VkResult result;
+            while ((result = waitSemaphores(device, &wait, 100ull * 1000 * 1000)) == VK_TIMEOUT) {
+                lock.lock();
+                const bool stop = submitStop;
+                lock.unlock();
+                if (stop)
+                    return;
+            }
+            if (result != VK_SUCCESS)
+                error = "waiting for the decoder's copies failed (" + std::to_string(result) + ")";
+        }
+        if (error.empty()) {
+            const VkResult result = submit_frame(slots[next.slot], next.after);
+            if (result != VK_SUCCESS)
+                error = "vkQueueSubmit failed (" + std::to_string(result) + ")";
+        }
+        lock.lock();
+        if (error.empty()) {
+            submissions.pop_front();
+            slots[next.slot].queued = false;
+        } else {
+            submitError = error;  // the frame stays queued: never submitted
+        }
+        submitDone.notify_all();
+    }
+}
+
+// Whether a committed frame is still waiting for the submit thread.
+bool vv_context::queued(const Slot &slot)
+{
+    if (!submitter.joinable())
+        return false;
+    std::lock_guard<std::mutex> lock(submitMutex);
+    return slot.queued;
+}
+
+// One command buffer run to its end (set-up, tests): submitted, then the
+// device waited for.
+VkResult vv_context::run_now(VkCommandBuffer commands)
+{
+    VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &commands;
+    std::lock_guard<std::mutex> lock(queueMutex);
+    const VkResult result = vk.vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+    return result == VK_SUCCESS ? vk.vkDeviceWaitIdle(device) : result;
+}
+
 int vv_context::collect(Slot &slot)
 {
     if (!slot.busy)
         return 0;
     const double waitStart = profile ? now_ns() : 0.0;
+    if (submitter.joinable()) {  // its fence signals only once the submit thread has submitted it
+        std::unique_lock<std::mutex> lock(submitMutex);
+        const bool submitted = submitDone.wait_for(lock, std::chrono::seconds(60), [&] {
+            return !slot.queued || !submitError.empty();
+        });
+        if (!submitError.empty()) {
+            failed = true;
+            return fail(-5, submitError);
+        }
+        if (!submitted) {
+            failed = true;
+            return fail(-5, "the decoder did not copy a frame in 60 seconds");
+        }
+    }
     VkResult result = vk.vkWaitForFences(device, 1, &slot.fence, VK_TRUE, 60ull * 1000 * 1000 * 1000);
     if (profile) {
         cpuNs[kCpuWait] += now_ns() - waitStart;
@@ -3532,26 +3673,25 @@ int vv_context::commit(bool score)
     vk.vkCmdPipelineBarrier(cb, kCompute | kTransfer, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, nullptr, 0,
                             nullptr);
     vk.vkEndCommandBuffer(cb);
-    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cb;
-    // After the decoder's copies of the frame into its slot (vv_commit_after).
-    VkTimelineSemaphoreSubmitInfo after = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
-    const VkPipelineStageFlags afterStages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    const uint64_t afterValue = copiedValue;
-    if (copied && afterValue) {
-        after.waitSemaphoreValueCount = 1;
-        after.pWaitSemaphoreValues = &afterValue;
-        submitInfo.pNext = &after;
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &copied;
-        submitInfo.pWaitDstStageMask = &afterStages;
-    }
+    const uint64_t after = copiedValue;  // the decoder's copies of the frame into its slot (vv_commit_after)
     copiedValue = 0;
-    VkResult result = vk.vkQueueSubmit(queue, 1, &submitInfo, slot.fence);
-    if (result != VK_SUCCESS) {
-        failed = true;
-        return fail(-5, "vkQueueSubmit failed (" + std::to_string(result) + ")");
+    if (submitter.joinable()) {  // submitted by the submit thread once they are done, in order
+        {
+            std::lock_guard<std::mutex> lock(submitMutex);
+            if (!submitError.empty()) {
+                failed = true;
+                return fail(-5, submitError);
+            }
+            slot.queued = true;
+            submissions.push_back({ slotIndex, after });
+        }
+        submitWork.notify_one();
+    } else {
+        const VkResult result = submit_frame(slot, after);
+        if (result != VK_SUCCESS) {
+            failed = true;
+            return fail(-5, "vkQueueSubmit failed (" + std::to_string(result) + ")");
+        }
     }
     slot.busy = true;
     if (profile) {
@@ -3642,7 +3782,7 @@ unsigned vv_context::completed()
         Slot &slot = slots[(nextSlot + i) % slots.size()];
         if (!slot.busy)
             continue;
-        if (vk.vkGetFenceStatus(device, slot.fence) != VK_SUCCESS || collect(slot))
+        if (queued(slot) || vk.vkGetFenceStatus(device, slot.fence) != VK_SUCCESS || collect(slot))
             break;
     }
     unsigned busy = 0;
@@ -3942,12 +4082,19 @@ VV_EXPORT int vv_import_timeline(vv_context *context, void *handle)
         return fail(-4, "Vulkan cannot take the decoder's timeline semaphore");
     }
     context->copied = semaphore;
+    try {
+        context->submitter = std::thread(&vv_context::submit_thread, context);
+    } catch (const std::system_error &) {
+        context->copied = VK_NULL_HANDLE;
+        context->destroySemaphore(context->device, semaphore, nullptr);
+        return fail(-1, "the submit thread could not start");
+    }
     return 0;
 }
 
 // The next vv_commit's frame is in its slot once the imported timeline
-// semaphore reaches `value` (the decoder's last copy of it): its work on the
-// GPU waits for that, and the caller need not.
+// semaphore reaches `value` (the decoder's last copy of it): the context's
+// submit thread submits its work then, and the caller need not wait.
 VV_EXPORT int vv_commit_after(vv_context *context, uint64_t value)
 {
     if (!context->copied)
@@ -4383,12 +4530,7 @@ VV_EXPORT int vv_read_buffer(vv_context *context, int which, void *out, uint64_t
     VkBufferCopy region = { 0, 0, bytes };
     vk.vkCmdCopyBuffer(cb, source->buffer, staging.buffer, 1, &region);
     vk.vkEndCommandBuffer(cb);
-    VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cb;
-    VkResult result = vk.vkQueueSubmit(context->queue, 1, &submit, VK_NULL_HANDLE);
-    if (result == VK_SUCCESS)
-        result = vk.vkDeviceWaitIdle(context->device);
+    const VkResult result = context->run_now(cb);
     if (result == VK_SUCCESS)
         memcpy(out, staging.mapped, (size_t)bytes);
     context->destroy_last_buffer(staging);
