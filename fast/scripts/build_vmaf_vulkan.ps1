@@ -123,6 +123,7 @@ $shaders = [ordered]@{
     # order, each multiply and add rounded (NO_CONTRACTION: see Add-NoContraction).
     'speed_dec'         = 'speed', 'STAGE=1', 'NO_CONTRACTION=1'
     'speed_dec_img'     = 'speed', 'STAGE=1', 'NO_CONTRACTION=1', 'FROM_IMAGE=1'
+    'speed_dec_split'   = 'speed', 'STAGE=1', 'NO_CONTRACTION=1', 'SPLIT=1'  # vv_export_part's two buffers
     'speed_blur'        = 'speed', 'STAGE=2', 'NO_CONTRACTION=1'
 }
 

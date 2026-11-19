@@ -751,6 +751,12 @@ struct vv_context {
     // in place of host memory. Vulkan imports them only on the same GPU and
     // driver (vv_shared_device).
     bool shared = false;
+    // Flag bit 3, with shared: each slot's planes in two such buffers, the
+    // reference's (staging) and the distorted's (stagingDis), for two
+    // decoders that each import one (vv_export_part). A driver may import an
+    // allocation only once a process: NVIDIA's on Windows refused a second
+    // import of one, by CUDA or by another Vulkan device alike.
+    bool split = false;
     PFN_vkGetMemoryWin32HandleKHR getMemoryHandle = nullptr;
     // A decoder's timeline semaphore (vv_import_timeline): its GPU copies into
     // the slots signal it, and a frame's submission waits for the value of its
@@ -910,13 +916,19 @@ struct vv_context {
                      HANDLE distorted, uint32_t distortedW, uint32_t distortedH, int distortedX, int distortedY);
     void picture_descriptors(VkDescriptorSet set, const Pass &pass, const Slot &slot);
     void picture_barriers(VkCommandBuffer cb, const Slot &slot, bool acquire);
-    uint32_t disOffset = 0;  // the distorted plane's place in a slot's staging buffer
+    // The distorted plane's place in a slot's staging buffer (in split mode,
+    // in stagingDis: 0).
+    uint32_t disOffset = 0;
     // VMAF v1 with a decoder's frames: the four chroma planes in a slot's
     // staging buffer too (ref U, ref V, dis U, dis V), from sharedChroma, each
-    // sharedChromaSpacing bytes after the one before (vv_shared_chroma).
+    // sharedChromaSpacing bytes after the one before (vv_shared_chroma). In
+    // split mode, the reference's two there and the distorted's two at the
+    // same place in stagingDis.
     uint32_t sharedChroma = 0, sharedChromaSpacing = 0;
+    // The buffer that holds a slot's distorted plane, at disOffset.
+    Buffer &dis_buffer(Slot &slot) { return split ? slot.stagingDis : slot.staging; }
     Bound slot_ref(Slot &slot) { return Bound(&slot.staging, 0, planeBytes); }
-    Bound slot_dis(Slot &slot) { return Bound(&slot.staging, disOffset, planeBytes); }
+    Bound slot_dis(Slot &slot) { return Bound(&dis_buffer(slot), disOffset, planeBytes); }
     int upload(Buffer &target, const void *data, size_t bytes);
     int build_passes();
     int submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *dis, ptrdiff_t disStride, bool score);
@@ -1415,7 +1427,7 @@ int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_l
             if (entry.buffer == &picRef)
                 slotBound.push_back(Bound(&slots[i].staging));
             else if (entry.buffer == &picDis)
-                slotBound.push_back(shared ? Bound(&slots[i].staging, disOffset, VK_WHOLE_SIZE)
+                slotBound.push_back(shared ? Bound(&dis_buffer(slots[i]), disOffset, VK_WHOLE_SIZE)
                                            : Bound(&slots[i].stagingDis));
             else
                 slotBound.push_back(entry);
@@ -2509,6 +2521,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // The pictures from a decoder's textures: VMAF v1 at 8 or 10 bits (NV12,
     // P010), motion against the frame before (not the five-frame window).
     pictures = pictures && v1 && (bpc == 8 || bpc == 10) && !options.fiveFrameWindow && memoryHandleProperties;
+    split = shared && !pictures && (flags >> 3) & 1;  // the pictures need no planes in the slots
 
     VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -2534,14 +2547,16 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // both planes: a multiple of 256, which any storage buffer offset
     // alignment divides (the passes bind the plane there when they read it in
     // place).
-    disOffset = (planeBytes + 255) & ~255u;
+    // In split mode each of a slot's two buffers holds one video's planes,
+    // laid out alike: the luma at 0, then its chroma.
+    disOffset = split ? 0 : (planeBytes + 255) & ~255u;
     const bool apart = direct && !shared;  // VMAF v0.6.1's distorted plane in stagingDis
-    VkDeviceSize stagingBytes = apart ? planeBytes : (VkDeviceSize)disOffset + planeBytes;
+    VkDeviceSize stagingBytes = apart || split ? planeBytes : (VkDeviceSize)disOffset + planeBytes;
     if (v1 && shared) {  // 4:2:0's chroma as libvmaf takes it, w/2 x h/2, its rows a word apart
         const uint32_t chromaStride = ((uint32_t)(w / 2) * (bpc > 8 ? 2 : 1) + 3) & ~3u;
         sharedChroma = (uint32_t)((stagingBytes + 255) & ~VkDeviceSize(255));
         sharedChromaSpacing = (chromaStride * (uint32_t)(h / 2) + 255) & ~255u;
-        stagingBytes = (VkDeviceSize)sharedChroma + 4ull * sharedChromaSpacing;
+        stagingBytes = (VkDeviceSize)sharedChroma + (split ? 2ull : 4ull) * sharedChromaSpacing;
     }
     // The pictures read where a decoder left them (vv_pictures): nothing is
     // written into the slots' shared buffers, which are made only for a
@@ -2619,7 +2634,8 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
             return fail(-1, "vkCreateFence failed");
         if (int error = create_buffer(slot.staging, stagingBytes, !shared, shared, !shared))
             return error;
-        if (int error = create_buffer(slot.stagingDis, apart ? planeBytes : 4, true, false, true))
+        if (int error = split ? create_buffer(slot.stagingDis, stagingBytes, false, true, false)
+                              : create_buffer(slot.stagingDis, apart ? planeBytes : 4, true, false, true))
             return error;
         if (int error = create_buffer(slot.result, kSlots * 8, true))
             return error;
@@ -2972,7 +2988,7 @@ int vv_context::enable_speed(const double *values)
             memcpy(constants, dec, sizeof dec);
             Bound chroma = Bound(&slot.speedChroma);
             if (fromStaging) {
-                chroma = Bound(&slot.staging, sharedChroma, 4ull * sharedChromaSpacing);
+                chroma = Bound(&slot.staging, sharedChroma, (split ? 2ull : 4ull) * sharedChromaSpacing);
                 constants[3] = sharedChromaSpacing / 4;  // planeWords
             }
             if (fromStaging && pictures) {  // from the pictures' textures (vv_pictures)
@@ -2981,6 +2997,12 @@ int vv_context::enable_speed(const double *values)
                                          groups(f.operating_w * f.operating_h * 4, perGroup), 1))
                     return error;
                 list.back().pictureRole = kPictureSpeed;
+            } else if (fromStaging && split) {  // the distorted's two planes from its own buffer
+                if (int error = add_pass(list, kShader_speed_dec_split, { chroma, &speedFilterTaps, &speedOperating,
+                                         &speedScaling, Bound(&slot.stagingDis, sharedChroma,
+                                                              2ull * sharedChromaSpacing) },
+                                         constants, sizeof dec, groups(f.operating_w * f.operating_h * 4, perGroup), 1))
+                    return error;
             } else if (int error = add_pass(list, kShader_speed_dec, { chroma, &speedFilterTaps, &speedOperating,
                                             &speedScaling }, constants, sizeof dec,
                                             groups(f.operating_w * f.operating_h * 4, perGroup), 1)) {
@@ -3328,7 +3350,7 @@ int vv_context::commit(bool score)
         // in the general layout throughout (the memory is Direct3D's).
         const int textures[2] = { pendingTextures[0], score ? pendingTextures[1] : -1 };
         Buffer *targets[2] = { direct ? &slot.staging : &picRef,
-                               direct ? (shared ? &slot.staging : &slot.stagingDis) : &picDis };
+                               direct ? (shared ? &dis_buffer(slot) : &slot.stagingDis) : &picDis };
         const VkDeviceSize offsets[2] = { 0, direct && shared ? (VkDeviceSize)disOffset : 0 };
         pendingTextures[0] = pendingTextures[1] = -1;
         for (int i = 0; i < 2; ++i) {
@@ -3363,7 +3385,7 @@ int vv_context::commit(bool score)
         vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
         if (score) {
             copy.srcOffset = disOffset;
-            vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picDis.buffer, 1, &copy);
+            vk.vkCmdCopyBuffer(cb, dis_buffer(slot).buffer, picDis.buffer, 1, &copy);
         }
     } else if (shared) {
         // A plane the CPU wrote (vv_shared_host_plane) goes where the decoder
@@ -3371,7 +3393,8 @@ int vv_context::commit(bool score)
         for (int i = 0; i < 2; ++i) {
             if (slot.planeFromHost[i] && (i == 0 || score)) {
                 const VkBufferCopy copy = { 0, i ? (VkDeviceSize)disOffset : 0, planeBytes };
-                vk.vkCmdCopyBuffer(cb, slot.hostPlane[i].buffer, slot.staging.buffer, 1, &copy);
+                vk.vkCmdCopyBuffer(cb, slot.hostPlane[i].buffer, (i ? dis_buffer(slot) : slot.staging).buffer, 1,
+                                   &copy);
             }
         }
     }
@@ -3936,8 +3959,10 @@ VV_EXPORT int vv_commit_after(vv_context *context, uint64_t value)
 // For a context made with flag bit 19 (frames from GPU memory): the staging
 // buffer the next pair's luma planes are to be written into by the API that
 // imported it -- *slot says which (they take turns), the reference's rows
-// start at offset 0 and the distorted's at *disOffset, *stride bytes apart.
-// Once they are written (and that API has finished writing), vv_commit.
+// start at offset 0 and the distorted's at *disOffset, *stride bytes apart
+// (in split mode, flag bit 3: at *disOffset, 0, of its own buffer,
+// vv_export_part's part 1). Once they are written (and that API has finished
+// writing), vv_commit.
 // Returns how many slots there are. A context reading a decoder's pictures
 // (vv_pictures) begins each frame here too, but its buffers hold no planes
 // (they are 4096 bytes): nothing may be written into them.
@@ -3973,25 +3998,36 @@ VV_EXPORT int vv_pictures(vv_context *context, void *reference, uint32_t referen
 // (vv_pictures), else 0.
 VV_EXPORT int vv_pictures_mode(vv_context *context) { return context->pictures ? 1 : 0; }
 
-// A slot's staging buffer as a Win32 handle another API on this GPU imports
-// (an opaque Win32 handle of a dedicated allocation of *bytes: CUDA's
+// One of a slot's staging buffers as a Win32 handle another API on this GPU
+// imports (an opaque Win32 handle of a dedicated allocation of *bytes: CUDA's
 // cuImportExternalMemory, or Vulkan's VkImportMemoryWin32HandleInfoKHR with
-// what vv_shared_device gives). The caller closes the handle once it has
-// imported it; the memory lives as long as the context.
-VV_EXPORT int vv_export(vv_context *context, int slot, void **handle, uint64_t *bytes)
+// what vv_shared_device gives): part 0 the slot's buffer, which holds both
+// videos' planes; in split mode (flag bit 3) part 0 the reference's and
+// part 1 the distorted's, laid out alike. The caller closes the handle once
+// it has imported it; the memory lives as long as the context.
+VV_EXPORT int vv_export_part(vv_context *context, int slot, int part, void **handle, uint64_t *bytes)
 {
-    if (!context->shared || slot < 0 || slot >= (int)context->slots.size())
+    if (!context->shared || slot < 0 || slot >= (int)context->slots.size() || part < 0
+        || part > (context->split ? 1 : 0))
         return fail(-3, "no such shared buffer");
+    const Slot &exported = context->slots[(size_t)slot];
+    const Buffer &buffer = part ? exported.stagingDis : exported.staging;
     VkMemoryGetWin32HandleInfoKHR info = { VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR };
-    info.memory = context->slots[(size_t)slot].staging.memory;
+    info.memory = buffer.memory;
     info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
     HANDLE win32 = nullptr;
     VkResult result = context->getMemoryHandle(context->device, &info, &win32);
     if (result != VK_SUCCESS)
         return fail(-1, "vkGetMemoryWin32HandleKHR failed (" + std::to_string(result) + ")");
     *handle = win32;
-    *bytes = context->slots[(size_t)slot].staging.allocation;
+    *bytes = buffer.allocation;
     return 0;
+}
+
+// vv_export_part's part 0.
+VV_EXPORT int vv_export(vv_context *context, int slot, void **handle, uint64_t *bytes)
+{
+    return vv_export_part(context, slot, 0, handle, bytes);
 }
 
 // For a context made with flag bit 19: what another Vulkan device must match
@@ -4199,8 +4235,10 @@ VV_EXPORT int vv_shared_host_plane(vv_context *context, int which, uint8_t **pla
 // where in each slot's staging buffer (the memory vv_export gives) the four
 // chroma planes go -- the reference's U and V, then the distorted's, from
 // *offset, *spacing bytes apart, rows *stride bytes apart (w/2 x h/2
-// samples). A decoder writes them there on the GPU, as the lumas; or the
-// frame's go through vv_chroma_staging instead.
+// samples). In split mode (flag bit 3) each of the slot's two buffers
+// (vv_export_part) holds its video's U and V there, from *offset. A decoder
+// writes them there on the GPU, as the lumas; or the frame's go through
+// vv_chroma_staging instead.
 VV_EXPORT int vv_shared_chroma(vv_context *context, uint64_t *offset, uint32_t *spacing, uint32_t *stride)
 {
     if (!context->shared || !context->speed)
