@@ -94,8 +94,8 @@ static char *test_16b_large_diff()
 
 
 /* libvmaf-fast: the rows init picks (VMAFx's AVX2 ones where the CPU has
- * AVX2) sum every width to the scalar rows' value, for random errors and the
- * largest. */
+ * AVX2, the NEON ones on Arm) sum every width to the scalar rows' value, for
+ * random errors and the largest. */
 static char *test_rows_init_picks_are_the_scalar_rows()
 {
     enum { N = 100 };

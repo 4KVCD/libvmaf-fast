@@ -23,8 +23,8 @@
  * picture_copy() + compute_ssim(), to the last bit, at every bit depth
  * picture_copy() converts, for scales that are and are not powers of two,
  * and for odd sizes (which compute_ssim() decimates to one column or row
- * more, mirrored); with the AVX2 decimation and the C one, and with a
- * workspace kept from call to call.
+ * more, mirrored); with the SIMD decimation (AVX2, or NEON on Arm) and the
+ * C one, and with a workspace kept from call to call.
  */
 
 #include <stdint.h>
@@ -73,7 +73,7 @@ static int compare(unsigned bpc, unsigned w, unsigned h)
     double want[4];
     int err = compute_ssim(ref_f, dis_f, w, h, stride, stride, &want[0], &want[1], &want[2], &want[3], 0);
     int differs = 0;
-    /* with the AVX2 code (where the CPU has it): with a workspace for the
+    /* with the SIMD code (where the CPU has it): with a workspace for the
      * call, and with one kept, used again dirty; then the C code, once */
     static const unsigned masks[] = { ~0u, 0 };
     for (int m = 0; m < 2 && !err; m++) {
@@ -125,11 +125,12 @@ static char *test_decimated_ssim_is_compute_ssims()
     return NULL;
 }
 
-/* libvmaf-fast: compute_ssim with the AVX2 code where the CPU has AVX2
- * (VMAFx's x86/convolve_avx2.c and x86/ssim_avx2.c) gives the scalar
- * code's score to the last bit; odd sizes, so that the vector loops leave
- * columns and samples over. */
-static char *test_avx2_ssim_is_the_scalar_ssim()
+/* libvmaf-fast: compute_ssim with the SIMD code where the CPU has it
+ * (VMAFx's x86/convolve_avx2.c and x86/ssim_avx2.c with AVX2,
+ * arm64/convolve_neon.c with NEON) gives the scalar code's score to the
+ * last bit; odd sizes, so that the vector loops leave columns and samples
+ * over. */
+static char *test_simd_ssim_is_the_scalar_ssim()
 {
     static const unsigned sizes[][2] = { { 203, 117 }, { 64, 48 } };
     vmaf_init_cpu();
@@ -151,7 +152,7 @@ static char *test_avx2_ssim_is_the_scalar_ssim()
         vmaf_picture_unref(&ref);
         vmaf_picture_unref(&dis);
         mu_assert("compute_ssim failed", !err);
-        mu_assert("the AVX2 SSIM is not the scalar SSIM", !memcmp(got, want, sizeof got));
+        mu_assert("the SIMD SSIM is not the scalar SSIM", !memcmp(got, want, sizeof got));
     }
     return NULL;
 }
@@ -175,7 +176,7 @@ static char *test_scale_one_and_odd_depths_are_refused()
 char *run_tests()
 {
     mu_run_test(test_decimated_ssim_is_compute_ssims);
-    mu_run_test(test_avx2_ssim_is_the_scalar_ssim);
+    mu_run_test(test_simd_ssim_is_the_scalar_ssim);
     mu_run_test(test_scale_one_and_odd_depths_are_refused);
     return NULL;
 }

@@ -29,6 +29,8 @@
 #include "opt.h"
 #if ARCH_X86
 #include "x86/psnr_avx2.h"
+#elif ARCH_AARCH64
+#include "arm64/psnr_neon.h"
 #endif
 
 typedef struct PsnrState {
@@ -44,7 +46,7 @@ typedef struct PsnrState {
         uint64_t n_pixels[3];
     } apsnr;
     /* a row's sum of squared errors (VMAFx's AVX2 rows where the CPU has
-     * AVX2, x86/psnr_avx2.c) */
+     * AVX2, x86/psnr_avx2.c; NEON rows on Arm, arm64/psnr_neon.c) */
     uint32_t (*sse_line_8)(const uint8_t *ref, const uint8_t *dis, unsigned w);
     uint64_t (*sse_line_16)(const uint16_t *ref, const uint16_t *dis, unsigned w);
 } PsnrState;
@@ -122,6 +124,11 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
     if (vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2) {
         s->sse_line_8 = psnr_sse_line_8_avx2;
         s->sse_line_16 = psnr_sse_line_16_avx2;
+    }
+#elif ARCH_AARCH64
+    if (vmaf_get_cpu_flags() & VMAF_ARM_CPU_FLAG_NEON) {
+        s->sse_line_8 = psnr_sse_line_8_neon;
+        s->sse_line_16 = psnr_sse_line_16_neon;
     }
 #endif
     s->peak = s->reduced_hbd_peak ? 255 * 1 << (bpc - 8) : (1 << bpc) - 1;

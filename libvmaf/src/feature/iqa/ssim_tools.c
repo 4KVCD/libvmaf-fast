@@ -174,7 +174,11 @@ float _iqa_ssim_ws(float *ref, float *cmp, int w, int h, const struct _kernel *k
     _iqa_convolve_ws(cmp, w, h, k, cmp_mu, 0, 0, conv_cache);
 
     /* libvmaf-fast: VMAFx's AVX2 copies of the three loops of floats below
-     * (x86/ssim_avx2.c), each pixel's arithmetic the scalar code's. */
+     * (x86/ssim_avx2.c), each pixel's arithmetic the scalar code's. Arm has
+     * no NEON copy: Clang vectorizes these loops already, and it fuses some
+     * of their multiplies and adds and not others (in the last loop it fuses
+     * only the pixels of a row left over after the vectors), which a copy
+     * would have to repeat exactly to give the same scores. */
 #if ARCH_X86
     const int avx2 = !!(vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2);
     if (avx2)

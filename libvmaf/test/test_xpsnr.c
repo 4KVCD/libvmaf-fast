@@ -358,6 +358,7 @@ typedef struct Case {
     int frame_rate, threads, n_subsample, weights_from_dist, frames;
     uint32_t noise;
     enum VmafPixelFormat pix_fmt;
+    uint64_t cpumask;  /* VmafConfiguration's: 0 lets the SIMD code run */
 } Case;
 
 /* 0, or the first frame whose score is not FFmpeg's */
@@ -374,7 +375,7 @@ static int run_case(const Case *c)
     double *want = malloc(c->frames * sizeof(double));
 
     VmafConfiguration cfg = { .log_level = VMAF_LOG_LEVEL_NONE, .n_threads = c->threads,
-                              .n_subsample = c->n_subsample };
+                              .n_subsample = c->n_subsample, .cpumask = c->cpumask };
     VmafContext *vmaf = NULL;
     int err = vmaf_init(&vmaf, cfg);
     VmafFeatureDictionary *opts = NULL;
@@ -462,6 +463,24 @@ static char *test_every_frame_is_ffmpegs()
     return NULL;
 }
 
+/* libvmaf-fast: the C code, which the SIMD code (AVX2, or NEON on Arm)
+ * replaces where the CPU has it, on one case of each of the SIMD code's
+ * paths: too small for blocks, every sample with odd edges, and
+ * downsampled with a last block too narrow for the spatial activity. */
+static char *test_the_c_code_is_ffmpegs_too()
+{
+    const Case cases[] = {
+        { 40, 30, 8, 24, 0, 1, 1, 4, 9, VMAF_PIX_FMT_YUV400P, ~0ull },
+        { 1279, 719, 10, 30, 3, 1, 1, 6, 12, VMAF_PIX_FMT_YUV400P, ~0ull },
+        { 3850, 2160, 8, 60, 4, 1, 1, 4, 8, VMAF_PIX_FMT_YUV400P, ~0ull },
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const int bad = run_case(&cases[i]);
+        mu_assert("an XPSNR of the C code is not FFmpeg's (see above)", bad == 0);
+    }
+    return NULL;
+}
+
 static int refused(unsigned w, unsigned h, unsigned bpc)
 {
     VmafConfiguration cfg = { .log_level = VMAF_LOG_LEVEL_NONE };
@@ -488,6 +507,7 @@ static char *test_what_ffmpeg_reads_outside_the_picture_for_is_refused()
 char *run_tests()
 {
     mu_run_test(test_every_frame_is_ffmpegs);
+    mu_run_test(test_the_c_code_is_ffmpegs_too);
     mu_run_test(test_what_ffmpeg_reads_outside_the_picture_for_is_refused);
     return NULL;
 }

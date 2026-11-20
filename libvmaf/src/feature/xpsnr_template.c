@@ -30,10 +30,10 @@ static uint64_t FN(sse_block)(const XpsnrState *s, const T *org, ptrdiff_t so, c
 {
     uint64_t sse = 0;
 
-#if ARCH_X86
-    if (s->avx2) {
+#if XPSNR_SIMD
+    if (s->simd) {
         for (uint32_t y = 0; y < block_height; y++) {
-            sse += FN(sse_line_avx2)(org, rec, block_width);
+            sse += FN(sse_line_simd)(org, rec, block_width);
             org += so;
             rec += sr;
         }

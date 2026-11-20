@@ -284,6 +284,8 @@ if is_asm_enabled
           feature_src_dir + 'arm64/adm_neon.c',
           feature_src_dir + 'arm64/motion_neon.c',
           feature_src_dir + 'arm64/speed_neon.c',
+          feature_src_dir + 'arm64/psnr_neon.c',
+          feature_src_dir + 'arm64/xpsnr_any_neon.c',
         ]
 
           arm64_static_lib = static_library(
@@ -294,6 +296,23 @@ if is_asm_enabled
         )
 
         platform_specific_cpu_objects += arm64_static_lib.extract_all_objects()
+
+        # SSIM's float code, bit-identical to the C code: -ffp-contract=off
+        # keeps clang from fusing a multiply and an add (intrinsics too)
+        # into one rounding
+        arm64_exact_float_sources = [
+          feature_src_dir + 'arm64/convolve_neon.c',
+          feature_src_dir + 'arm64/ssim_decimate_neon.c',
+        ]
+
+        arm64_exact_float_static_lib = static_library(
+          'arm64_exact_float',
+          arm64_exact_float_sources,
+          include_directories : vmaf_base_include,
+          c_args : vmaf_cflags_common + ['-DARCH_AARCH64', '-ffp-contract=off']
+        )
+
+        platform_specific_cpu_objects += arm64_exact_float_static_lib.extract_all_objects()
     endif
 
     if host_machine.cpu_family().startswith('x86')
