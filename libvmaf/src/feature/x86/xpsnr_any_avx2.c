@@ -62,7 +62,11 @@ static inline uint64_t sum_lanes(__m256i v)
     const __m256i wide = _mm256_add_epi64(_mm256_cvtepu32_epi64(_mm256_castsi256_si128(v)),
                                           _mm256_cvtepu32_epi64(_mm256_extracti128_si256(v, 1)));
     const __m128i half = _mm_add_epi64(_mm256_castsi256_si128(wide), _mm256_extracti128_si256(wide, 1));
-    return (uint64_t)_mm_cvtsi128_si64(half) + (uint64_t)_mm_extract_epi64(half, 1);
+    const __m128i total = _mm_add_epi64(half, _mm_unpackhi_epi64(half, half));
+    /* _mm_storel_epi64, not _mm_cvtsi128_si64: the latter is x86-64 only */
+    uint64_t sum;
+    _mm_storel_epi64((__m128i *)&sum, total);
+    return sum;
 }
 
 #define T uint8_t
