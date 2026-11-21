@@ -53,7 +53,8 @@
 /*
  * libvmaf-fast: copied unchanged from VMAFx (github.com/VMAFx/vmafx, commit
  * 1ed4affa, core/src/feature/x86/convolve_avx2.c) but for VMAF_ASSERT_DEBUG,
- * which is assert() here. The ADR and research notes named above are in
+ * which is assert() here, and for pictures smaller than the kernel, which
+ * have no output here as in the scalar filter (VMAFx asserted). The ADR and research notes named above are in
  * that repository. Called from iqa/convolve.c's _iqa_convolve.
  */
 
@@ -261,8 +262,6 @@ void iqa_convolve_avx2(float *img, int w, int h, const float *kernel_h, const fl
     VMAF_ASSERT_DEBUG(kernel_h != NULL);
     VMAF_ASSERT_DEBUG(kernel_v != NULL);
     VMAF_ASSERT_DEBUG(normalized == 1);
-    VMAF_ASSERT_DEBUG(w >= kw);
-    VMAF_ASSERT_DEBUG(h >= kh);
     (void)normalized;
 
     const int uc = kw / 2;
@@ -271,6 +270,19 @@ void iqa_convolve_avx2(float *img, int w, int h, const float *kernel_h, const fl
     const int kh_even = (kh & 1) ? 0 : 1;
     const int dst_w = w - kw + 1;
     const int dst_h = h - kh + 1;
+
+    /* libvmaf-fast: a picture narrower or shorter than the kernel has no
+     * position where the kernel fits, so no output: the scalar filter's
+     * loops then do nothing and it reports the same sizes. The passes below
+     * need at least one output (a 9x9 picture under SSIM's 11x11 window
+     * failed their asserts). */
+    if (dst_w < 1 || dst_h < 1) {
+        if (rw)
+            *rw = dst_w;
+        if (rh)
+            *rh = dst_h;
+        return;
+    }
 
     float *dst = result;
     if (!dst) {

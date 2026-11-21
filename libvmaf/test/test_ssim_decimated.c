@@ -128,10 +128,14 @@ static char *test_decimated_ssim_is_compute_ssims()
 /* libvmaf-fast: compute_ssim with the AVX2 code where the CPU has AVX2
  * (VMAFx's x86/convolve_avx2.c and x86/ssim_avx2.c) gives the scalar
  * code's score to the last bit; odd sizes, so that the vector loops leave
- * columns and samples over. */
+ * columns and samples over; and pictures narrower or shorter than the 11x11
+ * window, where neither has an output (the AVX2 filter asserted there), and
+ * just as wide or tall (one output). */
 static char *test_avx2_ssim_is_the_scalar_ssim()
 {
-    static const unsigned sizes[][2] = { { 203, 117 }, { 64, 48 } };
+    static const unsigned sizes[][2] = {
+        { 203, 117 }, { 64, 48 }, { 9, 9 }, { 10, 64 }, { 64, 10 }, { 11, 11 }, { 11, 64 },
+    };
     vmaf_init_cpu();
     for (size_t i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
         const unsigned w = sizes[i][0], h = sizes[i][1];

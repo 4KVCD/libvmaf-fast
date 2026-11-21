@@ -120,10 +120,28 @@ static void batch_thread_data_free(void *data)
     free(td);
 }
 
+/* libvmaf-fast: with MSVC's static C runtime (a DLL built with b_vscrt=mt
+ * has its own copy), a failed assert() shows a dialog box by default and
+ * waits for a click, which freezes a host that runs without a window (a
+ * video app's scoring process waited forever). Here the message goes to
+ * stderr and abort() ends the process at once, with no dialog box and no
+ * Windows Error Reporting either. Only the runtime libvmaf is linked with is
+ * changed: a DLL's own copy, or that of a program built with libvmaf's
+ * static library and /MT. */
+static void asserts_end_the_process(void)
+{
+#if defined(_MSC_VER) && !defined(_DLL)
+    _set_error_mode(_OUT_TO_STDERR);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+}
+
 int vmaf_init(VmafContext **vmaf, VmafConfiguration cfg)
 {
     if (!vmaf) return -EINVAL;
     int err = 0;
+
+    asserts_end_the_process();
 
     VmafContext *const v = *vmaf = malloc(sizeof(*v));
     if (!v) goto fail;
