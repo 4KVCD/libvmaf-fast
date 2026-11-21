@@ -43,8 +43,20 @@
 #include "convolve.h"
 #include "ssim_tools.h"
 #include "cpu.h"
+/* libvmaf-fast: the SIMD copies of the three loops of floats of
+ * _iqa_ssim_ws, AVX2 (VMAFx's, x86/ssim_avx2.c) or NEON (arm64/ssim_neon.c) */
 #if ARCH_X86
 #include "../x86/ssim_avx2.h"
+#define SSIM_SIMD_FLAG VMAF_X86_CPU_FLAG_AVX2
+#define ssim_precompute_simd ssim_precompute_avx2
+#define ssim_variance_simd ssim_variance_avx2
+#define ssim_accumulate_simd ssim_accumulate_avx2
+#elif ARCH_AARCH64
+#include "../arm64/ssim_neon.h"
+#define SSIM_SIMD_FLAG VMAF_ARM_CPU_FLAG_NEON
+#define ssim_precompute_simd ssim_precompute_neon
+#define ssim_variance_simd ssim_variance_neon
+#define ssim_accumulate_simd ssim_accumulate_neon
 #endif
 
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
@@ -173,12 +185,12 @@ float _iqa_ssim_ws(float *ref, float *cmp, int w, int h, const struct _kernel *k
     _iqa_convolve_ws(ref, w, h, k, ref_mu, 0, 0, conv_cache);
     _iqa_convolve_ws(cmp, w, h, k, cmp_mu, 0, 0, conv_cache);
 
-    /* libvmaf-fast: VMAFx's AVX2 copies of the three loops of floats below
-     * (x86/ssim_avx2.c), each pixel's arithmetic the scalar code's. */
-#if ARCH_X86
-    const int avx2 = !!(vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2);
-    if (avx2)
-        ssim_precompute_avx2(ref, cmp, ref_sigma_sqd, cmp_sigma_sqd, sigma_both, w*h);
+    /* libvmaf-fast: the SIMD copies of the three loops of floats below,
+     * each pixel's arithmetic the scalar code's. */
+#ifdef SSIM_SIMD_FLAG
+    const int simd = !!(vmaf_get_cpu_flags() & SSIM_SIMD_FLAG);
+    if (simd)
+        ssim_precompute_simd(ref, cmp, ref_sigma_sqd, cmp_sigma_sqd, sigma_both, w*h);
     else
 #endif
     for (y=0; y<h; ++y) {
@@ -196,13 +208,13 @@ float _iqa_ssim_ws(float *ref, float *cmp, int w, int h, const struct _kernel *k
     _iqa_convolve_ws(sigma_both,    w, h, k, 0, &w, &h, conv_cache); /* Update the width and height */
 
     /* The convolution results are smaller by the kernel width and height */
-#if ARCH_X86
+#ifdef SSIM_SIMD_FLAG
     /* libvmaf-fast: the pixels the loops below visit: none where the
      * picture is smaller than the window both ways, w and h both negative
      * (w*h is not) */
     const int pixels = w > 0 && h > 0 ? w * h : 0;
-    if (avx2)
-        ssim_variance_avx2(ref_sigma_sqd, cmp_sigma_sqd, sigma_both, ref_mu, cmp_mu, pixels);
+    if (simd)
+        ssim_variance_simd(ref_sigma_sqd, cmp_sigma_sqd, sigma_both, ref_mu, cmp_mu, pixels);
     else
 #endif
     for (y=0; y<h; ++y) {
@@ -222,11 +234,11 @@ float _iqa_ssim_ws(float *ref, float *cmp, int w, int h, const struct _kernel *k
     l_sum = 0.0; /* zli-nflx */
     c_sum = 0.0; /* zli-nflx */
     s_sum = 0.0; /* zli-nflx */
-#if ARCH_X86
+#ifdef SSIM_SIMD_FLAG
     /* Over all the pixels in one call, so its four sums are added up in the
      * order of the loop below. */
-    if (avx2 && !args)
-        ssim_accumulate_avx2(ref_mu, cmp_mu, ref_sigma_sqd, cmp_sigma_sqd, sigma_both, pixels,
+    if (simd && !args)
+        ssim_accumulate_simd(ref_mu, cmp_mu, ref_sigma_sqd, cmp_sigma_sqd, sigma_both, pixels,
                              C1, C2, C3, &ssim_sum, &l_sum, &c_sum, &s_sum);
     else
 #endif

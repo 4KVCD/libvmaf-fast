@@ -19,22 +19,9 @@
 #ifndef LIBVMAF_FEATURE_X86_XPSNR_ANY_AVX2_H
 #define LIBVMAF_FEATURE_X86_XPSNR_ANY_AVX2_H
 
-#include <stddef.h>
 #include <stdint.h>
 
-/* One strip of XPSNR's blocks: the picture's rows from a multiple of the
- * block size, `height` of them (the block size, or fewer at the bottom). */
-typedef struct XpsnrStrip {
-    /* the strip's first rows of the original, the reconstruction and the
-     * two pictures before (m1, m2: a row of zeros with stride 0 before the
-     * first) */
-    const void *org, *rec, *m1, *m2;
-    ptrdiff_t so, sr, s1, s2;  /* strides in samples */
-    int w, b, b_val;           /* picture width, block size, FFmpeg's b_val */
-    int height;
-    int y_act, h_act;          /* the strip's rows of spatial activity, as FN(block) has them */
-    int second_order;          /* temporal: m0 - 2 m1 + m2 (else m0 - m1) */
-} XpsnrStrip;
+#include "../xpsnr_strip.h"
 
 /*
  * The integer sums of xpsnr_template.c's FN(block) for every block of the

@@ -34,8 +34,26 @@
 #include "iqa/ssim_tools.h"
 #include "ssim.h"
 #include "cpu.h"
+/* libvmaf-fast's SIMD box sums: AVX2 (x86/ssim_decimate_avx2.c) or NEON
+ * (arm64/ssim_decimate_neon.c) */
 #if ARCH_X86
 #include "x86/ssim_decimate_avx2.h"
+#define SSIM_DECIMATE_SIMD_FLAG VMAF_X86_CPU_FLAG_AVX2
+#define ssim_column_sums_simd_8 ssim_column_sums_avx2_8
+#define ssim_column_sums_simd_16 ssim_column_sums_avx2_16
+#define ssim_box_sums_simd ssim_box_sums_avx2
+#define ssim_column_table_sums_simd_8 ssim_column_table_sums_avx2_8
+#define ssim_column_table_sums_simd_16 ssim_column_table_sums_avx2_16
+#define ssim_box_table_sums_simd ssim_box_table_sums_avx2
+#elif ARCH_AARCH64
+#include "arm64/ssim_decimate_neon.h"
+#define SSIM_DECIMATE_SIMD_FLAG VMAF_ARM_CPU_FLAG_NEON
+#define ssim_column_sums_simd_8 ssim_column_sums_neon_8
+#define ssim_column_sums_simd_16 ssim_column_sums_neon_16
+#define ssim_box_sums_simd ssim_box_sums_neon
+#define ssim_column_table_sums_simd_8 ssim_column_table_sums_neon_8
+#define ssim_column_table_sums_simd_16 ssim_column_table_sums_neon_16
+#define ssim_box_table_sums_simd ssim_box_table_sums_neon
 #endif
 
 /* _ssim_map */
@@ -80,10 +98,10 @@ int ssim_scale(int w, int h, int scale_override)
  * the integer sum of the samples times one power of two. Otherwise each
  * sample's product is looked up in a table of them.
  *
- * With AVX2 (x86/ssim_decimate_avx2.c) each output row is made in two
- * steps, the sums of each column's `scale` rows and then the sums of
- * `scale` of those; the boxes at the left and right edges, which mirror,
- * from the same column sums here.
+ * With SIMD (x86/ssim_decimate_avx2.c, arm64/ssim_decimate_neon.c) each
+ * output row is made in two steps, the sums of each column's `scale` rows
+ * and then the sums of `scale` of those; the boxes at the left and right
+ * edges, which mirror, from the same column sums here.
  */
 static int ssim_mirror(int i, int n)
 {
@@ -102,7 +120,7 @@ struct SsimWorkspace {
     unsigned bpc;
     double unit;          /* 1/(scale*scale) over the conversion's divisor */
     double *table;        /* each sample's float product; NULL: unit works */
-    bool avx2_sums;       /* integer box sums fit ssim_box_sums_avx2 */
+    bool simd_sums;       /* integer box sums fit ssim_box_sums_simd */
     int *columns;         /* each output's box columns, mirrored: sw * scale */
     double *acc;          /* the C code's row of box sums: sw */
     uint32_t *col;        /* integer column sums: w */
@@ -144,7 +162,7 @@ SsimWorkspace *ssim_workspace_alloc(int w, int h, int scale, unsigned bpc)
         }
     }
     const uint64_t max_box = (uint64_t)scale * scale * ((1u << bpc) - 1);
-    ws->avx2_sums = power_of_two && max_box < (1u << 24);
+    ws->simd_sums = power_of_two && max_box < (1u << 24);
     const size_t small = (size_t)ws->sw * ws->sh;
     ws->columns = malloc(sizeof(int) * ws->sw * scale);
     ws->acc = malloc(sizeof(double) * ws->sw);
@@ -185,7 +203,7 @@ void ssim_workspace_free(SsimWorkspace *ws)
     free(ws);
 }
 
-#if ARCH_X86
+#ifdef SSIM_DECIMATE_SIMD_FLAG
 /* Output x of a row from the row's column sums, its box mirrored at the
  * picture's edge (ws->columns), as the C code's sum. */
 static float mirrored_box_sum(const SsimWorkspace *ws, int x)
@@ -203,10 +221,10 @@ static float mirrored_box_sum(const SsimWorkspace *ws, int x)
     return (float)((double)sum * ws->unit);
 }
 
-/* One output row from its box rows (ws->rows8 or rows16) with AVX2: the
+/* One output row from its box rows (ws->rows8 or rows16) with SIMD: the
  * column sums, the box sums inside the picture, and the mirrored boxes at
  * the edges from the same column sums. */
-static void decimate_row_avx2(const SsimWorkspace *ws, int wide, float *out)
+static void decimate_row_simd(const SsimWorkspace *ws, int wide, float *out)
 {
     const int scale = ws->scale, sw = ws->sw, uc = scale / 2;
     /* outputs whose box lies inside the picture: x * scale - uc >= 0 and
@@ -217,16 +235,16 @@ static void decimate_row_avx2(const SsimWorkspace *ws, int wide, float *out)
     if (inside_hi < inside_lo) inside_hi = inside_lo;
     if (ws->table) {
         if (wide)
-            ssim_column_table_sums_avx2_16(ws->rows16, scale, ws->w, ws->table, ws->col_table);
+            ssim_column_table_sums_simd_16(ws->rows16, scale, ws->w, ws->table, ws->col_table);
         else
-            ssim_column_table_sums_avx2_8(ws->rows8, scale, ws->w, ws->table, ws->col_table);
-        ssim_box_table_sums_avx2(ws->col_table, scale, inside_lo, inside_hi, out);
+            ssim_column_table_sums_simd_8(ws->rows8, scale, ws->w, ws->table, ws->col_table);
+        ssim_box_table_sums_simd(ws->col_table, scale, inside_lo, inside_hi, out);
     } else {
         if (wide)
-            ssim_column_sums_avx2_16(ws->rows16, scale, ws->w, ws->col);
+            ssim_column_sums_simd_16(ws->rows16, scale, ws->w, ws->col);
         else
-            ssim_column_sums_avx2_8(ws->rows8, scale, ws->w, ws->col);
-        ssim_box_sums_avx2(ws->col, scale, inside_lo, inside_hi, (float)ws->unit, out);
+            ssim_column_sums_simd_8(ws->rows8, scale, ws->w, ws->col);
+        ssim_box_sums_simd(ws->col, scale, inside_lo, inside_hi, (float)ws->unit, out);
     }
     for (int x = 0; x < inside_lo; x++)
         out[x] = mirrored_box_sum(ws, x);
@@ -235,7 +253,7 @@ static void decimate_row_avx2(const SsimWorkspace *ws, int wide, float *out)
 }
 #endif
 
-static void decimate_picture(VmafPicture *pic, SsimWorkspace *ws, int avx2, float *dst)
+static void decimate_picture(VmafPicture *pic, SsimWorkspace *ws, int simd, float *dst)
 {
     const int h = ws->h, scale = ws->scale, sw = ws->sw, sh = ws->sh;
     const int wide = pic->bpc > 8;
@@ -245,13 +263,13 @@ static void decimate_picture(VmafPicture *pic, SsimWorkspace *ws, int avx2, floa
     const double *table = ws->table;
     const int uc = scale / 2;
     double *acc = ws->acc;
-#if !ARCH_X86
-    (void) avx2;
+#ifndef SSIM_DECIMATE_SIMD_FLAG
+    (void) simd;
 #endif
     for (int y = 0; y < sh; y++) {
         float *out = dst + (size_t)y * sw;
-#if ARCH_X86
-        if (avx2 && (table || ws->avx2_sums)) {
+#ifdef SSIM_DECIMATE_SIMD_FLAG
+        if (simd && (table || ws->simd_sums)) {
             for (int v = 0; v < scale; v++) {
                 const int row = ssim_mirror(y * scale - uc + v, h);
                 if (wide)
@@ -259,7 +277,7 @@ static void decimate_picture(VmafPicture *pic, SsimWorkspace *ws, int avx2, floa
                 else
                     ws->rows8[v] = data8 + row * stride;
             }
-            decimate_row_avx2(ws, wide, out);
+            decimate_row_simd(ws, wide, out);
             continue;
         }
 #endif
@@ -308,12 +326,12 @@ int compute_ssim_decimated(VmafPicture *ref, VmafPicture *cmp, int scale,
         ws = own = ssim_workspace_alloc(w, h, scale, bpc);
         if (!ws) return -ENOMEM;
     }
-    int avx2 = 0;
-#if ARCH_X86
-    avx2 = !!(vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2);
+    int simd = 0;
+#ifdef SSIM_DECIMATE_SIMD_FLAG
+    simd = !!(vmaf_get_cpu_flags() & SSIM_DECIMATE_SIMD_FLAG);
 #endif
-    decimate_picture(ref, ws, avx2, ws->ref_f);
-    decimate_picture(cmp, ws, avx2, ws->cmp_f);
+    decimate_picture(ref, ws, simd, ws->ref_f);
+    decimate_picture(cmp, ws, simd, ws->cmp_f);
     const int err = ssim_of_floats(ws->ref_f, ws->cmp_f, ws->sw, ws->sh, ws->iqa,
                                    score, l_score, c_score, s_score);
     ssim_workspace_free(own);

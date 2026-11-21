@@ -40,6 +40,8 @@
 #include "cpu.h"
 #if ARCH_X86
 #include "../x86/convolve_avx2.h"
+#elif ARCH_AARCH64
+#include "../arm64/convolve_neon.h"
 #endif
 
 float KBND_SYMMETRIC(const float *img, int w, int h, int x, int y, float bnd_const)
@@ -110,6 +112,13 @@ void _iqa_convolve_ws(float *img, int w, int h, const struct _kernel *k, float *
     if ((vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2) && k->normalized &&
         k->kernel_h && k->kernel_v) {
         iqa_convolve_avx2(img, w, h, k->kernel_h, k->kernel_v, k->w, k->h, 1, cache, result, rw, rh);
+        return;
+    }
+#elif ARCH_AARCH64
+    /* the same with NEON (arm64/convolve_neon.c) */
+    if ((vmaf_get_cpu_flags() & VMAF_ARM_CPU_FLAG_NEON) && k->normalized &&
+        k->kernel_h && k->kernel_v) {
+        iqa_convolve_neon(img, w, h, k->kernel_h, k->kernel_v, k->w, k->h, cache, result, rw, rh);
         return;
     }
 #endif
