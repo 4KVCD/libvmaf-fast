@@ -33,9 +33,12 @@ typedef struct {
     unsigned frame_skip_ref;
     unsigned frame_skip_dist;
     unsigned frame_cnt;
+    /* the _ref and _dist sizes default to width and height */
     unsigned width, height;
+    unsigned width_ref, height_ref, width_dist, height_dist;
     enum VmafPixelFormat pix_fmt;
     unsigned bitdepth;
+    VmafColor color_ref, color_dist;
     bool use_yuv;
     char *output_path;
     enum VmafOutputFormat output_fmt;

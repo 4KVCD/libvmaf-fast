@@ -23,6 +23,7 @@
 
 #include "dict.h"
 #include "libvmaf/model.h"
+#include "libvmaf/picture.h"
 
 enum VmafModelType {
     VMAF_MODEL_TYPE_UNKNOWN = 0,
@@ -77,6 +78,20 @@ typedef struct VmafModel {
         } knots;
         bool out_lte_in, out_gte_in;
     } score_transform;
+    struct {
+        bool enabled;
+        VmafColor color;
+        /* UNKNOWN / 0 mean "keep the source picture's" */
+        enum VmafPixelFormat pix_fmt;
+        unsigned bpc;
+        /* short side both pictures are scaled to, so 1080 means 1920x1080 or
+         * 1080x1920 by source orientation; 0 means "keep the source's" */
+        unsigned display_resolution;
+        /* the colorimetry to assume for a picture with none set; only SDR
+         * models declare one */
+        bool has_assumed_color;
+        VmafColor assumed_color;
+    } conversion_target;
     struct svm_model *svm;
 } VmafModel;
 

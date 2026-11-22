@@ -118,4 +118,10 @@ float _iqa_ssim(float *ref, float *cmp, int w, int h, const struct _kernel *k,
 		, float *l_mean, float *c_mean, float *s_mean /* zli-nflx */
 		);
 
+/* libvmaf-fast: _iqa_ssim with its buffers in workspace (6 * w * h floats,
+ * kept by the caller from frame to frame), or allocated if it is NULL. */
+float _iqa_ssim_ws(float *ref, float *cmp, int w, int h, const struct _kernel *k,
+                   const struct _map_reduce *mr, const struct iqa_ssim_args *args,
+                   float *l_mean, float *c_mean, float *s_mean, float *workspace);
+
 #endif /* _SSIM_TOOLS_H_ */

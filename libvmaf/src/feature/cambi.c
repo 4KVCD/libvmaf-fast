@@ -33,6 +33,8 @@
 
 #if ARCH_X86
 #include "x86/cambi_avx2.h"
+#elif ARCH_AARCH64
+#include "arm64/cambi_neon.h"
 #endif
 
 /* Ratio of pixels for computation, must be 0 < topk <= 1.0 */
@@ -121,6 +123,14 @@ void compute_dp_row(uint32_t *dp_curr, const uint32_t *dp_prev,
                     const uint16_t *deriv, int width, int pad_size, bool deriv_valid);
 void compute_mask_row(uint16_t *mask_row, const uint32_t *dp_bottom, const uint32_t *dp_top,
                       int width, int pad_size, uint32_t mask_index);
+#if ARCH_AARCH64
+/* calculate_c_values with the NEON kernels (defined after it) */
+static void calculate_c_values_neon(VmafPicture *pic, const VmafPicture *mask_pic,
+                                    float *c_values, uint16_t *histograms, uint16_t window_size,
+                                    const uint16_t num_diffs, const uint16_t *tvi_for_diff,
+                                    uint16_t vlt_luma, const int *diff_weights, const int *all_diffs,
+                                    int width, int height);
+#endif
 
 typedef struct CambiState {
     VmafPicture pics[PICS_BUFFER_SIZE];
@@ -173,7 +183,7 @@ static const VmafOption options[] = {
         .offset = offsetof(CambiState, enc_width),
         .type = VMAF_OPT_TYPE_INT,
         .default_val.i = 0,
-        .min = 180,
+        .min = 144,
         .max = 7680,
         .flags = VMAF_OPT_FLAG_FEATURE_PARAM,
         .alias = "encw",
@@ -184,7 +194,7 @@ static const VmafOption options[] = {
         .offset = offsetof(CambiState, enc_height),
         .type = VMAF_OPT_TYPE_INT,
         .default_val.i = 0,
-        .min = 150,
+        .min = 144,
         .max = 7680,
         .flags = VMAF_OPT_FLAG_FEATURE_PARAM,
         .alias = "ench",
@@ -647,6 +657,15 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
         s->compute_dp_row_callback = compute_dp_row_avx2;
         s->compute_mask_row_callback = compute_mask_row_avx2;
     }
+#elif ARCH_AARCH64
+    if (vmaf_get_cpu_flags() & VMAF_ARM_CPU_FLAG_NEON) {
+        s->derivative_callback = get_derivative_data_for_row_neon;
+        s->calc_c_values_callback = calculate_c_values_neon;
+        s->filter_mode_callback = filter_mode_neon;
+        s->decimate_callback = decimate_neon;
+        s->compute_dp_row_callback = compute_dp_row_neon;
+        s->compute_mask_row_callback = compute_mask_row_neon;
+    }
 #endif
 
     return err;
@@ -748,7 +767,12 @@ static void decimate_generic_uint16_and_convert_to_10b(const VmafPicture *pic, V
     if (in_w == out_w && in_h == out_h) {
         if (pic->bpc == 10) {
             // memcpy is faster in case the original bitdepth is already 10
-            memcpy(out_data, data, stride * pic->h[0] * sizeof(uint16_t));
+            if (stride == out_stride) {
+                memcpy(out_data, data, stride * out_h * sizeof(uint16_t));
+            } else {
+                for (unsigned i = 0; i < out_h; i++)
+                    memcpy(out_data + i * out_stride, data + i * stride, out_w * sizeof(uint16_t));
+            }
         }
         else {
             for (unsigned i = 0; i < out_h; i++) {
@@ -1118,10 +1142,20 @@ void calculate_c_values_row(float *c_values, const uint16_t *histograms, const u
     }
 }
 
-void calculate_c_values(VmafPicture *pic, const VmafPicture *mask_pic,
-                               float *c_values, uint16_t *histograms, uint16_t window_size,
+/* The pass over the rows that makes the c-values, with the kernels of
+ * the c-values of a row and of the histograms' range updates as given:
+ * the scalar ones or a SIMD version (arm64/cambi_neon.c). */
+typedef void (*VmafCValuesRow)(float *c_values, const uint16_t *histograms, const uint16_t *image,
+                               const uint16_t *mask, int row, int width, ptrdiff_t stride,
                                const uint16_t num_diffs, const uint16_t *tvi_for_diff, uint16_t vlt_luma,
-                               const int *diff_weights, const int *all_diffs, int width, int height) {
+                               const int *diff_weights, const int *all_diffs,
+                               const float *reciprocal_lut);
+
+static void c_values_pass(VmafPicture *pic, const VmafPicture *mask_pic,
+                          float *c_values, uint16_t *histograms, uint16_t window_size,
+                          const uint16_t num_diffs, const uint16_t *tvi_for_diff, uint16_t vlt_luma,
+                          const int *diff_weights, const int *all_diffs, int width, int height,
+                          VmafCValuesRow row_fn, VmafRangeUpdater inc, VmafRangeUpdater dec) {
 
     uint16_t pad_size = window_size >> 1;
 
@@ -1139,13 +1173,13 @@ void calculate_c_values(VmafPicture *pic, const VmafPicture *mask_pic,
     // First pass: first pad_size rows
     for (int i = 0; i < pad_size; i++) {
         for (int j = 0; j < pad_size; j++) {
-            update_histogram_add_edge_first_pass(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, increment_range);
+            update_histogram_add_edge_first_pass(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, inc);
         }
         for (int j = pad_size; j < width - pad_size - 1; j++) {
-            update_histogram_add_first_pass(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, increment_range);
+            update_histogram_add_first_pass(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, inc);
         }
         for (int j = MAX(width - pad_size - 1, pad_size); j < width; j++) {
-            update_histogram_add_edge_first_pass(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, increment_range);
+            update_histogram_add_edge_first_pass(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, inc);
         }
     }
 
@@ -1153,41 +1187,62 @@ void calculate_c_values(VmafPicture *pic, const VmafPicture *mask_pic,
     for (int i = 0; i < pad_size + 1; i++) {
         if (i + pad_size < height) {
             for (int j = 0; j < pad_size; j++) {
-                update_histogram_add_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, increment_range);
+                update_histogram_add_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, inc);
             }
             for (int j = pad_size; j < width - pad_size - 1; j++) {
-                update_histogram_add(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, increment_range);
+                update_histogram_add(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, inc);
             }
             for (int j = MAX(width - pad_size - 1, pad_size); j < width; j++) {
-                update_histogram_add_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, increment_range);
+                update_histogram_add_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, inc);
             }
         }
-        calculate_c_values_row(c_values, histograms, image, mask, i, width, stride, num_diffs, tvi_for_diff, vlt_luma, diff_weights, all_diffs, reciprocal_lut);
+        row_fn(c_values, histograms, image, mask, i, width, stride, num_diffs, tvi_for_diff, vlt_luma, diff_weights, all_diffs, reciprocal_lut);
     }
     for (int i = pad_size + 1; i < height - pad_size; i++) {
         for (int j = 0; j < pad_size; j++)
-            uh_slide_edge(histograms, image, mask, i, j, width, stride, pad_size, v_band_base, v_band_size, increment_range, decrement_range);
+            uh_slide_edge(histograms, image, mask, i, j, width, stride, pad_size, v_band_base, v_band_size, inc, dec);
         for (int j = pad_size; j < width - pad_size - 1; j++)
-            uh_slide(histograms, image, mask, i, j, width, stride, pad_size, v_band_base, v_band_size, increment_range, decrement_range);
+            uh_slide(histograms, image, mask, i, j, width, stride, pad_size, v_band_base, v_band_size, inc, dec);
         for (int j = MAX(width - pad_size - 1, pad_size); j < width; j++)
-            uh_slide_edge(histograms, image, mask, i, j, width, stride, pad_size, v_band_base, v_band_size, increment_range, decrement_range);
-        calculate_c_values_row(c_values, histograms, image, mask, i, width, stride, num_diffs, tvi_for_diff, vlt_luma, diff_weights, all_diffs, reciprocal_lut);
+            uh_slide_edge(histograms, image, mask, i, j, width, stride, pad_size, v_band_base, v_band_size, inc, dec);
+        row_fn(c_values, histograms, image, mask, i, width, stride, num_diffs, tvi_for_diff, vlt_luma, diff_weights, all_diffs, reciprocal_lut);
     }
     for (int i = height - pad_size; i < height; i++) {
         if (i - pad_size - 1 >= 0) {
             for (int j = 0; j < pad_size; j++) {
-                update_histogram_subtract_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, decrement_range);
+                update_histogram_subtract_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, dec);
             }
             for (int j = pad_size; j < width - pad_size - 1; j++) {
-                update_histogram_subtract(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, decrement_range);
+                update_histogram_subtract(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, dec);
             }
             for (int j = MAX(width - pad_size - 1, pad_size); j < width; j++) {
-                update_histogram_subtract_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, decrement_range);
+                update_histogram_subtract_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, v_band_base, v_band_size, dec);
             }
         }
-        calculate_c_values_row(c_values, histograms, image, mask, i, width, stride, num_diffs, tvi_for_diff, vlt_luma, diff_weights, all_diffs, reciprocal_lut);
+        row_fn(c_values, histograms, image, mask, i, width, stride, num_diffs, tvi_for_diff, vlt_luma, diff_weights, all_diffs, reciprocal_lut);
     }
 }
+
+void calculate_c_values(VmafPicture *pic, const VmafPicture *mask_pic,
+                               float *c_values, uint16_t *histograms, uint16_t window_size,
+                               const uint16_t num_diffs, const uint16_t *tvi_for_diff, uint16_t vlt_luma,
+                               const int *diff_weights, const int *all_diffs, int width, int height) {
+    c_values_pass(pic, mask_pic, c_values, histograms, window_size, num_diffs, tvi_for_diff, vlt_luma,
+                  diff_weights, all_diffs, width, height, calculate_c_values_row, increment_range,
+                  decrement_range);
+}
+
+#if ARCH_AARCH64
+static void calculate_c_values_neon(VmafPicture *pic, const VmafPicture *mask_pic,
+                                    float *c_values, uint16_t *histograms, uint16_t window_size,
+                                    const uint16_t num_diffs, const uint16_t *tvi_for_diff,
+                                    uint16_t vlt_luma, const int *diff_weights, const int *all_diffs,
+                                    int width, int height) {
+    c_values_pass(pic, mask_pic, c_values, histograms, window_size, num_diffs, tvi_for_diff, vlt_luma,
+                  diff_weights, all_diffs, width, height, calculate_c_values_row_neon,
+                  cambi_increment_range_neon, cambi_decrement_range_neon);
+}
+#endif
 
 static double average_topk_elements(const float *arr, int topk_elements) {
     double sum = 0;

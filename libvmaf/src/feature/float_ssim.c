@@ -36,6 +36,9 @@ typedef struct SsimState {
     bool clip_db;
     double max_db;
     int scale;
+    /* libvmaf-fast: compute_ssim_decimated's buffers, kept from frame to
+     * frame; NULL where the pictures are not decimated */
+    SsimWorkspace *ws;
 } SsimState;
 
 static const VmafOption options[] = {
@@ -72,6 +75,23 @@ static const VmafOption options[] = {
     { 0 }
 };
 
+/* The two float pictures compute_ssim takes, once. */
+static int full_size_buffers(SsimState *s, unsigned w, unsigned h)
+{
+    if (s->ref)
+        return 0;
+    s->float_stride = ALIGN_CEIL(w * sizeof(float));
+    s->ref = aligned_malloc(s->float_stride * h, 32);
+    if (!s->ref) return -ENOMEM;
+    s->dist = aligned_malloc(s->float_stride * h, 32);
+    if (!s->dist) {
+        aligned_free(s->ref);
+        s->ref = NULL;
+        return -ENOMEM;
+    }
+    return 0;
+}
+
 static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
                 unsigned bpc, unsigned w, unsigned h)
 {
@@ -87,18 +107,13 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
         s->max_db = INFINITY;
     }
 
-    s->float_stride = ALIGN_CEIL(w * sizeof(float));
-    s->ref = aligned_malloc(s->float_stride * h, 32);
-    if (!s->ref) goto fail;
-    s->dist = aligned_malloc(s->float_stride * h, 32);
-    if (!s->dist) goto free_ref;
-
-    return 0;
-
-free_ref:
-    free(s->ref);
-fail:
-    return -ENOMEM;
+    /* libvmaf-fast: decimated pictures need no full-size float copies */
+    const int scale = ssim_scale(w, h, s->scale);
+    if (scale > 1 && (bpc == 8 || bpc == 10 || bpc == 12 || bpc == 16)) {
+        s->ws = ssim_workspace_alloc(w, h, scale, bpc);
+        return s->ws ? 0 : -ENOMEM;
+    }
+    return full_size_buffers(s, w, h);
 }
 
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
@@ -122,10 +137,12 @@ static int extract(VmafFeatureExtractor *fex,
     double score, l_score, c_score, s_score;
     /* libvmaf-fast: decimated from the samples, the same score (ssim.c) */
     const int scale = ssim_scale(ref_pic->w[0], ref_pic->h[0], s->scale);
-    err = scale > 1 ? compute_ssim_decimated(ref_pic, dist_pic, scale, &score,
+    err = scale > 1 ? compute_ssim_decimated(ref_pic, dist_pic, scale, s->ws, &score,
                                              &l_score, &c_score, &s_score)
                     : -EINVAL;
     if (err == -EINVAL) {
+        err = full_size_buffers(s, ref_pic->w[0], ref_pic->h[0]);
+        if (err) return err;
         picture_copy(s->ref, s->float_stride, ref_pic, 0, ref_pic->bpc, 0);
         picture_copy(s->dist, s->float_stride, dist_pic, 0, dist_pic->bpc, 0);
         err = compute_ssim(s->ref, s->dist, ref_pic->w[0], ref_pic->h[0],
@@ -156,6 +173,7 @@ static int close(VmafFeatureExtractor *fex)
     SsimState *s = fex->priv;
     if (s->ref) aligned_free(s->ref);
     if (s->dist) aligned_free(s->dist);
+    ssim_workspace_free(s->ws);
     return 0;
 }
 

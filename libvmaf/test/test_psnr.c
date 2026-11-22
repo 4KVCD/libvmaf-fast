@@ -93,9 +93,42 @@ static char *test_16b_large_diff()
 }
 
 
+/* libvmaf-fast: the rows init picks (VMAFx's AVX2 ones where the CPU has
+ * AVX2) sum every width to the scalar rows' value, for random errors and the
+ * largest. */
+static char *test_rows_init_picks_are_the_scalar_rows()
+{
+    enum { N = 100 };
+    uint8_t r8[N], d8[N];
+    uint16_t r16[N], d16[N];
+    uint32_t state = 1;
+    vmaf_init_cpu();
+    PsnrState s = { 0 };
+    VmafFeatureExtractor fex = { .priv = &s };
+    mu_assert("init failed", !init(&fex, VMAF_PIX_FMT_YUV400P, 8, 64, 64));
+
+    for (int pass = 0; pass < 2; pass++) {
+        for (unsigned j = 0; j < N; j++) {
+            state = state * 1664525u + 1013904223u;
+            r8[j] = pass ? (j & 1) * 255 : (uint8_t) (state >> 24);
+            d8[j] = pass ? 255 - r8[j] : (uint8_t) (state >> 16);
+            r16[j] = pass ? (j & 1) * 65535 : (uint16_t) (state >> 16);
+            d16[j] = pass ? 65535 - r16[j] : (uint16_t) state;
+        }
+        for (unsigned w = 1; w <= N; w++) {
+            mu_assert("an 8-bit row is not the scalar row's",
+                      s.sse_line_8(r8, d8, w) == sse_line_8_c(r8, d8, w));
+            mu_assert("a 16-bit row is not the scalar row's",
+                      s.sse_line_16(r16, d16, w) == sse_line_16_c(r16, d16, w));
+        }
+    }
+    return NULL;
+}
+
 char *run_tests()
 {
     mu_run_test(test_16b_large_diff);
+    mu_run_test(test_rows_init_picks_are_the_scalar_rows);
 
     return NULL;
 }

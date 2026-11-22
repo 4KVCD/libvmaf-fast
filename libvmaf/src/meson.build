@@ -4,6 +4,8 @@ vmaf_soversion = vmaf_api_version_major
 feature_src_dir = './feature/'
 src_dir = './'
 model_dir = '../../model/'
+hdr_model_dir = '../../model/hdr_vmaf_v1.1.8/'
+hdr_hfr_model_dir = '../../model/hdr_vmaf_v1.1.8_hfr/'
 cuda_dir = './cuda/'
 
 vmaf_base_include = include_directories('./', './feature', './feature/common', '../include')
@@ -160,6 +162,22 @@ if built_in_models_enabled
             ]
         endif
 
+        # HDR default (3H, matching the SDR default's 3H convention), plus the
+        # 5H phone, 2160p and 1.5H 4K variants.
+        hdr_model_files = [
+            'hdr_vmaf_v1.1.8_3d0h.json',
+            'hdr_vmaf_v1.1.8_3d0h_2160.json',
+            'hdr_vmaf_v1.1.8_5d0h.json',
+            'hdr_vmaf_v1.1.8_1d5h_2160.json',
+        ]
+
+        hdr_hfr_model_files = [
+            'hdr_vmaf_v1.1.8_hfr_3d0h.json',
+            'hdr_vmaf_v1.1.8_hfr_3d0h_2160.json',
+            'hdr_vmaf_v1.1.8_hfr_5d0h.json',
+            'hdr_vmaf_v1.1.8_hfr_1d5h_2160.json',
+        ]
+
         foreach model_file : model_files
             if xdd_supports_n
                 command = [xxd, '-i', '-n', 'src_@PLAINNAME@', '@INPUT@', '@OUTPUT@']
@@ -228,6 +246,42 @@ if built_in_models_enabled
             )
         endforeach
 
+        foreach model_file : hdr_model_files
+            if xdd_supports_n
+                command = [xxd, '-i', '-n', 'src_@PLAINNAME@', '@INPUT@', '@OUTPUT@']
+            else
+                command = [xxd, '-i', '@INPUT@', '@OUTPUT@']
+            endif
+            json_model_c_sources += custom_target(
+                  model_file,
+                  output : '@PLAINNAME@.c',
+                  input : configure_file(
+                    input : hdr_model_dir + model_file,
+                    output : model_file,
+                    copy: true
+                  ),
+                  command : command,
+            )
+        endforeach
+
+        foreach model_file : hdr_hfr_model_files
+            if xdd_supports_n
+                command = [xxd, '-i', '-n', 'src_@PLAINNAME@', '@INPUT@', '@OUTPUT@']
+            else
+                command = [xxd, '-i', '@INPUT@', '@OUTPUT@']
+            endif
+            json_model_c_sources += custom_target(
+                  model_file,
+                  output : '@PLAINNAME@.c',
+                  input : configure_file(
+                    input : hdr_hfr_model_dir + model_file,
+                    output : model_file,
+                    copy: true
+                  ),
+                  command : command,
+            )
+        endforeach
+
         cdata.set10('VMAF_BUILT_IN_MODELS', built_in_models_enabled)
     endif
 endif
@@ -284,6 +338,12 @@ if is_asm_enabled
           feature_src_dir + 'arm64/adm_neon.c',
           feature_src_dir + 'arm64/motion_neon.c',
           feature_src_dir + 'arm64/speed_neon.c',
+          feature_src_dir + 'arm64/psnr_neon.c',
+          feature_src_dir + 'arm64/convolve_neon.c',
+          feature_src_dir + 'arm64/ssim_neon.c',
+          feature_src_dir + 'arm64/ssim_decimate_neon.c',
+          feature_src_dir + 'arm64/xpsnr_any_neon.c',
+          feature_src_dir + 'arm64/cambi_neon.c',
         ]
 
           arm64_static_lib = static_library(
@@ -304,12 +364,20 @@ if is_asm_enabled
           feature_src_dir + 'x86/adm_avx2.c',
           feature_src_dir + 'x86/cambi_avx2.c',
           feature_src_dir + 'x86/speed_avx2.c',
+          feature_src_dir + 'x86/convolve_avx2.c',
+          feature_src_dir + 'x86/ssim_avx2.c',
+          feature_src_dir + 'x86/ssim_decimate_avx2.c',
+          feature_src_dir + 'x86/xpsnr_any_avx2.c',
+          feature_src_dir + 'x86/psnr_avx2.c',
       ]
 
       if cc.get_id() == 'msvc'
           avx2_cflags = ['/arch:AVX2']
       else
-          avx2_cflags = ['-mavx2', '-mavx', '-mfma']
+          # -ffp-contract=off: with -mfma, GCC and clang may fuse a multiply
+          # and an add (intrinsics too) into one FMA, which rounds once and
+          # would change the SSIM code's exact results
+          avx2_cflags = ['-mavx2', '-mavx', '-mfma', '-ffp-contract=off']
       endif
       x86_avx2_static_lib = static_library(
           'x86_avx2',
@@ -611,6 +679,7 @@ libvmaf_sources = [
     src_dir + 'framesync.c',
     src_dir + 'metadata_handler.c',
     src_dir + 'picture_pool.c',
+    src_dir + 'conversion_policy.c',
 ]
 
 if is_cuda_enabled

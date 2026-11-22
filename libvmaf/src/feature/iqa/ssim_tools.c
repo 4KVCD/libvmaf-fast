@@ -42,6 +42,22 @@
 #include "iqa.h"
 #include "convolve.h"
 #include "ssim_tools.h"
+#include "cpu.h"
+/* libvmaf-fast: the SIMD copies of the three loops of floats of
+ * _iqa_ssim_ws, AVX2 (VMAFx's, x86/ssim_avx2.c) or NEON (arm64/ssim_neon.c) */
+#if ARCH_X86
+#include "../x86/ssim_avx2.h"
+#define SSIM_SIMD_FLAG VMAF_X86_CPU_FLAG_AVX2
+#define ssim_precompute_simd ssim_precompute_avx2
+#define ssim_variance_simd ssim_variance_avx2
+#define ssim_accumulate_simd ssim_accumulate_avx2
+#elif ARCH_AARCH64
+#include "../arm64/ssim_neon.h"
+#define SSIM_SIMD_FLAG VMAF_ARM_CPU_FLAG_NEON
+#define ssim_precompute_simd ssim_precompute_neon
+#define ssim_variance_simd ssim_variance_neon
+#define ssim_accumulate_simd ssim_accumulate_neon
+#endif
 
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
@@ -101,6 +117,13 @@ float _iqa_ssim(float *ref, float *cmp, int w, int h, const struct _kernel *k,
 		, float *l_mean, float *c_mean, float *s_mean /* zli-nflx */
 		)
 {
+    return _iqa_ssim_ws(ref, cmp, w, h, k, mr, args, l_mean, c_mean, s_mean, NULL);
+}
+
+float _iqa_ssim_ws(float *ref, float *cmp, int w, int h, const struct _kernel *k,
+                   const struct _map_reduce *mr, const struct iqa_ssim_args *args,
+                   float *l_mean, float *c_mean, float *s_mean, float *workspace)
+{
     float alpha=1.0f, beta=1.0f, gamma=1.0f;
     int L=255;
     float K1=0.01f, K2=0.03f;
@@ -131,11 +154,24 @@ float _iqa_ssim(float *ref, float *cmp, int w, int h, const struct _kernel *k,
     C2 = (K2*L)*(K2*L);
     C3 = C2 / 2.0f;
 
-    ref_mu = (float*)malloc(w*h*sizeof(float));
-    cmp_mu = (float*)malloc(w*h*sizeof(float));
-    ref_sigma_sqd = (float*)malloc(w*h*sizeof(float));
-    cmp_sigma_sqd = (float*)malloc(w*h*sizeof(float));
-    sigma_both = (float*)malloc(w*h*sizeof(float));
+    /* libvmaf-fast: the buffers (and the convolutions' cache) from the
+     * caller's workspace, which it keeps from frame to frame */
+    float *conv_cache = NULL;
+    if (workspace) {
+        const size_t n = (size_t)w * h;
+        ref_mu = workspace;
+        cmp_mu = workspace + n;
+        ref_sigma_sqd = workspace + 2 * n;
+        cmp_sigma_sqd = workspace + 3 * n;
+        sigma_both = workspace + 4 * n;
+        conv_cache = workspace + 5 * n;
+    } else {
+        ref_mu = (float*)malloc(w*h*sizeof(float));
+        cmp_mu = (float*)malloc(w*h*sizeof(float));
+        ref_sigma_sqd = (float*)malloc(w*h*sizeof(float));
+        cmp_sigma_sqd = (float*)malloc(w*h*sizeof(float));
+        sigma_both = (float*)malloc(w*h*sizeof(float));
+    }
     if (!ref_mu || !cmp_mu || !ref_sigma_sqd || !cmp_sigma_sqd || !sigma_both) {
         if (ref_mu) free(ref_mu);
         if (cmp_mu) free(cmp_mu);
@@ -146,9 +182,17 @@ float _iqa_ssim(float *ref, float *cmp, int w, int h, const struct _kernel *k,
     }
 
     /* Calculate mean */
-    _iqa_convolve(ref, w, h, k, ref_mu, 0, 0);
-    _iqa_convolve(cmp, w, h, k, cmp_mu, 0, 0);
+    _iqa_convolve_ws(ref, w, h, k, ref_mu, 0, 0, conv_cache);
+    _iqa_convolve_ws(cmp, w, h, k, cmp_mu, 0, 0, conv_cache);
 
+    /* libvmaf-fast: the SIMD copies of the three loops of floats below,
+     * each pixel's arithmetic the scalar code's. */
+#ifdef SSIM_SIMD_FLAG
+    const int simd = !!(vmaf_get_cpu_flags() & SSIM_SIMD_FLAG);
+    if (simd)
+        ssim_precompute_simd(ref, cmp, ref_sigma_sqd, cmp_sigma_sqd, sigma_both, w*h);
+    else
+#endif
     for (y=0; y<h; ++y) {
         offset = y*w;
         for (x=0; x<w; ++x, ++offset) {
@@ -159,11 +203,20 @@ float _iqa_ssim(float *ref, float *cmp, int w, int h, const struct _kernel *k,
     }
 
     /* Calculate sigma */
-    _iqa_convolve(ref_sigma_sqd, w, h, k, 0,  0,  0);
-    _iqa_convolve(cmp_sigma_sqd, w, h, k, 0,  0,  0);
-    _iqa_convolve(sigma_both,    w, h, k, 0, &w, &h); /* Update the width and height */
+    _iqa_convolve_ws(ref_sigma_sqd, w, h, k, 0,  0,  0, conv_cache);
+    _iqa_convolve_ws(cmp_sigma_sqd, w, h, k, 0,  0,  0, conv_cache);
+    _iqa_convolve_ws(sigma_both,    w, h, k, 0, &w, &h, conv_cache); /* Update the width and height */
 
     /* The convolution results are smaller by the kernel width and height */
+#ifdef SSIM_SIMD_FLAG
+    /* libvmaf-fast: the pixels the loops below visit: none where the
+     * picture is smaller than the window both ways, w and h both negative
+     * (w*h is not) */
+    const int pixels = w > 0 && h > 0 ? w * h : 0;
+    if (simd)
+        ssim_variance_simd(ref_sigma_sqd, cmp_sigma_sqd, sigma_both, ref_mu, cmp_mu, pixels);
+    else
+#endif
     for (y=0; y<h; ++y) {
         offset = y*w;
         for (x=0; x<w; ++x, ++offset) {
@@ -181,6 +234,14 @@ float _iqa_ssim(float *ref, float *cmp, int w, int h, const struct _kernel *k,
     l_sum = 0.0; /* zli-nflx */
     c_sum = 0.0; /* zli-nflx */
     s_sum = 0.0; /* zli-nflx */
+#ifdef SSIM_SIMD_FLAG
+    /* Over all the pixels in one call, so its four sums are added up in the
+     * order of the loop below. */
+    if (simd && !args)
+        ssim_accumulate_simd(ref_mu, cmp_mu, ref_sigma_sqd, cmp_sigma_sqd, sigma_both, pixels,
+                             C1, C2, C3, &ssim_sum, &l_sum, &c_sum, &s_sum);
+    else
+#endif
     for (y=0; y<h; ++y) {
         offset = y*w;
         for (x=0; x<w; ++x, ++offset) {
@@ -235,11 +296,13 @@ float _iqa_ssim(float *ref, float *cmp, int w, int h, const struct _kernel *k,
         }
     }
 
-    free(ref_mu);
-    free(cmp_mu);
-    free(ref_sigma_sqd);
-    free(cmp_sigma_sqd);
-    free(sigma_both);
+    if (!workspace) {
+        free(ref_mu);
+        free(cmp_mu);
+        free(ref_sigma_sqd);
+        free(cmp_sigma_sqd);
+        free(sigma_both);
+    }
 
     if (!args) {
     	*l_mean = (float)(l_sum / (double)(w*h)); /* zli-nflx */

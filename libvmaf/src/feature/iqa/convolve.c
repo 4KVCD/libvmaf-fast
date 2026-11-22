@@ -37,6 +37,12 @@
 #include <assert.h>
 #include "convolve.h"
 #include "iqa_options.h"
+#include "cpu.h"
+#if ARCH_X86
+#include "../x86/convolve_avx2.h"
+#elif ARCH_AARCH64
+#include "../arm64/convolve_neon.h"
+#endif
 
 float KBND_SYMMETRIC(const float *img, int w, int h, int x, int y, float bnd_const)
 {
@@ -89,8 +95,33 @@ static float _calc_scale(const struct _kernel *k)
 
 void _iqa_convolve(float *img, int w, int h, const struct _kernel *k, float *result, int *rw, int *rh)
 {
+    _iqa_convolve_ws(img, w, h, k, result, rw, rh, NULL);
+}
+
+void _iqa_convolve_ws(float *img, int w, int h, const struct _kernel *k, float *result,
+                      int *rw, int *rh, float *cache)
+{
 
 #ifdef IQA_CONVOLVE_1D
+
+#if ARCH_X86
+    /* libvmaf-fast: VMAFx's AVX2 copy of the 1D filter below
+     * (x86/convolve_avx2.c): the same float products added in double in the
+     * same order, so the same result. It needs scale 1 (a normalized
+     * kernel) and both 1D kernels, as every SSIM window here has. */
+    if ((vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2) && k->normalized &&
+        k->kernel_h && k->kernel_v) {
+        iqa_convolve_avx2(img, w, h, k->kernel_h, k->kernel_v, k->w, k->h, 1, cache, result, rw, rh);
+        return;
+    }
+#elif ARCH_AARCH64
+    /* the same with NEON (arm64/convolve_neon.c) */
+    if ((vmaf_get_cpu_flags() & VMAF_ARM_CPU_FLAG_NEON) && k->normalized &&
+        k->kernel_h && k->kernel_v) {
+        iqa_convolve_neon(img, w, h, k->kernel_h, k->kernel_v, k->w, k->h, cache, result, rw, rh);
+        return;
+    }
+#endif
 
     /* use 1D separable filter */
 
@@ -110,8 +141,8 @@ void _iqa_convolve(float *img, int w, int h, const struct _kernel *k, float *res
      * in the image */
     scale = _calc_scale(k);
 
-    /* create cache */
-    img_cache = (float *)calloc(w*h, sizeof(float));
+    /* create cache (libvmaf-fast: or the caller's) */
+    img_cache = cache ? cache : (float *)calloc(w*h, sizeof(float));
     if (!img_cache)
         assert(0);
 
@@ -150,9 +181,12 @@ void _iqa_convolve(float *img, int w, int h, const struct _kernel *k, float *res
     }
 
     /* free cache */
-    free(img_cache);
+    if (img_cache != cache)
+        free(img_cache);
 
 #else /* use 2D filter */
+
+    (void) cache;
 
     int x,y,kx,ky,u,v;
     int uc = k->w/2;

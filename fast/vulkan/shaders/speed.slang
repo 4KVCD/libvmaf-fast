@@ -37,6 +37,23 @@ int mirror(int i, int n) { return i < 0 ? -i : (i >= n ? 2 * n - i - 2 : i); }
 [[vk::binding(4, 0)]] Texture2D<uint2> disChroma;
 #else
 [[vk::binding(0, 0)]] StructuredBuffer<uint> chroma;
+#if SPLIT
+// The shared buffers in split mode (vv_export_part): the reference's two
+// planes in chroma, the distorted's two in disChroma, laid out alike.
+[[vk::binding(4, 0)]] StructuredBuffer<uint> disChroma;
+#endif
+#endif
+
+#if !FROM_IMAGE
+// Word `index` of plane `plane`'s chroma, counted from the plane's buffer's start.
+uint chroma_word(uint plane, uint index)
+{
+#if SPLIT
+    return plane < 2 ? chroma[index] : disChroma[index];
+#else
+    return chroma[index];
+#endif
+}
 #endif
 [[vk::binding(1, 0)]] StructuredBuffer<float> filters;
 [[vk::binding(2, 0)]] RWStructuredBuffer<float> operating;
@@ -54,12 +71,16 @@ float sample(uint plane, int x, int y)
     const uint2 both = plane < 2 ? refChroma.Load(at) : disChroma.Load(at);
     const uint v = ((plane & 1) == 0 ? both.x : both.y) >> (pc[7] > 8 ? 6u : 0u);
 #else
+#if SPLIT
+    const uint base = (plane & 1) * pc[3] + uint(y) * pc[2];  // each video's U, then V
+#else
     const uint base = plane * pc[3] + uint(y) * pc[2];
+#endif
     uint v;
     if (pc[7] > 8) {
-        v = (chroma[base + uint(x >> 1)] >> ((x & 1) * 16)) & 0xFFFFu;
+        v = (chroma_word(plane, base + uint(x >> 1)) >> ((x & 1) * 16)) & 0xFFFFu;
     } else {
-        v = (chroma[base + uint(x >> 2)] >> ((x & 3) * 8)) & 0xFFu;
+        v = (chroma_word(plane, base + uint(x >> 2)) >> ((x & 3) * 8)) & 0xFFu;
     }
 #endif
     precise float scaled = float(v) * asfloat(pc[8]);  // exact: v / 2^k

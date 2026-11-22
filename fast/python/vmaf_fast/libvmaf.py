@@ -30,10 +30,11 @@ class _Configuration(ctypes.Structure):
 class _Picture(ctypes.Structure):
     _fields_ = [("pix_fmt", ctypes.c_int), ("bpc", ctypes.c_uint), ("w", ctypes.c_uint * 3),
                 ("h", ctypes.c_uint * 3), ("stride", ctypes.c_ssize_t * 3), ("data", ctypes.c_void_p * 3),
-                # VmafColor (range, primaries, transfer, matrix), in the structure since upstream
-                # 0497a0f2 (vmaf_picture_convert). Without it libvmaf writes behind the picture.
-                ("color", ctypes.c_int * 4),
-                ("ref", ctypes.c_void_p), ("priv", ctypes.c_void_p)]
+                ("ref", ctypes.c_void_p), ("priv", ctypes.c_void_p),
+                # VmafColor (range, primaries, transfer, matrix): in the structure since upstream
+                # 0497a0f2 (vmaf_picture_convert), at its end since 0b946287. Without it libvmaf
+                # writes behind the picture.
+                ("color", ctypes.c_int * 4)]
 
 
 class _PictureParameters(ctypes.Structure):

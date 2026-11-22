@@ -171,6 +171,11 @@ test_barten_csf = executable('test_barten_csf',
     dependencies : math_lib,
 )
 
+test_conversion_policy = executable('test_conversion_policy',
+    ['test.c', 'test_conversion_policy.c', '../src/conversion_policy.c', '../src/log.c'],
+    include_directories : [libvmaf_inc, test_inc, include_directories('../src/')],
+)
+
 test_motion_blend = executable('test_motion_blend',
     ['test.c', 'test_motion_blend.c'],
     include_directories : [libvmaf_inc, test_inc, include_directories('../src/')],
@@ -304,6 +309,14 @@ test_pic_preallocation = executable('test_pic_preallocation',
 )
 test('test_pic_preallocation', test_pic_preallocation)
 
+test_picture_wrap_integration = executable('test_picture_wrap_integration',
+    ['test.c', 'test_picture_wrap_integration.c'],
+    include_directories : [libvmaf_inc, test_inc, include_directories('../src/')],
+    link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
+    dependencies: cuda_dependency,
+)
+test('test_picture_wrap_integration', test_picture_wrap_integration)
+
 test('test_picture', test_picture)
 test('test_feature_collector', test_feature_collector)
 test('test_thread_pool', test_thread_pool)
@@ -326,6 +339,7 @@ test('test_propagate_metadata', test_propagate_metadata)
 test('test_adm_csf', test_adm_csf)
 test('test_barten_csf', test_barten_csf)
 test('test_motion_blend', test_motion_blend)
+test('test_conversion_policy', test_conversion_policy)
 
 if is_asm_enabled and (host_machine.cpu_family().startswith('arm64') or host_machine.cpu_family().startswith('aarch64'))
     test_motion_neon = executable('test_motion_neon',
@@ -361,3 +375,15 @@ test_colorspace = executable('test_colorspace',
 
 test('test_colorspace', test_colorspace)
 endif
+
+test_read_pictures_convert_args = ['-DJSON_MODEL_PATH="'+join_paths(meson.project_source_root(), '../model/')+'"']
+if get_option('enable_zimg')
+    test_read_pictures_convert_args += ['-DHAVE_ZIMG=1']
+endif
+test_read_pictures_convert = executable('test_read_pictures_convert',
+    ['test.c', 'test_read_pictures_convert.c'],
+    include_directories : [libvmaf_inc, test_inc],
+    c_args : test_read_pictures_convert_args,
+    link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
+)
+test('test_read_pictures_convert', test_read_pictures_convert)

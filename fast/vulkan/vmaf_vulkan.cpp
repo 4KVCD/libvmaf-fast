@@ -581,6 +581,9 @@ struct Slot {
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool busy = false;
+    // Committed, but not yet submitted by the submit thread (vv_context::
+    // submitter): its fence cannot signal before. Under submitMutex.
+    bool queued = false;
     bool scored = false;
     unsigned index = 0;
 };
@@ -597,7 +600,8 @@ const int kDcmTile[2] = { 16, 8 };
 struct V1Options {
     double viewDistance = 3.0;   // adm_norm_view_dist
     int displayHeight = 1080;    // adm_ref_display_height
-    int csfMode = 0;             // adm_csf_mode: 0 Watson97, 2 Barten-Watson blend
+    int csfMode = 0;             // adm_csf_mode: 0 Watson97, 2 Barten-Watson blend, 3 its MAE fit
+    bool skipScale0 = false;     // adm_skip_scale0: scale 0 only downsamples (HDR VMAF)
     double noiseWeight = 0.03125;
     double dlmWeight = 1.0;
     double minValue = 0.0;       // adm_min_val
@@ -798,16 +802,49 @@ struct vv_context {
     // in place of host memory. Vulkan imports them only on the same GPU and
     // driver (vv_shared_device).
     bool shared = false;
+    // Flag bit 3, with shared: each slot's planes in two such buffers, the
+    // reference's (staging) and the distorted's (stagingDis), for two
+    // decoders that each import one (vv_export_part). A driver may import an
+    // allocation only once a process: NVIDIA's on Windows refused a second
+    // import of one, by CUDA or by another Vulkan device alike.
+    bool split = false;
     PFN_vkGetMemoryWin32HandleKHR getMemoryHandle = nullptr;
     // A decoder's timeline semaphore (vv_import_timeline): its GPU copies into
-    // the slots signal it, and a frame's submission waits for the value of its
-    // own (vv_commit_after), so that the decoder need not wait for its copies.
+    // the slots signal it, and a frame is submitted once the value of its own
+    // (vv_commit_after) is reached, so that neither the decoder nor the
+    // caller waits for the copies.
     bool timelines = false;  // the device takes timeline semaphores from other APIs
     VkSemaphore copied = VK_NULL_HANDLE;
     uint64_t copiedValue = 0;  // the next commit's, 0: none
     PFN_vkImportSemaphoreWin32HandleKHR importSemaphore = nullptr;
     PFN_vkCreateSemaphore createSemaphore = nullptr;
     PFN_vkDestroySemaphore destroySemaphore = nullptr;
+    PFN_vkWaitSemaphores waitSemaphores = nullptr;
+    // The submit thread, started by vv_import_timeline: it takes every
+    // committed frame in order, waits on the CPU (asleep) until the decoder's
+    // copies of it are done, then submits it. Not a submission that waits on
+    // the GPU: NVIDIA's driver (616.92, RTX 5090) services a GPU wait on a
+    // semaphore of another device with a thread of its own that polls the
+    // clock, one per waiting device (1080p VMAF, NEG and v1 of a minute: the
+    // run's CPU time 18.5 s with the GPU waiting, 13.3 s waited here, same
+    // wall time).
+    struct Submission {
+        size_t slot;
+        uint64_t after;  // the timeline value to wait for, 0: none
+    };
+    std::thread submitter;
+    std::mutex submitMutex;  // the members below and the slots' `queued`
+    std::condition_variable submitWork, submitDone;
+    std::deque<Submission> submissions;
+    bool submitStop = false;
+    std::string submitError;  // the thread's failure, reported on the caller's thread
+    // The queue is used from two threads once the submit thread runs:
+    // vkQueueSubmit and vkDeviceWaitIdle hold this.
+    std::mutex queueMutex;
+    void submit_thread();
+    VkResult submit_frame(Slot &slot, uint64_t after);
+    bool queued(const Slot &slot);
+    VkResult run_now(VkCommandBuffer commands);
     uint8_t deviceUuid[VK_UUID_SIZE] = {}, driverUuid[VK_UUID_SIZE] = {};
     // Or a decoder on this GPU writes them into Direct3D 11 textures, which
     // the context imports (vv_import_texture) and copies from on the GPU
@@ -957,13 +994,19 @@ struct vv_context {
                      HANDLE distorted, uint32_t distortedW, uint32_t distortedH, int distortedX, int distortedY);
     void picture_descriptors(VkDescriptorSet set, const Pass &pass, const Slot &slot);
     void picture_barriers(VkCommandBuffer cb, const Slot &slot, bool acquire);
-    uint32_t disOffset = 0;  // the distorted plane's place in a slot's staging buffer
+    // The distorted plane's place in a slot's staging buffer (in split mode,
+    // in stagingDis: 0).
+    uint32_t disOffset = 0;
     // VMAF v1 with a decoder's frames: the four chroma planes in a slot's
     // staging buffer too (ref U, ref V, dis U, dis V), from sharedChroma, each
-    // sharedChromaSpacing bytes after the one before (vv_shared_chroma).
+    // sharedChromaSpacing bytes after the one before (vv_shared_chroma). In
+    // split mode, the reference's two there and the distorted's two at the
+    // same place in stagingDis.
     uint32_t sharedChroma = 0, sharedChromaSpacing = 0;
+    // The buffer that holds a slot's distorted plane, at disOffset.
+    Buffer &dis_buffer(Slot &slot) { return split ? slot.stagingDis : slot.staging; }
     Bound slot_ref(Slot &slot) { return Bound(&slot.staging, 0, planeBytes); }
-    Bound slot_dis(Slot &slot) { return Bound(&slot.staging, disOffset, planeBytes); }
+    Bound slot_dis(Slot &slot) { return Bound(&dis_buffer(slot), disOffset, planeBytes); }
     int upload(Buffer &target, const void *data, size_t bytes);
     int build_passes();
     int submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *dis, ptrdiff_t disStride, bool score);
@@ -1017,6 +1060,17 @@ vv_context::~vv_context()
         copyStart.notify_all();
         for (std::thread &thread : copiers)
             thread.join();
+    }
+    if (submitter.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(submitMutex);
+            submitStop = true;
+        }
+        submitWork.notify_all();
+        submitter.join();  // a wait for the decoder ends within its 100 ms
+        for (const Submission &dropped : submissions)  // (a run stopped early): never submitted
+            slots[dropped.slot].busy = slots[dropped.slot].queued = false;
+        submissions.clear();
     }
     if (!device)
         return;
@@ -1309,7 +1363,8 @@ int vv_context::make_layouts(int shader, uint32_t bindings)
     // vv_pictures' shaders: the pictures' textures (the bindings in `images`).
     uint32_t images = 0;
     if (shader == kShader_motion_v1_8_img || shader == kShader_motion_v1_16_img || shader == kShader_adm_fused_0_8_img
-        || shader == kShader_adm_fused_0_16_img)
+        || shader == kShader_adm_fused_0_16_img || shader == kShader_adm_fused_0_8_img_skip
+        || shader == kShader_adm_fused_0_16_img_skip)
         images = 3;
     if (shader == kShader_cambi_front_8_img || shader == kShader_cambi_front_16_img
         || shader == kShader_cambi_front_8_1_img || shader == kShader_cambi_front_16_1_img)
@@ -1462,7 +1517,7 @@ int vv_context::add_pass(std::vector<Pass> &list, int shader, std::initializer_l
             if (entry.buffer == &picRef)
                 slotBound.push_back(Bound(&slots[i].staging));
             else if (entry.buffer == &picDis)
-                slotBound.push_back(shared ? Bound(&slots[i].staging, disOffset, VK_WHOLE_SIZE)
+                slotBound.push_back(shared ? Bound(&dis_buffer(slots[i]), disOffset, VK_WHOLE_SIZE)
                                            : Bound(&slots[i].stagingDis));
             else
                 slotBound.push_back(entry);
@@ -1566,12 +1621,7 @@ int vv_context::upload(Buffer &target, const void *data, size_t bytes)
     VkBufferCopy region = { 0, 0, bytes };
     vk.vkCmdCopyBuffer(commands, staging.buffer, target.buffer, 1, &region);
     vk.vkEndCommandBuffer(commands);
-    VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &commands;
-    VkResult result = vk.vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
-    if (result == VK_SUCCESS)
-        result = vk.vkDeviceWaitIdle(device);
+    const VkResult result = run_now(commands);
     destroy_last_buffer(staging);
     return result == VK_SUCCESS ? 0 : fail(-1, "uploading a table to the GPU failed");
 }
@@ -1850,33 +1900,16 @@ int vv_context::build_passes()
 
 namespace {
 
-// barten_watson_blend_csf() of libvmaf's barten_csf_tools.h: [theta][scale].
-const float BLENDED_CSF_1080_3H[2][4] = { { 0.01183, 0.025026, 0.04295, 0.058621 },
-                                          { 0.004302, 0.011778, 0.023918, 0.035901 } };
-const float BLENDED_CSF_1080_5H[2][4] = { { 0.004212, 0.014809, 0.029642, 0.047464 },
-                                          { 0.000984, 0.005852, 0.0146, 0.027574 } };
-const float BLENDED_CSF_2160_3H[2][4] = { { 0.00226, 0.01183, 0.025026, 0.04295 },
-                                          { 0.000479, 0.004302, 0.011778, 0.023918 } };
-const float BLENDED_CSF_2160_5H[2][4] = { { 0.000092, 0.004212, 0.014809, 0.029642 },
-                                          { 0.000050, 0.000984, 0.005852, 0.0146 } };
-
 // The contrast sensitivity factors of a scale ({h, v, d}) as libvmaf's CPU
-// code takes them (adm_csf and the others of integer_adm.c). False when the
-// options are ones it has no table for.
+// code takes them (adm_csf and the others of integer_adm.c): Watson97's
+// (mode 0), or the Barten-Watson blends' tables (modes 2 and 3, libvmaf's
+// own: v1_host.c). False when the options are ones it has no table for.
 bool v1_rfactors(const V1Options &o, int scale, float rfactor[3])
 {
     float factor1, factor2;
-    if (o.csfMode == 2) {
-        const float (*table)[4] =
-            (o.displayHeight == 1080 && o.viewDistance == 3.0) ? BLENDED_CSF_1080_3H :
-            (o.displayHeight == 1080 && o.viewDistance == 5.0) ? BLENDED_CSF_1080_5H :
-            (o.displayHeight == 2160 && o.viewDistance == 1.5) ? BLENDED_CSF_1080_3H :
-            (o.displayHeight == 2160 && o.viewDistance == 3.0) ? BLENDED_CSF_2160_3H :
-            (o.displayHeight == 2160 && o.viewDistance == 5.0) ? BLENDED_CSF_2160_5H : nullptr;
-        if (!table)
+    if (o.csfMode == 2 || o.csfMode == 3) {
+        if (v1_adm_blend_factors(o.csfMode, scale, o.viewDistance, o.displayHeight, &factor1, &factor2))
             return false;
-        factor1 = table[0][scale];
-        factor2 = table[1][scale];
     } else if (o.csfMode == 0) {
         factor1 = 1.0f / dwt_quant_step(&dwt_7_9_YCbCr_threshold[0], scale, 1, o.viewDistance, o.displayHeight);
         factor2 = 1.0f / dwt_quant_step(&dwt_7_9_YCbCr_threshold[0], scale, 2, o.viewDistance, o.displayHeight);
@@ -2083,9 +2116,13 @@ int vv_context::build_passes_v1()
             const int rows = std::max(0, p[43] - p[42]);
             const uint32_t chunks = groups(std::max(0, colEnd - colStart), kAdmOwnColumns);
             const uint32_t constants[] = { (uint32_t)(scale * kAdmParams), chunks };
+            // adm_skip_scale0: scale 0 only transformed for scale 1, nothing summed (no ROWSUM).
+            const bool skip = scale == 0 && options.skipScale0;
             if (scale == 0 && pictures) {
                 uint32_t pushed[kPushBytes / 4] = { constants[0], constants[1] };
-                error = add_pass(scored, deep ? kShader_adm_fused_0_16_img : kShader_adm_fused_0_8_img,
+                const int shader = skip ? (deep ? kShader_adm_fused_0_16_img_skip : kShader_adm_fused_0_8_img_skip)
+                                        : (deep ? kShader_adm_fused_0_16_img : kShader_adm_fused_0_8_img);
+                error = add_pass(scored, shader,
                                  { kPictureBinding, kPictureBinding, &divTable, &admParams, &acc, &bandsRef[1],
                                    &bandsDis[1], &admPartial },
                                  pushed, kPushBytes, chunks, groups(rows, kAdmBandRows));
@@ -2098,7 +2135,9 @@ int vv_context::build_passes_v1()
                 if (!error)
                     scored.back().pictureRole = kPictureAdm;
             } else if (scale == 0) {
-                error = add_pass(scored, deep ? kShader_adm_fused_0_16 : kShader_adm_fused_0_8,
+                const int shader = skip ? (deep ? kShader_adm_fused_0_16_skip : kShader_adm_fused_0_8_skip)
+                                        : (deep ? kShader_adm_fused_0_16 : kShader_adm_fused_0_8);
+                error = add_pass(scored, shader,
                                  { inRef, inDis, &divTable, &admParams, &acc, &bandsRef[1], &bandsDis[1], &admPartial },
                                  constants, sizeof constants, chunks, groups(rows, kAdmBandRows));
                 if (!error && direct)
@@ -2115,7 +2154,7 @@ int vv_context::build_passes_v1()
                                         &acc, &admPartial }, constants, sizeof constants, chunks,
                                         groups(rows, kAdmBandRowsSmall));
             }
-            if (!error)
+            if (!error && !skip)
                 error = add_pass(scored, kShader_adm_rowsum, { &bandsRef[set], &bandsDis[set], &divTable, &admParams, &acc,
                                  &admPartial }, constants, sizeof constants, groups(rows * 9, 256), 1);
         }
@@ -2203,9 +2242,17 @@ void v1_adm(const vv_context &context, const uint64_t *slots, double out[3])
         h = (h + 1) / 2;
         const int64_t *cm = (const int64_t *)&slots[kSlotCm + scale * 3];
         const int64_t *aim = (const int64_t *)&slots[kSlotCm + kScales * 3 + scale * 3];
-        float den_scale = v1_csf_den(&slots[kSlotCsfDen + scale * 3], w, h, scale, context.rfactorV1[scale], o.noiseWeight);
-        float num_scale = v1_cm(cm, w, h, scale, o.noiseWeight);
-        float aim_num_scale = v1_cm(aim, w, h, scale, 0.0);
+        float den_scale, num_scale, aim_num_scale;
+        if (scale == 0 && o.skipScale0) {  // as libvmaf: no measure at scale 0, a denominator above 0
+            den_scale = 1e-10f;
+            num_scale = 0.0f;
+            aim_num_scale = 0.0f;
+        } else {
+            den_scale = v1_csf_den(&slots[kSlotCsfDen + scale * 3], w, h, scale, context.rfactorV1[scale],
+                                   o.noiseWeight);
+            num_scale = v1_cm(cm, w, h, scale, o.noiseWeight);
+            aim_num_scale = v1_cm(aim, w, h, scale, 0.0);
+        }
         num += num_scale;
         den += den_scale;
         aim_num += aim_num_scale;
@@ -2310,10 +2357,11 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     if (narrowSubgroup) {
         for (int shader : { kShader_cambi_cvalues_slide_16, kShader_cambi_cvalues_slide, kShader_adm_fused_0_8,
                             kShader_adm_fused_0_16, kShader_adm_fused, kShader_adm_fused_0_8_img,
-                            kShader_adm_fused_0_16_img })
+                            kShader_adm_fused_0_16_img, kShader_adm_fused_0_8_skip, kShader_adm_fused_0_16_skip,
+                            kShader_adm_fused_0_8_img_skip, kShader_adm_fused_0_16_img_skip })
             subgroupSizes[shader] = narrowSubgroup;
     }
-    // A decoder's copies waited for on the GPU (vv_import_timeline,
+    // A decoder's copies waited for by the context (vv_import_timeline,
     // vv_commit_after), where the driver has timeline semaphores it can share;
     // else the decoder waits for its copies itself.
     if (shared && has(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) && has(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME)
@@ -2546,7 +2594,8 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
                                                                                         "vkImportSemaphoreWin32HandleKHR");
         createSemaphore = (PFN_vkCreateSemaphore)api->vkGetDeviceProcAddr(device, "vkCreateSemaphore");
         destroySemaphore = (PFN_vkDestroySemaphore)api->vkGetDeviceProcAddr(device, "vkDestroySemaphore");
-        timelines = importSemaphore && createSemaphore && destroySemaphore;
+        waitSemaphores = (PFN_vkWaitSemaphores)api->vkGetDeviceProcAddr(device, "vkWaitSemaphores");
+        timelines = importSemaphore && createSemaphore && destroySemaphore && waitSemaphores;
     }
     vk.vkGetDeviceQueue(device, queueFamily, 0, &queue);
     if (shared) {
@@ -2560,6 +2609,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // The pictures from a decoder's textures: VMAF v1 at 8 or 10 bits (NV12,
     // P010), motion against the frame before (not the five-frame window).
     pictures = pictures && v1 && (bpc == 8 || bpc == 10) && !options.fiveFrameWindow && memoryHandleProperties;
+    split = shared && !pictures && (flags >> 3) & 1;  // the pictures need no planes in the slots
 
     VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -2585,14 +2635,16 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // both planes: a multiple of 256, which any storage buffer offset
     // alignment divides (the passes bind the plane there when they read it in
     // place).
-    disOffset = (planeBytes + 255) & ~255u;
+    // In split mode each of a slot's two buffers holds one video's planes,
+    // laid out alike: the luma at 0, then its chroma.
+    disOffset = split ? 0 : (planeBytes + 255) & ~255u;
     const bool apart = direct && !shared;  // VMAF v0.6.1's distorted plane in stagingDis
-    VkDeviceSize stagingBytes = apart ? planeBytes : (VkDeviceSize)disOffset + planeBytes;
+    VkDeviceSize stagingBytes = apart || split ? planeBytes : (VkDeviceSize)disOffset + planeBytes;
     if (v1 && shared) {  // 4:2:0's chroma as libvmaf takes it, w/2 x h/2, its rows a word apart
         const uint32_t chromaStride = ((uint32_t)(w / 2) * (bpc > 8 ? 2 : 1) + 3) & ~3u;
         sharedChroma = (uint32_t)((stagingBytes + 255) & ~VkDeviceSize(255));
         sharedChromaSpacing = (chromaStride * (uint32_t)(h / 2) + 255) & ~255u;
-        stagingBytes = (VkDeviceSize)sharedChroma + 4ull * sharedChromaSpacing;
+        stagingBytes = (VkDeviceSize)sharedChroma + (split ? 2ull : 4ull) * sharedChromaSpacing;
     }
     // The pictures read where a decoder left them (vv_pictures): nothing is
     // written into the slots' shared buffers, which are made only for a
@@ -2670,7 +2722,8 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
             return fail(-1, "vkCreateFence failed");
         if (int error = create_buffer(slot.staging, stagingBytes, !shared, shared, !shared))
             return error;
-        if (int error = create_buffer(slot.stagingDis, apart ? planeBytes : 4, true, false, true))
+        if (int error = split ? create_buffer(slot.stagingDis, stagingBytes, false, true, false)
+                              : create_buffer(slot.stagingDis, apart ? planeBytes : 4, true, false, true))
             return error;
         if (int error = create_buffer(slot.result, kSlots * 8, true))
             return error;
@@ -2712,11 +2765,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
                                 &admRB, &admAB, &admFB, &picPrev[0], &picPrev[1] })
             vk.vkCmdFillBuffer(cb, buffer->buffer, 0, VK_WHOLE_SIZE, 0);
         vk.vkEndCommandBuffer(cb);
-        VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &cb;
-        if (vk.vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS ||
-            vk.vkDeviceWaitIdle(device) != VK_SUCCESS)
+        if (run_now(cb) != VK_SUCCESS)
             return fail(-1, "clearing the GPU buffers failed");
     }
     if (int error = build_passes())
@@ -3023,7 +3072,7 @@ int vv_context::enable_speed(const double *values)
             memcpy(constants, dec, sizeof dec);
             Bound chroma = Bound(&slot.speedChroma);
             if (fromStaging) {
-                chroma = Bound(&slot.staging, sharedChroma, 4ull * sharedChromaSpacing);
+                chroma = Bound(&slot.staging, sharedChroma, (split ? 2ull : 4ull) * sharedChromaSpacing);
                 constants[3] = sharedChromaSpacing / 4;  // planeWords
             }
             if (fromStaging && pictures) {  // from the pictures' textures (vv_pictures)
@@ -3032,6 +3081,12 @@ int vv_context::enable_speed(const double *values)
                                          groups(f.operating_w * f.operating_h * 4, perGroup), 1))
                     return error;
                 list.back().pictureRole = kPictureSpeed;
+            } else if (fromStaging && split) {  // the distorted's two planes from its own buffer
+                if (int error = add_pass(list, kShader_speed_dec_split, { chroma, &speedFilterTaps, &speedOperating,
+                                         &speedScaling, Bound(&slot.stagingDis, sharedChroma,
+                                                              2ull * sharedChromaSpacing) },
+                                         constants, sizeof dec, groups(f.operating_w * f.operating_h * 4, perGroup), 1))
+                    return error;
             } else if (int error = add_pass(list, kShader_speed_dec, { chroma, &speedFilterTaps, &speedOperating,
                                             &speedScaling }, constants, sizeof dec,
                                             groups(f.operating_w * f.operating_h * 4, perGroup), 1)) {
@@ -3092,11 +3147,119 @@ int vv_context::enable_profile()
     return 0;
 }
 
+// A committed frame's work, its fence signalled at the end. After the
+// decoder's copies of it (`after`, 0: none): on the submit thread the value
+// is reached already, but the wait stays in the submission as the copies'
+// memory dependency between the two devices. Reached, it costs little:
+// NVIDIA's polling thread of the device then ran 0.8-1.2 G cycles a 1080p
+// minute, 9-10 G while the value was still to come.
+VkResult vv_context::submit_frame(Slot &slot, uint64_t after)
+{
+    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &slot.commands;
+    VkTimelineSemaphoreSubmitInfo timeline = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+    const VkPipelineStageFlags afterStages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if (copied && after) {
+        timeline.waitSemaphoreValueCount = 1;
+        timeline.pWaitSemaphoreValues = &after;
+        submitInfo.pNext = &timeline;
+        submitInfo.waitSemaphoreCount = 1;
+        submitInfo.pWaitSemaphores = &copied;
+        submitInfo.pWaitDstStageMask = &afterStages;
+    }
+    std::lock_guard<std::mutex> lock(queueMutex);
+    return vk.vkQueueSubmit(queue, 1, &submitInfo, slot.fence);
+}
+
+// The submit thread (vv_import_timeline): the committed frames in order, each
+// once the decoder's copies of it are done. After a failure it submits no
+// more; the caller's next call reports it.
+void vv_context::submit_thread()
+{
+    std::unique_lock<std::mutex> lock(submitMutex);
+    for (;;) {
+        submitWork.wait(lock, [&] { return submitStop || (!submissions.empty() && submitError.empty()); });
+        if (submitStop)
+            return;
+        const Submission next = submissions.front();
+        lock.unlock();
+        std::string error;
+        if (next.after) {
+            // Asleep until the decoder's copies are done, waking every 100 ms
+            // to see a stop (a run that ends before the decoder copied a frame
+            // it was given).
+            VkSemaphoreWaitInfo wait = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+            wait.semaphoreCount = 1;
+            wait.pSemaphores = &copied;
+            wait.pValues = &next.after;
+            VkResult result;
+            while ((result = waitSemaphores(device, &wait, 100ull * 1000 * 1000)) == VK_TIMEOUT) {
+                lock.lock();
+                const bool stop = submitStop;
+                lock.unlock();
+                if (stop)
+                    return;
+            }
+            if (result != VK_SUCCESS)
+                error = "waiting for the decoder's copies failed (" + std::to_string(result) + ")";
+        }
+        if (error.empty()) {
+            const VkResult result = submit_frame(slots[next.slot], next.after);
+            if (result != VK_SUCCESS)
+                error = "vkQueueSubmit failed (" + std::to_string(result) + ")";
+        }
+        lock.lock();
+        if (error.empty()) {
+            submissions.pop_front();
+            slots[next.slot].queued = false;
+        } else {
+            submitError = error;  // the frame stays queued: never submitted
+        }
+        submitDone.notify_all();
+    }
+}
+
+// Whether a committed frame is still waiting for the submit thread.
+bool vv_context::queued(const Slot &slot)
+{
+    if (!submitter.joinable())
+        return false;
+    std::lock_guard<std::mutex> lock(submitMutex);
+    return slot.queued;
+}
+
+// One command buffer run to its end (set-up, tests): submitted, then the
+// device waited for.
+VkResult vv_context::run_now(VkCommandBuffer commands)
+{
+    VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &commands;
+    std::lock_guard<std::mutex> lock(queueMutex);
+    const VkResult result = vk.vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+    return result == VK_SUCCESS ? vk.vkDeviceWaitIdle(device) : result;
+}
+
 int vv_context::collect(Slot &slot)
 {
     if (!slot.busy)
         return 0;
     const double waitStart = profile ? now_ns() : 0.0;
+    if (submitter.joinable()) {  // its fence signals only once the submit thread has submitted it
+        std::unique_lock<std::mutex> lock(submitMutex);
+        const bool submitted = submitDone.wait_for(lock, std::chrono::seconds(60), [&] {
+            return !slot.queued || !submitError.empty();
+        });
+        if (!submitError.empty()) {
+            failed = true;
+            return fail(-5, submitError);
+        }
+        if (!submitted) {
+            failed = true;
+            return fail(-5, "the decoder did not copy a frame in 60 seconds");
+        }
+    }
     VkResult result = vk.vkWaitForFences(device, 1, &slot.fence, VK_TRUE, 60ull * 1000 * 1000 * 1000);
     if (profile) {
         cpuNs[kCpuWait] += now_ns() - waitStart;
@@ -3384,7 +3547,7 @@ int vv_context::commit(bool score)
         // in the general layout throughout (the memory is Direct3D's).
         const int textures[2] = { pendingTextures[0], score ? pendingTextures[1] : -1 };
         Buffer *targets[2] = { direct ? &slot.staging : &picRef,
-                               direct ? (shared ? &slot.staging : &slot.stagingDis) : &picDis };
+                               direct ? (shared ? &dis_buffer(slot) : &slot.stagingDis) : &picDis };
         const VkDeviceSize offsets[2] = { 0, direct && shared ? (VkDeviceSize)disOffset : 0 };
         pendingTextures[0] = pendingTextures[1] = -1;
         for (int i = 0; i < 2; ++i) {
@@ -3419,7 +3582,7 @@ int vv_context::commit(bool score)
         vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
         if (score) {
             copy.srcOffset = disOffset;
-            vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picDis.buffer, 1, &copy);
+            vk.vkCmdCopyBuffer(cb, dis_buffer(slot).buffer, picDis.buffer, 1, &copy);
         }
     } else if (shared) {
         // A plane the CPU wrote (vv_shared_host_plane) goes where the decoder
@@ -3427,7 +3590,8 @@ int vv_context::commit(bool score)
         for (int i = 0; i < 2; ++i) {
             if (slot.planeFromHost[i] && (i == 0 || score)) {
                 const VkBufferCopy copy = { 0, i ? (VkDeviceSize)disOffset : 0, planeBytes };
-                vk.vkCmdCopyBuffer(cb, slot.hostPlane[i].buffer, slot.staging.buffer, 1, &copy);
+                vk.vkCmdCopyBuffer(cb, slot.hostPlane[i].buffer, (i ? dis_buffer(slot) : slot.staging).buffer, 1,
+                                   &copy);
             }
         }
     }
@@ -3565,26 +3729,25 @@ int vv_context::commit(bool score)
     vk.vkCmdPipelineBarrier(cb, kCompute | kTransfer, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, nullptr, 0,
                             nullptr);
     vk.vkEndCommandBuffer(cb);
-    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cb;
-    // After the decoder's copies of the frame into its slot (vv_commit_after).
-    VkTimelineSemaphoreSubmitInfo after = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
-    const VkPipelineStageFlags afterStages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    const uint64_t afterValue = copiedValue;
-    if (copied && afterValue) {
-        after.waitSemaphoreValueCount = 1;
-        after.pWaitSemaphoreValues = &afterValue;
-        submitInfo.pNext = &after;
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &copied;
-        submitInfo.pWaitDstStageMask = &afterStages;
-    }
+    const uint64_t after = copiedValue;  // the decoder's copies of the frame into its slot (vv_commit_after)
     copiedValue = 0;
-    VkResult result = vk.vkQueueSubmit(queue, 1, &submitInfo, slot.fence);
-    if (result != VK_SUCCESS) {
-        failed = true;
-        return fail(-5, "vkQueueSubmit failed (" + std::to_string(result) + ")");
+    if (submitter.joinable()) {  // submitted by the submit thread once they are done, in order
+        {
+            std::lock_guard<std::mutex> lock(submitMutex);
+            if (!submitError.empty()) {
+                failed = true;
+                return fail(-5, submitError);
+            }
+            slot.queued = true;
+            submissions.push_back({ slotIndex, after });
+        }
+        submitWork.notify_one();
+    } else {
+        const VkResult result = submit_frame(slot, after);
+        if (result != VK_SUCCESS) {
+            failed = true;
+            return fail(-5, "vkQueueSubmit failed (" + std::to_string(result) + ")");
+        }
     }
     slot.busy = true;
     if (profile) {
@@ -3675,7 +3838,7 @@ unsigned vv_context::completed()
         Slot &slot = slots[(nextSlot + i) % slots.size()];
         if (!slot.busy)
             continue;
-        if (vk.vkGetFenceStatus(device, slot.fence) != VK_SUCCESS || collect(slot))
+        if (queued(slot) || vk.vkGetFenceStatus(device, slot.fence) != VK_SUCCESS || collect(slot))
             break;
     }
     unsigned busy = 0;
@@ -3975,12 +4138,19 @@ VV_EXPORT int vv_import_timeline(vv_context *context, void *handle)
         return fail(-4, "Vulkan cannot take the decoder's timeline semaphore");
     }
     context->copied = semaphore;
+    try {
+        context->submitter = std::thread(&vv_context::submit_thread, context);
+    } catch (const std::system_error &) {
+        context->copied = VK_NULL_HANDLE;
+        context->destroySemaphore(context->device, semaphore, nullptr);
+        return fail(-1, "the submit thread could not start");
+    }
     return 0;
 }
 
 // The next vv_commit's frame is in its slot once the imported timeline
-// semaphore reaches `value` (the decoder's last copy of it): its work on the
-// GPU waits for that, and the caller need not.
+// semaphore reaches `value` (the decoder's last copy of it): the context's
+// submit thread submits its work then, and the caller need not wait.
 VV_EXPORT int vv_commit_after(vv_context *context, uint64_t value)
 {
     if (!context->copied)
@@ -3992,8 +4162,10 @@ VV_EXPORT int vv_commit_after(vv_context *context, uint64_t value)
 // For a context made with flag bit 19 (frames from GPU memory): the staging
 // buffer the next pair's luma planes are to be written into by the API that
 // imported it -- *slot says which (they take turns), the reference's rows
-// start at offset 0 and the distorted's at *disOffset, *stride bytes apart.
-// Once they are written (and that API has finished writing), vv_commit.
+// start at offset 0 and the distorted's at *disOffset, *stride bytes apart
+// (in split mode, flag bit 3: at *disOffset, 0, of its own buffer,
+// vv_export_part's part 1). Once they are written (and that API has finished
+// writing), vv_commit.
 // Returns how many slots there are. A context reading a decoder's pictures
 // (vv_pictures) begins each frame here too, but its buffers hold no planes
 // (they are 4096 bytes): nothing may be written into them.
@@ -4029,25 +4201,36 @@ VV_EXPORT int vv_pictures(vv_context *context, void *reference, uint32_t referen
 // (vv_pictures), else 0.
 VV_EXPORT int vv_pictures_mode(vv_context *context) { return context->pictures ? 1 : 0; }
 
-// A slot's staging buffer as a Win32 handle another API on this GPU imports
-// (an opaque Win32 handle of a dedicated allocation of *bytes: CUDA's
+// One of a slot's staging buffers as a Win32 handle another API on this GPU
+// imports (an opaque Win32 handle of a dedicated allocation of *bytes: CUDA's
 // cuImportExternalMemory, or Vulkan's VkImportMemoryWin32HandleInfoKHR with
-// what vv_shared_device gives). The caller closes the handle once it has
-// imported it; the memory lives as long as the context.
-VV_EXPORT int vv_export(vv_context *context, int slot, void **handle, uint64_t *bytes)
+// what vv_shared_device gives): part 0 the slot's buffer, which holds both
+// videos' planes; in split mode (flag bit 3) part 0 the reference's and
+// part 1 the distorted's, laid out alike. The caller closes the handle once
+// it has imported it; the memory lives as long as the context.
+VV_EXPORT int vv_export_part(vv_context *context, int slot, int part, void **handle, uint64_t *bytes)
 {
-    if (!context->shared || slot < 0 || slot >= (int)context->slots.size())
+    if (!context->shared || slot < 0 || slot >= (int)context->slots.size() || part < 0
+        || part > (context->split ? 1 : 0))
         return fail(-3, "no such shared buffer");
+    const Slot &exported = context->slots[(size_t)slot];
+    const Buffer &buffer = part ? exported.stagingDis : exported.staging;
     VkMemoryGetWin32HandleInfoKHR info = { VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR };
-    info.memory = context->slots[(size_t)slot].staging.memory;
+    info.memory = buffer.memory;
     info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
     HANDLE win32 = nullptr;
     VkResult result = context->getMemoryHandle(context->device, &info, &win32);
     if (result != VK_SUCCESS)
         return fail(-1, "vkGetMemoryWin32HandleKHR failed (" + std::to_string(result) + ")");
     *handle = win32;
-    *bytes = context->slots[(size_t)slot].staging.allocation;
+    *bytes = buffer.allocation;
     return 0;
+}
+
+// vv_export_part's part 0.
+VV_EXPORT int vv_export(vv_context *context, int slot, void **handle, uint64_t *bytes)
+{
+    return vv_export_part(context, slot, 0, handle, bytes);
 }
 
 // For a context made with flag bit 19: what another Vulkan device must match
@@ -4255,8 +4438,10 @@ VV_EXPORT int vv_shared_host_plane(vv_context *context, int which, uint8_t **pla
 // where in each slot's staging buffer (the memory vv_export gives) the four
 // chroma planes go -- the reference's U and V, then the distorted's, from
 // *offset, *spacing bytes apart, rows *stride bytes apart (w/2 x h/2
-// samples). A decoder writes them there on the GPU, as the lumas; or the
-// frame's go through vv_chroma_staging instead.
+// samples). In split mode (flag bit 3) each of the slot's two buffers
+// (vv_export_part) holds its video's U and V there, from *offset. A decoder
+// writes them there on the GPU, as the lumas; or the frame's go through
+// vv_chroma_staging instead.
 VV_EXPORT int vv_shared_chroma(vv_context *context, uint64_t *offset, uint32_t *spacing, uint32_t *stride)
 {
     if (!context->shared || !context->speed)
@@ -4401,12 +4586,7 @@ VV_EXPORT int vv_read_buffer(vv_context *context, int which, void *out, uint64_t
     VkBufferCopy region = { 0, 0, bytes };
     vk.vkCmdCopyBuffer(cb, source->buffer, staging.buffer, 1, &region);
     vk.vkEndCommandBuffer(cb);
-    VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cb;
-    VkResult result = vk.vkQueueSubmit(context->queue, 1, &submit, VK_NULL_HANDLE);
-    if (result == VK_SUCCESS)
-        result = vk.vkDeviceWaitIdle(context->device);
+    const VkResult result = context->run_now(cb);
     if (result == VK_SUCCESS)
         memcpy(out, staging.mapped, (size_t)bytes);
     context->destroy_last_buffer(staging);
@@ -4419,9 +4599,23 @@ VV_EXPORT int vv_read_buffer(vv_context *context, int which, void *out, uint64_t
 // adm_min_val, motion_max_val, motion_five_frame_window,
 // motion_moving_average (nine doubles). Frames go in with vv_submit or
 // vv_staging / vv_commit as for VMAF v0.6.1.
+VV_EXPORT int vv_create_v1_ex(vv_context **out, int device, int width, int height, int bitDepth, int flags,
+                              const double *options, int count);
+
 VV_EXPORT int vv_create_v1(vv_context **out, int device, int width, int height, int bitDepth, int flags,
                            const double *options)
 {
+    return vv_create_v1_ex(out, device, width, height, bitDepth, flags, options, 9);
+}
+
+// vv_create_v1 with `count` options: its nine, then adm_skip_scale0 (the
+// HDR VMAF models'; 0 where not given).
+VV_EXPORT int vv_create_v1_ex(vv_context **out, int device, int width, int height, int bitDepth, int flags,
+                              const double *options, int count)
+{
+    *out = nullptr;
+    if (count < 9)
+        return fail(-3, "VMAF v1: fewer options than its nine");
     vv_context *context = new vv_context();
     context->v1 = true;
     V1Options &o = context->options;
@@ -4434,6 +4628,7 @@ VV_EXPORT int vv_create_v1(vv_context **out, int device, int width, int height, 
     o.motionMax = options[6];
     o.fiveFrameWindow = options[7] != 0;
     o.movingAverage = options[8] != 0;
+    o.skipScale0 = count > 9 && options[9] != 0;
     int error = o.viewDistance * o.displayHeight < kAdmNormViewDist * kAdmRefDisplayHeight
         ? fail(-3, "VMAF v1: the viewing distance is nearer than ADM's 16-bit pipeline takes")
         : context->init(device, width, height, bitDepth, flags);

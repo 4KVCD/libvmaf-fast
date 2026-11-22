@@ -96,9 +96,9 @@ def _libvmaf() -> ctypes.CDLL:
 
 def _vulkan() -> ctypes.CDLL:
     lib = vmaf_vulkan._load()
-    lib.vv_create_v1.restype = ctypes.c_int
-    lib.vv_create_v1.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                 ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_double)]
+    lib.vv_create_v1_ex.restype = ctypes.c_int
+    lib.vv_create_v1_ex.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_double), ctypes.c_int]
     lib.vv_features_v1.restype = ctypes.c_int
     lib.vv_features_v1.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double), ctypes.c_uint]
     if hasattr(lib, "vv_v1_cambi"):  # CAMBI on the GPU
@@ -326,21 +326,21 @@ class V1Scorer:
                 raise VmafV1Error("no GPU that Vulkan can calculate VMAF on")
             device = chosen.index
         adm, motion = options[_ADM3], options[_MOTION3]
-        values = (ctypes.c_double * 9)(
+        values = (ctypes.c_double * 10)(
             adm.get("adm_norm_view_dist", 3.0), adm.get("adm_ref_display_height", 1080), adm.get("adm_csf_mode", 0),
             adm.get("adm_noise_weight", 0.03125), adm.get("adm_dlm_weight", 1.0), adm.get("adm_min_val", 0.0),
             motion.get("motion_max_val", 10000.0), float(bool(motion.get("motion_five_frame_window", False))),
-            float(bool(motion.get("motion_moving_average", False))))
+            float(bool(motion.get("motion_moving_average", False))), float(bool(adm.get("adm_skip_scale0", False))))
         unsupported = (set(adm) - {"adm_norm_view_dist", "adm_ref_display_height", "adm_csf_mode", "adm_noise_weight",
-                                   "adm_dlm_weight", "adm_min_val", "adm_enhn_gain_limit"}
+                                   "adm_dlm_weight", "adm_min_val", "adm_enhn_gain_limit", "adm_skip_scale0"}
                        | set(motion) - {"motion_max_val", "motion_five_frame_window", "motion_moving_average"})
         if unsupported or adm.get("adm_enhn_gain_limit", 100.0) != 1.0:
             raise VmafV1Error(f"the model has ADM or motion options the GPU does not calculate: {sorted(unsupported)}")
         self._gpu = ctypes.c_void_p()
         self._cpu = ctypes.c_void_p()
         flags = (3 << 8) | (vmaf_vulkan.SHARED_FLAG if shared is not None else 0)
-        vmaf_vulkan._check(vulkan, vulkan.vv_create_v1(ctypes.byref(self._gpu), device, width, height, bit_depth,
-                                                       flags, values), "Starting Vulkan")
+        vmaf_vulkan._check(vulkan, vulkan.vv_create_v1_ex(ctypes.byref(self._gpu), device, width, height, bit_depth,
+                                                          flags, values, len(values)), "Starting Vulkan")
         try:
             if shared is not None:
                 if width & 1 or height & 1:

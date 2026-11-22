@@ -33,6 +33,18 @@ enum {
     ARG_FRAME_CNT,
     ARG_FRAME_SKIP_REF,
     ARG_FRAME_SKIP_DIST,
+    ARG_WIDTH_REF,
+    ARG_WIDTH_DIST,
+    ARG_HEIGHT_REF,
+    ARG_HEIGHT_DIST,
+    ARG_COLOR_RANGE_REF,
+    ARG_COLOR_RANGE_DIST,
+    ARG_COLOR_PRIMARIES_REF,
+    ARG_COLOR_PRIMARIES_DIST,
+    ARG_COLOR_TRC_REF,
+    ARG_COLOR_TRC_DIST,
+    ARG_COLOR_MATRIX_REF,
+    ARG_COLOR_MATRIX_DIST,
 };
 
 static const struct option long_opts[] = {
@@ -40,6 +52,10 @@ static const struct option long_opts[] = {
     { "distorted",        1, NULL, 'd' },
     { "width",            1, NULL, 'w' },
     { "height",           1, NULL, 'h' },
+    { "width_ref",        1, NULL, ARG_WIDTH_REF },
+    { "width_dist",       1, NULL, ARG_WIDTH_DIST },
+    { "height_ref",       1, NULL, ARG_HEIGHT_REF },
+    { "height_dist",      1, NULL, ARG_HEIGHT_DIST },
     { "pixel_format",     1, NULL, 'p' },
     { "bitdepth",         1, NULL, 'b' },
     { "model",            1, NULL, 'm' },
@@ -58,6 +74,14 @@ static const struct option long_opts[] = {
     { "frame_cnt",        1, NULL, ARG_FRAME_CNT },
     { "frame_skip_ref",   1, NULL, ARG_FRAME_SKIP_REF },
     { "frame_skip_dist",  1, NULL, ARG_FRAME_SKIP_DIST },
+    { "color_range_ref",  1, NULL, ARG_COLOR_RANGE_REF },
+    { "color_range_dist", 1, NULL, ARG_COLOR_RANGE_DIST },
+    { "color_primaries_ref",  1, NULL, ARG_COLOR_PRIMARIES_REF },
+    { "color_primaries_dist", 1, NULL, ARG_COLOR_PRIMARIES_DIST },
+    { "color_trc_ref",    1, NULL, ARG_COLOR_TRC_REF },
+    { "color_trc_dist",   1, NULL, ARG_COLOR_TRC_DIST },
+    { "color_matrix_ref", 1, NULL, ARG_COLOR_MATRIX_REF },
+    { "color_matrix_dist", 1, NULL, ARG_COLOR_MATRIX_DIST },
     { "no_prediction",    0, NULL, 'n' },
     { "version",          0, NULL, 'v' },
     { "quiet",            0, NULL, 'q' },
@@ -78,6 +102,11 @@ static void usage(const char *const app, const char *const reason, ...) {
             " --distorted/-d $path:        path to distorted .y4m or .yuv\n"
             " --width/-w $unsigned:        width\n"
             " --height/-h $unsigned:       height\n"
+            " --width_ref/--width_dist/--height_ref/--height_dist $unsigned:\n"
+            "                              reference or distorted size, if it\n"
+            "                              differs from --width/--height. Only\n"
+            "                              models that scale their inputs\n"
+            "                              accept different sizes\n"
             " --pixel_format/-p: $string   pixel format (420/422/444)\n"
             " --bitdepth/-b $unsigned:     bitdepth (8/10/12/16)\n"
             " --model/-m $params:          model parameters, colon \":\" delimited\n"
@@ -97,6 +126,14 @@ static void usage(const char *const app, const char *const reason, ...) {
             " --frame_skip_ref $unsigned:  skip the first N frames in reference\n"
             " --frame_skip_dist $unsigned: skip the first N frames in distorted\n"
             " --subsample: $unsigned       compute scores only every N frames\n"
+            " --color_range_ref/_dist $string:\n"
+            "                              color range for the reference/distorted input\n"
+            " --color_primaries_ref/_dist $string:\n"
+            "                              color primaries for the reference/distorted input\n"
+            " --color_trc_ref/_dist $string:\n"
+            "                              transfer characteristic for the reference/distorted input\n"
+            " --color_matrix_ref/_dist $string:\n"
+            "                              matrix coefficients for the reference/distorted input\n"
             " --quiet/-q:                  disable FPS meter when run in a TTY\n"
             " --no_prediction/-n:          no prediction, extract features only\n"
             " --version/-v:                print version and exit\n"
@@ -180,6 +217,125 @@ static enum VmafPixelFormat parse_pix_fmt(const char *const optarg,
                                              "(420/422/444)");
 
     return pix_fmt;
+}
+
+static enum VmafColorRange parse_color_range(const char *const optarg,
+                                              const int option,
+                                              const char *const app)
+{
+    if (!strcmp(optarg, "unknown")) return VMAF_COLOR_RANGE_UNKNOWN;
+    if (!strcmp(optarg, "limited")) return VMAF_COLOR_RANGE_LIMITED;
+    if (!strcmp(optarg, "full")) return VMAF_COLOR_RANGE_FULL;
+
+    error(app, optarg, option, "a valid color range "
+                               "(unknown/limited/full)");
+    return VMAF_COLOR_RANGE_UNKNOWN;
+}
+
+typedef struct { const char *name; unsigned val; } NamedValue;
+
+static int lookup_named_value(const NamedValue *table, size_t table_len,
+                              const char *const optarg, unsigned *val)
+{
+    for (size_t i = 0; i < table_len; i++) {
+        if (!strcmp(optarg, table[i].name)) {
+            *val = table[i].val;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static const NamedValue color_primaries_names[] = {
+    { "unknown",  VMAF_COLOR_PRIMARIES_UNKNOWN },
+    { "bt709",    VMAF_COLOR_PRIMARIES_BT709 },
+    { "bt2020",   VMAF_COLOR_PRIMARIES_BT2020 },
+};
+
+static const NamedValue color_trc_names[] = {
+    { "unknown",       VMAF_COLOR_TRC_UNKNOWN },
+    { "bt709",         VMAF_COLOR_TRC_BT709 },
+    { "smpte2084",     VMAF_COLOR_TRC_SMPTE2084 },
+    { "pq",            VMAF_COLOR_TRC_SMPTE2084 },
+};
+
+static const NamedValue color_matrix_names[] = {
+    { "unknown",              VMAF_COLOR_MATRIX_UNKNOWN },
+    { "bt709",                VMAF_COLOR_MATRIX_BT709 },
+    { "bt2020nc",             VMAF_COLOR_MATRIX_BT2020_NCL },
+    { "ictcp",                VMAF_COLOR_MATRIX_ICTCP },
+};
+
+static enum VmafColorPrimaries parse_color_primaries(
+    const char *const optarg, const int option, const char *const app)
+{
+    unsigned val;
+    if (lookup_named_value(color_primaries_names,
+                           sizeof(color_primaries_names) /
+                               sizeof(*color_primaries_names),
+                           optarg, &val))
+    {
+        error(app, optarg, option,
+              "a valid color primaries name, e.g. unknown/bt709/bt2020");
+        return VMAF_COLOR_PRIMARIES_UNKNOWN;
+    }
+    return (enum VmafColorPrimaries) val;
+}
+
+static enum VmafColorTransferCharacteristic parse_color_trc(
+    const char *const optarg, const int option, const char *const app)
+{
+    unsigned val;
+    if (lookup_named_value(color_trc_names,
+                           sizeof(color_trc_names) / sizeof(*color_trc_names),
+                           optarg, &val))
+    {
+        error(app, optarg, option,
+              "a valid transfer characteristic name, e.g. unknown/bt709/pq");
+        return VMAF_COLOR_TRC_UNKNOWN;
+    }
+    return (enum VmafColorTransferCharacteristic) val;
+}
+
+static enum VmafColorMatrixCoefficients parse_color_matrix(
+    const char *const optarg, const int option, const char *const app)
+{
+    unsigned val;
+    if (lookup_named_value(color_matrix_names,
+                           sizeof(color_matrix_names) /
+                               sizeof(*color_matrix_names),
+                           optarg, &val))
+    {
+        error(app, optarg, option, "a valid matrix coefficients name, e.g. "
+                                   "bt709/bt2020nc/ictcp");
+        return VMAF_COLOR_MATRIX_UNKNOWN;
+    }
+    return (enum VmafColorMatrixCoefficients) val;
+}
+
+/* --color_X_ref and --color_X_dist describe one input each. */
+#define COLOR_ARG_CASES(attr, ARG, parse)                                   \
+    case ARG##_REF:                                                         \
+        settings->color_ref.attr = parse(optarg, ARG##_REF, argv[0]);       \
+        break;                                                              \
+    case ARG##_DIST:                                                        \
+        settings->color_dist.attr = parse(optarg, ARG##_DIST, argv[0]);     \
+        break;
+
+static bool color_any_set(const VmafColor *color)
+{
+    return color->range != VMAF_COLOR_RANGE_UNKNOWN ||
+           color->primaries != VMAF_COLOR_PRIMARIES_UNKNOWN ||
+           color->trc != VMAF_COLOR_TRC_UNKNOWN ||
+           color->matrix != VMAF_COLOR_MATRIX_UNKNOWN;
+}
+
+static bool color_all_set(const VmafColor *color)
+{
+    return color->range != VMAF_COLOR_RANGE_UNKNOWN &&
+           color->primaries != VMAF_COLOR_PRIMARIES_UNKNOWN &&
+           color->trc != VMAF_COLOR_TRC_UNKNOWN &&
+           color->matrix != VMAF_COLOR_MATRIX_UNKNOWN;
 }
 
 #ifndef HAVE_STRSEP
@@ -506,13 +662,13 @@ void cli_parse(const int argc, char *const *const argv,
                 parse_feature_config(optarg, argv[0]), argv[0], "features");
             break;
         case ARG_THREADS:
-            settings->thread_cnt = parse_unsigned(optarg, 't', argv[0]);
+            settings->thread_cnt = parse_unsigned(optarg, ARG_THREADS, argv[0]);
             break;
         case ARG_SUBSAMPLE:
-            settings->subsample = parse_unsigned(optarg, 's', argv[0]);
+            settings->subsample = parse_unsigned(optarg, ARG_SUBSAMPLE, argv[0]);
             break;
         case ARG_CPUMASK:
-            settings->cpumask = parse_unsigned(optarg, 'c', argv[0]);
+            settings->cpumask = parse_unsigned(optarg, ARG_CPUMASK, argv[0]);
             break;
         case ARG_GPUMASK:
             settings->gpumask = parse_unsigned(optarg, ARG_GPUMASK, argv[0]);
@@ -530,9 +686,29 @@ void cli_parse(const int argc, char *const *const argv,
         case ARG_FRAME_SKIP_REF:
             settings->frame_skip_ref = parse_unsigned(optarg, ARG_FRAME_SKIP_REF, argv[0]);
             break;
+        case ARG_WIDTH_REF:
+            settings->width_ref = parse_unsigned(optarg, ARG_WIDTH_REF, argv[0]);
+            settings->use_yuv = true;
+            break;
+        case ARG_WIDTH_DIST:
+            settings->width_dist = parse_unsigned(optarg, ARG_WIDTH_DIST, argv[0]);
+            settings->use_yuv = true;
+            break;
+        case ARG_HEIGHT_REF:
+            settings->height_ref = parse_unsigned(optarg, ARG_HEIGHT_REF, argv[0]);
+            settings->use_yuv = true;
+            break;
+        case ARG_HEIGHT_DIST:
+            settings->height_dist = parse_unsigned(optarg, ARG_HEIGHT_DIST, argv[0]);
+            settings->use_yuv = true;
+            break;
         case ARG_FRAME_SKIP_DIST:
             settings->frame_skip_dist = parse_unsigned(optarg, ARG_FRAME_SKIP_DIST, argv[0]);
             break;
+        COLOR_ARG_CASES(range, ARG_COLOR_RANGE, parse_color_range)
+        COLOR_ARG_CASES(primaries, ARG_COLOR_PRIMARIES, parse_color_primaries)
+        COLOR_ARG_CASES(trc, ARG_COLOR_TRC, parse_color_trc)
+        COLOR_ARG_CASES(matrix, ARG_COLOR_MATRIX, parse_color_matrix)
         case 'n':
             settings->no_prediction = true;
             break;
@@ -553,20 +729,52 @@ void cli_parse(const int argc, char *const *const argv,
         usage(argv[0], "Reference .y4m or .yuv (-r/--reference) is required");
     if (!settings->path_dist)
         usage(argv[0], "Distorted .y4m or .yuv (-d/--distorted) is required");
-    if (settings->use_yuv && !(settings->width && settings->height &&
-        settings->pix_fmt && settings->bitdepth))
+    if (!settings->width_ref) settings->width_ref = settings->width;
+    if (!settings->height_ref) settings->height_ref = settings->height;
+    if (!settings->width_dist) settings->width_dist = settings->width;
+    if (!settings->height_dist) settings->height_dist = settings->height;
+    if (settings->use_yuv &&
+        !(settings->width_ref && settings->height_ref &&
+          settings->width_dist && settings->height_dist &&
+          settings->pix_fmt && settings->bitdepth))
     {
         usage(argv[0], "The following options are required for .yuv input:\n"
-                       "  --width/-w\n"
-                       "  --height/-h\n"
+                       "  --width/-w, or --width_ref and --width_dist\n"
+                       "  --height/-h, or --height_ref and --height_dist\n"
                        "  --pixel_format/-p\n"
                        "  --bitdepth/-b\n");
     }
 
+    const bool ref_color_set = color_all_set(&settings->color_ref);
+    const bool dist_color_set = color_all_set(&settings->color_dist);
+    if (color_any_set(&settings->color_ref) && !ref_color_set) {
+        usage(argv[0], "The reference colorimetry must either be fully "
+                       "specified or left unset: provide all of "
+                       "--color_range_ref, --color_primaries_ref, "
+                       "--color_trc_ref and --color_matrix_ref\n");
+    }
+    if (color_any_set(&settings->color_dist) && !dist_color_set) {
+        usage(argv[0], "The distorted colorimetry must either be fully "
+                       "specified or left unset: provide all of "
+                       "--color_range_dist, --color_primaries_dist, "
+                       "--color_trc_dist and --color_matrix_dist\n");
+    }
+
     if (settings->model_cnt == 0 && !settings->no_prediction) {
 #if VMAF_BUILT_IN_MODELS
+        /*
+         * If both inputs are described as HDR (via the raw yuv/y4m
+         * --color_* flags) and no model was given, default to the HDR
+         * model. An explicitly chosen model is used as is: an SDR model
+         * ignores the color flags, so pairing it with HDR inputs is the
+         * caller's responsibility.
+         */
+        const bool is_hdr =
+            ref_color_set && dist_color_set &&
+            settings->color_ref.trc == VMAF_COLOR_TRC_SMPTE2084 &&
+            settings->color_dist.trc == VMAF_COLOR_TRC_SMPTE2084;
         CLIModelConfig cfg = {
-            .version = "vmaf_v0.6.1",
+            .version = is_hdr ? "hdr_vmaf_v1.1.8_3d0h" : "vmaf_v0.6.1",
         };
         CHECKED_APPEND(settings->model_config, settings->model_cnt, cfg,
                        argv[0], "models");

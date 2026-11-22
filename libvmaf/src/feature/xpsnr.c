@@ -20,7 +20,10 @@
  * reads and writes beyond the picture for an odd width or height above
  * that, which init refuses, as it does more than 12 bits. Option "psnr":
  * psnr_y as well, the psnr extractor's, from the squared errors summed here
- * anyway.
+ * anyway. Where the CPU has AVX2 or NEON, the sums are made by
+ * libvmaf-fast's own kernels and VMAFx's PSNR rows (x86/xpsnr_any_avx2.c,
+ * x86/psnr_avx2.c, and their NEON copies in arm64/), a strip of blocks at a
+ * time, row by row: the same integers.
  *
  * This file is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -50,9 +53,27 @@
  * HAVE_CUDA, which libvmaf.c has; without it here fex->prev_ref and the
  * rest are read 8 bytes off (integer_motion.c has it through cpu.h). */
 #include "config.h"
+#include "cpu.h"
 #include "feature_collector.h"
 #include "feature_extractor.h"
 #include "opt.h"
+#if ARCH_X86
+#include "x86/psnr_avx2.h"
+#include "x86/xpsnr_any_avx2.h"
+#define XPSNR_SIMD_FLAG VMAF_X86_CPU_FLAG_AVX2
+#define psnr_sse_line_simd_8 psnr_sse_line_8_avx2
+#define psnr_sse_line_simd_16 psnr_sse_line_16_avx2
+#define xpsnr_strip_simd_8 xpsnr_strip_avx2_8
+#define xpsnr_strip_simd_16 xpsnr_strip_avx2_16
+#elif ARCH_AARCH64
+#include "arm64/psnr_neon.h"
+#include "arm64/xpsnr_any_neon.h"
+#define XPSNR_SIMD_FLAG VMAF_ARM_CPU_FLAG_NEON
+#define psnr_sse_line_simd_8 psnr_sse_line_8_neon
+#define psnr_sse_line_simd_16 psnr_sse_line_16_neon
+#define xpsnr_strip_simd_8 xpsnr_strip_neon_8
+#define xpsnr_strip_simd_16 xpsnr_strip_neon_16
+#endif
 
 /* FFmpeg's sums and products, each rounded on its own: no fused
  * multiply-add, which the compiler may otherwise make of them. */
@@ -81,6 +102,11 @@ typedef struct XpsnrState {
     double *weights;
     /* a row of zero samples: the pictures before the first */
     void *zeros;
+    /* where the CPU has AVX2 or NEON: the sums of a strip's blocks
+     * (x86/xpsnr_any_avx2.c, arm64/xpsnr_any_neon.c), into strip_sse,
+     * strip_sa and strip_ta (w_blk each) */
+    bool simd;
+    uint64_t *strip_sse, *strip_sa, *strip_ta;
 } XpsnrState;
 
 typedef struct XpsnrPlanes {
@@ -125,6 +151,62 @@ static const VmafOption options[] = {
     { 0 }
 };
 
+#ifdef XPSNR_SIMD_FLAG
+/* VMAFx's SIMD rows for FN(sse_block); the 16-bit one's 64-bit sum cut to
+ * the 32 bits FFmpeg sums a row in. */
+static inline unsigned sse_line_simd_8(const uint8_t *org, const uint8_t *rec, uint32_t w)
+{
+    return psnr_sse_line_simd_8(org, rec, w);
+}
+
+static inline unsigned sse_line_simd_16(const uint16_t *org, const uint16_t *rec, uint32_t w)
+{
+    return (unsigned) psnr_sse_line_simd_16(org, rec, w);
+}
+#endif
+
+/* FFmpeg's spatial activity of a block: x_act <= x < w_act, y_act <= y <
+ * h_act, which keeps b_val samples off the picture's edges */
+typedef struct XpsnrActivity {
+    int x_act, y_act, w_act, h_act;
+} XpsnrActivity;
+
+static XpsnrActivity block_activity(const XpsnrState *s, uint32_t offset_x, uint32_t offset_y,
+                                    uint32_t block_width, uint32_t block_height)
+{
+    const int b_val = s->b_val;
+    return (XpsnrActivity) {
+        .x_act = (offset_x > 0 ? 0 : b_val),
+        .y_act = (offset_y > 0 ? 0 : b_val),
+        .w_act = (offset_x + block_width  < s->w ? (int) block_width  : (int) block_width  - b_val),
+        .h_act = (offset_y + block_height < s->h ? (int) block_height : (int) block_height - b_val),
+    };
+}
+
+/* a block whose weight FFmpeg leaves at 1: no activity is summed */
+static bool too_small(const XpsnrActivity *a)
+{
+    return a->w_act <= a->x_act || a->h_act <= a->y_act;
+}
+
+/* the end of FFmpeg's calc_squared_error_and_weight: a block's ms_act from
+ * its spatial and temporal activity (the latter with XPSNR_GAMMA) */
+static double block_ms_act(const XpsnrState *s, const XpsnrActivity *a, uint64_t sa_act,
+                           uint64_t ta_act, uint32_t block_width, uint32_t block_height)
+{
+    /* calculate weight (average squared activity) */
+    double ms_act = (double) sa_act / ((double) (a->w_act - a->x_act) * (double) (a->h_act - a->y_act));
+
+    /* weight += mean squared temporal activity */
+    ms_act += (double) ta_act / ((double) block_width * (double) block_height);
+
+    /* lower limit, accounts for high-pass gain */
+    if (ms_act < (double) (1 << (s->bpc - 6)))
+        ms_act = (double) (1 << (s->bpc - 6));
+
+    return ms_act * ms_act; /* since SSE is squared */
+}
+
 #define T uint8_t
 #define FN(name) name##_8
 #include "xpsnr_template.c"
@@ -158,18 +240,26 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
     s->avg_act = sqrt(16.0 * (double) (1 << (2 * bpc - 9)) / sqrt(XPSNR_MAX(0.00001, r))); /* the sqrt(a_pic) */
     const uint64_t max_error_64 = (uint64_t) ((1 << bpc) - 1) * (uint64_t) ((1 << bpc) - 1);
     s->num64 = (uint64_t) w * (uint64_t) h * max_error_64;
+#ifdef XPSNR_SIMD_FLAG
+    s->simd = !!(vmaf_get_cpu_flags() & XPSNR_SIMD_FLAG);
+#endif
 
     s->sse_luma = malloc(sizeof(double) * s->w_blk * s->h_blk);
     s->weights = malloc(sizeof(double) * s->w_blk * s->h_blk);
     s->zeros = calloc(w + 8, sizeof(uint16_t));
-    if (!s->sse_luma || !s->weights || !s->zeros) {
+    s->strip_sse = malloc(sizeof(uint64_t) * 3 * s->w_blk);  /* strip_sa and strip_ta in it */
+    if (!s->sse_luma || !s->weights || !s->zeros || !s->strip_sse) {
         free(s->sse_luma);
         free(s->weights);
         free(s->zeros);
+        free(s->strip_sse);
         s->sse_luma = s->weights = NULL;
         s->zeros = NULL;
+        s->strip_sse = NULL;
         return -ENOMEM;
     }
+    s->strip_sa = s->strip_sse + s->w_blk;
+    s->strip_ta = s->strip_sa + s->w_blk;
     return 0;
 }
 
@@ -206,6 +296,32 @@ static void smooth_weights(const XpsnrState *s, double *weights)
     }
 }
 
+#ifdef XPSNR_SIMD_FLAG
+/* the sums of the blocks of the strip from row y, block_height rows, into
+ * s->strip_sse, strip_sa and strip_ta (x86/xpsnr_any_avx2.c,
+ * arm64/xpsnr_any_neon.c) */
+static void strip_simd(XpsnrState *s, const XpsnrPlanes *p, uint32_t y, uint32_t block_height)
+{
+    const size_t bytes = s->bpc > 8 ? 2 : 1;
+    const XpsnrActivity a = block_activity(s, 0, y, s->b, block_height); /* the same rows for every block */
+    const XpsnrStrip st = {
+        .org = (const uint8_t *) p->org + y * p->so * bytes,
+        .rec = (const uint8_t *) p->rec + y * p->sr * bytes,
+        .m1 = (const uint8_t *) p->m1 + y * p->s1 * bytes,
+        .m2 = (const uint8_t *) p->m2 + y * p->s2 * bytes,
+        .so = p->so, .sr = p->sr, .s1 = p->s1, .s2 = p->s2,
+        .w = (int) s->w, .b = (int) s->b, .b_val = s->b_val,
+        .height = (int) block_height,
+        .y_act = a.y_act, .h_act = a.h_act,
+        .second_order = s->frame_rate >= 32,
+    };
+    if (s->bpc == 8)
+        xpsnr_strip_simd_8(&st, s->strip_sse, s->strip_sa, s->strip_ta);
+    else
+        xpsnr_strip_simd_16(&st, s->strip_sse, s->strip_sa, s->strip_ta);
+}
+#endif
+
 /* FFmpeg's get_wsse for the luma plane; *sse, the plane's sum of squared
  * errors. */
 static uint64_t wsse_luma(XpsnrState *s, const XpsnrPlanes *p, uint64_t *sse)
@@ -213,8 +329,8 @@ static uint64_t wsse_luma(XpsnrState *s, const XpsnrPlanes *p, uint64_t *sse)
     const uint32_t b = s->b, w = s->w, h = s->h;
 
     if (b < 4) { /* picture is too small for XPSNR, calculate nonweighted PSNR */
-        *sse = s->bpc == 8 ? sse_block_8(p->org, p->so, p->rec, p->sr, w, h)
-                           : sse_block_16(p->org, p->so, p->rec, p->sr, w, h);
+        *sse = s->bpc == 8 ? sse_block_8(s, p->org, p->so, p->rec, p->sr, w, h)
+                           : sse_block_16(s, p->org, p->so, p->rec, p->sr, w, h);
         return *sse;
     }
 
@@ -225,12 +341,27 @@ static uint64_t wsse_luma(XpsnrState *s, const XpsnrPlanes *p, uint64_t *sse)
 
     for (uint32_t y = 0; y < h; y += b) { /* calculate block SSE and perceptual weights */
         const uint32_t block_height = (y + b > h ? h - y : b);
+#ifdef XPSNR_SIMD_FLAG
+        if (s->simd)
+            strip_simd(s, p, y, block_height);
+#endif
 
         for (uint32_t x = 0; x < w; x += b, idx_blk++) {
             const uint32_t block_width = (x + b > w ? w - x : b);
             double ms_act = 1.0;
+            uint64_t block_sse;
 
-            const uint64_t block_sse = s->bpc == 8
+#ifdef XPSNR_SIMD_FLAG
+            if (s->simd) { /* FN(block)'s result from the strip's sums */
+                const uint32_t bx = x / b;
+                const XpsnrActivity a = block_activity(s, x, y, block_width, block_height);
+                block_sse = s->strip_sse[bx];
+                if (!too_small(&a))
+                    ms_act = block_ms_act(s, &a, s->strip_sa[bx], XPSNR_GAMMA * s->strip_ta[bx],
+                                          block_width, block_height);
+            } else
+#endif
+            block_sse = s->bpc == 8
                 ? block_8(s, p, x, y, block_width, block_height, &ms_act)
                 : block_16(s, p, x, y, block_width, block_height, &ms_act);
             sse_luma[idx_blk] = (double) block_sse;
@@ -306,6 +437,7 @@ static int close(VmafFeatureExtractor *fex)
     free(s->sse_luma);
     free(s->weights);
     free(s->zeros);
+    free(s->strip_sse);
     return 0;
 }
 

@@ -71,7 +71,7 @@ jobs:
       - name: Install Meson and Ninja
         if: matrix.build.type == 'msvc'
         run: |
-          pip install meson ninja
+          pip install meson ninja pkgconf
 
       - name: Install build tools
         if: matrix.build.type == 'msvc'

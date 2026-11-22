@@ -25,8 +25,8 @@ $commit = (git -C $repository rev-parse HEAD).Trim()
 # fast/dist, which may hold other files from earlier builds).
 $expected = @(
     'libvmaf/libvmaf.dll', 'libvmaf/licenses/LICENSE.libvmaf.txt', 'libvmaf/licenses/LICENSE.nv-codec-headers.txt',
-    'libvmaf/licenses/LICENSE.pthreads4w.txt', 'libvmaf/licenses/LICENSE.xpsnr.txt',
-    'vmaf_vulkan/vmaf_vulkan.dll', 'vmaf_vulkan/licenses/LICENSE.libvmaf.txt')
+    'libvmaf/licenses/LICENSE.pthreads4w.txt', 'libvmaf/licenses/LICENSE.simd.txt', 'libvmaf/licenses/LICENSE.xpsnr.txt',
+    'libvmaf/licenses/LICENSE.zimg.txt', 'vmaf_vulkan/vmaf_vulkan.dll', 'vmaf_vulkan/licenses/LICENSE.libvmaf.txt')
 $built = @(foreach ($folder in 'libvmaf', 'vmaf_vulkan') {
     $root = Join-Path $dist $folder
     if (Test-Path $root) {

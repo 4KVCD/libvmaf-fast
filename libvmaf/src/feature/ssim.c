@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <stdbool.h>
 
 #include <errno.h>
 
@@ -32,6 +33,28 @@
 #include "iqa/decimate.h"
 #include "iqa/ssim_tools.h"
 #include "ssim.h"
+#include "cpu.h"
+/* libvmaf-fast's SIMD box sums: AVX2 (x86/ssim_decimate_avx2.c) or NEON
+ * (arm64/ssim_decimate_neon.c) */
+#if ARCH_X86
+#include "x86/ssim_decimate_avx2.h"
+#define SSIM_DECIMATE_SIMD_FLAG VMAF_X86_CPU_FLAG_AVX2
+#define ssim_column_sums_simd_8 ssim_column_sums_avx2_8
+#define ssim_column_sums_simd_16 ssim_column_sums_avx2_16
+#define ssim_box_sums_simd ssim_box_sums_avx2
+#define ssim_column_table_sums_simd_8 ssim_column_table_sums_avx2_8
+#define ssim_column_table_sums_simd_16 ssim_column_table_sums_avx2_16
+#define ssim_box_table_sums_simd ssim_box_table_sums_avx2
+#elif ARCH_AARCH64
+#include "arm64/ssim_decimate_neon.h"
+#define SSIM_DECIMATE_SIMD_FLAG VMAF_ARM_CPU_FLAG_NEON
+#define ssim_column_sums_simd_8 ssim_column_sums_neon_8
+#define ssim_column_sums_simd_16 ssim_column_sums_neon_16
+#define ssim_box_sums_simd ssim_box_sums_neon
+#define ssim_column_table_sums_simd_8 ssim_column_table_sums_neon_8
+#define ssim_column_table_sums_simd_16 ssim_column_table_sums_neon_16
+#define ssim_box_table_sums_simd ssim_box_table_sums_neon
+#endif
 
 /* _ssim_map */
 int _ssim_map(const struct _ssim_int *si, void *ctx)
@@ -74,6 +97,11 @@ int ssim_scale(int w, int h, int scale_override)
  * 1080p and 4K), each product is the value times it exactly, and the sum is
  * the integer sum of the samples times one power of two. Otherwise each
  * sample's product is looked up in a table of them.
+ *
+ * With SIMD (x86/ssim_decimate_avx2.c, arm64/ssim_decimate_neon.c) each
+ * output row is made in two steps, the sums of each column's `scale` rows
+ * and then the sums of `scale` of those; the boxes at the left and right
+ * edges, which mirror, from the same column sums here.
  */
 static int ssim_mirror(int i, int n)
 {
@@ -82,31 +110,177 @@ static int ssim_mirror(int i, int n)
     return i;
 }
 
-static int decimate_picture(VmafPicture *pic, int scale, float *dst,
-                            int sw, int sh, const double *table)
+/* Everything compute_ssim_decimated needs for pictures of one size, bit
+ * depth and scale, kept from frame to frame: at 1080p and 4K each float
+ * buffer is just over 512 KB, which Windows' heap gives straight from the
+ * system, so allocating them every frame took page faults worth a fifth of
+ * the SSIM's time. */
+struct SsimWorkspace {
+    int w, h, scale, sw, sh;
+    unsigned bpc;
+    double unit;          /* 1/(scale*scale) over the conversion's divisor */
+    double *table;        /* each sample's float product; NULL: unit works */
+    bool simd_sums;       /* integer box sums fit ssim_box_sums_simd */
+    int *columns;         /* each output's box columns, mirrored: sw * scale */
+    double *acc;          /* the C code's row of box sums: sw */
+    uint32_t *col;        /* integer column sums: w */
+    double *col_table;    /* table column sums: w */
+    const uint8_t **rows8;    /* the box rows of one output row: scale */
+    const uint16_t **rows16;
+    float *ref_f, *cmp_f; /* the decimated pictures: sw * sh each */
+    float *iqa;           /* _iqa_ssim_ws's buffers: 6 * sw * sh */
+};
+
+SsimWorkspace *ssim_workspace_alloc(int w, int h, int scale, unsigned bpc)
 {
-    const int w = pic->w[0], h = pic->h[0];
+    if (scale <= 1 || w <= 0 || h <= 0)
+        return NULL;
+    if (bpc != 8 && bpc != 10 && bpc != 12 && bpc != 16)
+        return NULL;  /* picture_copy reads others as 8-bit */
+    SsimWorkspace *ws = calloc(1, sizeof(*ws));
+    if (!ws) return NULL;
+    ws->w = w;
+    ws->h = h;
+    ws->scale = scale;
+    ws->bpc = bpc;
+    ws->sw = w / scale + (w & 1);
+    ws->sh = h / scale + (h & 1);
+    const float divisor = bpc == 10 ? 4.0f : bpc == 12 ? 16.0f : bpc == 16 ? 256.0f : 1.0f;
+    ws->unit = 1.0 / (double)(scale * scale) / (double)divisor;
+    const int power_of_two = (scale & (scale - 1)) == 0;
+    if (!power_of_two) {
+        /* low_pass.kernel[] as compute_ssim() makes it */
+        const float k = 1.0f / (scale * scale);
+        const size_t values = (size_t)1 << bpc;
+        ws->table = malloc(sizeof(double) * values);
+        if (!ws->table) goto fail;
+        for (size_t i = 0; i < values; i++) {
+            /* picture_copy's value, times the kernel's float, in float */
+            const float value = bpc == 8 ? (float)i + 0 : (float)i / divisor + 0;
+            const float product = value * k;
+            ws->table[i] = (double)product;
+        }
+    }
+    const uint64_t max_box = (uint64_t)scale * scale * ((1u << bpc) - 1);
+    ws->simd_sums = power_of_two && max_box < (1u << 24);
+    const size_t small = (size_t)ws->sw * ws->sh;
+    ws->columns = malloc(sizeof(int) * ws->sw * scale);
+    ws->acc = malloc(sizeof(double) * ws->sw);
+    ws->col = malloc(sizeof(uint32_t) * w);
+    ws->col_table = malloc(sizeof(double) * w);
+    ws->rows8 = malloc(sizeof(*ws->rows8) * scale);
+    ws->rows16 = malloc(sizeof(*ws->rows16) * scale);
+    ws->ref_f = malloc(sizeof(float) * small);
+    ws->cmp_f = malloc(sizeof(float) * small);
+    ws->iqa = malloc(sizeof(float) * small * 6);
+    if (!ws->columns || !ws->acc || !ws->col || !ws->col_table || !ws->rows8 ||
+        !ws->rows16 || !ws->ref_f || !ws->cmp_f || !ws->iqa)
+        goto fail;
+    /* _iqa_filter_pixel's window: the scale samples from x * scale - uc */
+    const int uc = scale / 2;
+    for (int x = 0; x < ws->sw; x++)
+        for (int u = 0; u < scale; u++)
+            ws->columns[x * scale + u] = ssim_mirror(x * scale - uc + u, w);
+    return ws;
+fail:
+    ssim_workspace_free(ws);
+    return NULL;
+}
+
+void ssim_workspace_free(SsimWorkspace *ws)
+{
+    if (!ws) return;
+    free(ws->table);
+    free(ws->columns);
+    free(ws->acc);
+    free(ws->col);
+    free(ws->col_table);
+    free(ws->rows8);
+    free(ws->rows16);
+    free(ws->ref_f);
+    free(ws->cmp_f);
+    free(ws->iqa);
+    free(ws);
+}
+
+#ifdef SSIM_DECIMATE_SIMD_FLAG
+/* Output x of a row from the row's column sums, its box mirrored at the
+ * picture's edge (ws->columns), as the C code's sum. */
+static float mirrored_box_sum(const SsimWorkspace *ws, int x)
+{
+    const int *c = ws->columns + x * ws->scale;
+    if (ws->table) {
+        double sum = 0.0;
+        for (int u = 0; u < ws->scale; u++)
+            sum += ws->col_table[c[u]];
+        return (float)sum;
+    }
+    uint32_t sum = 0;
+    for (int u = 0; u < ws->scale; u++)
+        sum += ws->col[c[u]];
+    return (float)((double)sum * ws->unit);
+}
+
+/* One output row from its box rows (ws->rows8 or rows16) with SIMD: the
+ * column sums, the box sums inside the picture, and the mirrored boxes at
+ * the edges from the same column sums. */
+static void decimate_row_simd(const SsimWorkspace *ws, int wide, float *out)
+{
+    const int scale = ws->scale, sw = ws->sw, uc = scale / 2;
+    /* outputs whose box lies inside the picture: x * scale - uc >= 0 and
+     * x * scale - uc + scale <= w */
+    const int inside_lo = 1;
+    int inside_hi = (ws->w + uc - scale) / scale + 1;
+    if (inside_hi > sw) inside_hi = sw;
+    if (inside_hi < inside_lo) inside_hi = inside_lo;
+    if (ws->table) {
+        if (wide)
+            ssim_column_table_sums_simd_16(ws->rows16, scale, ws->w, ws->table, ws->col_table);
+        else
+            ssim_column_table_sums_simd_8(ws->rows8, scale, ws->w, ws->table, ws->col_table);
+        ssim_box_table_sums_simd(ws->col_table, scale, inside_lo, inside_hi, out);
+    } else {
+        if (wide)
+            ssim_column_sums_simd_16(ws->rows16, scale, ws->w, ws->col);
+        else
+            ssim_column_sums_simd_8(ws->rows8, scale, ws->w, ws->col);
+        ssim_box_sums_simd(ws->col, scale, inside_lo, inside_hi, (float)ws->unit, out);
+    }
+    for (int x = 0; x < inside_lo; x++)
+        out[x] = mirrored_box_sum(ws, x);
+    for (int x = inside_hi; x < sw; x++)
+        out[x] = mirrored_box_sum(ws, x);
+}
+#endif
+
+static void decimate_picture(VmafPicture *pic, SsimWorkspace *ws, int simd, float *dst)
+{
+    const int h = ws->h, scale = ws->scale, sw = ws->sw, sh = ws->sh;
     const int wide = pic->bpc > 8;
     const ptrdiff_t stride = wide ? pic->stride[0] / 2 : pic->stride[0];
     const uint8_t *data8 = pic->data[0];
     const uint16_t *data16 = pic->data[0];
-    /* _iqa_filter_pixel's window: the scale samples from x * scale - uc */
+    const double *table = ws->table;
     const int uc = scale / 2;
-    double *acc = malloc(sizeof(double) * sw);
-    int *columns = malloc(sizeof(int) * sw * scale);
-    if (!acc || !columns) {
-        free(acc);
-        free(columns);
-        return -ENOMEM;
-    }
-    for (int x = 0; x < sw; x++)
-        for (int u = 0; u < scale; u++)
-            columns[x * scale + u] = ssim_mirror(x * scale - uc + u, w);
-    /* table == NULL: 1/(scale*scale) and the conversion are powers of two */
-    const double unit = 1.0 / (double)(scale * scale) /
-                        (pic->bpc == 10 ? 4.0 : pic->bpc == 12 ? 16.0 :
-                         pic->bpc == 16 ? 256.0 : 1.0);
+    double *acc = ws->acc;
+#ifndef SSIM_DECIMATE_SIMD_FLAG
+    (void) simd;
+#endif
     for (int y = 0; y < sh; y++) {
+        float *out = dst + (size_t)y * sw;
+#ifdef SSIM_DECIMATE_SIMD_FLAG
+        if (simd && (table || ws->simd_sums)) {
+            for (int v = 0; v < scale; v++) {
+                const int row = ssim_mirror(y * scale - uc + v, h);
+                if (wide)
+                    ws->rows16[v] = data16 + row * stride;
+                else
+                    ws->rows8[v] = data8 + row * stride;
+            }
+            decimate_row_simd(ws, wide, out);
+            continue;
+        }
+#endif
         for (int x = 0; x < sw; x++)
             acc[x] = 0.0;
         for (int v = 0; v < scale; v++) {
@@ -114,7 +288,7 @@ static int decimate_picture(VmafPicture *pic, int scale, float *dst,
             const uint8_t *r8 = data8 + row * stride;
             const uint16_t *r16 = data16 + row * stride;
             for (int x = 0; x < sw; x++) {
-                const int *c = columns + x * scale;
+                const int *c = ws->columns + x * scale;
                 if (table) {
                     double sum = 0.0;
                     for (int u = 0; u < scale; u++)
@@ -128,22 +302,18 @@ static int decimate_picture(VmafPicture *pic, int scale, float *dst,
                 }
             }
         }
-        float *out = dst + (size_t)y * sw;
         for (int x = 0; x < sw; x++)
-            out[x] = (float)(table ? acc[x] : acc[x] * unit);
+            out[x] = (float)(table ? acc[x] : acc[x] * ws->unit);
     }
-    free(acc);
-    free(columns);
-    return 0;
 }
 
-static int ssim_of_floats(float *ref_f, float *cmp_f, int w, int h,
+static int ssim_of_floats(float *ref_f, float *cmp_f, int w, int h, float *iqa,
                           double *score, double *l_score, double *c_score,
                           double *s_score);
 
 int compute_ssim_decimated(VmafPicture *ref, VmafPicture *cmp, int scale,
-                           double *score, double *l_score, double *c_score,
-                           double *s_score)
+                           SsimWorkspace *ws, double *score, double *l_score,
+                           double *c_score, double *s_score)
 {
     const int w = ref->w[0], h = ref->h[0];
     const unsigned bpc = ref->bpc;
@@ -151,38 +321,26 @@ int compute_ssim_decimated(VmafPicture *ref, VmafPicture *cmp, int scale,
         return -EINVAL;
     if (bpc != 8 && bpc != 10 && bpc != 12 && bpc != 16)
         return -EINVAL;  /* picture_copy reads others as 8-bit */
-    const int sw = w / scale + (w & 1), sh = h / scale + (h & 1);
-    /* low_pass.kernel[] as compute_ssim() makes it */
-    const float k = 1.0f / (scale * scale);
-    const int power_of_two = (scale & (scale - 1)) == 0;
-    double *table = NULL;
-    if (!power_of_two) {
-        const size_t values = (size_t)1 << bpc;
-        const float scaler = bpc == 10 ? 4.0f : bpc == 12 ? 16.0f : bpc == 16 ? 256.0f : 1.0f;
-        table = malloc(sizeof(double) * values);
-        if (!table) return -ENOMEM;
-        for (size_t i = 0; i < values; i++) {
-            /* picture_copy's value, times the kernel's float, in float */
-            const float value = bpc == 8 ? (float)i + 0 : (float)i / scaler + 0;
-            const float product = value * k;
-            table[i] = (double)product;
-        }
+    SsimWorkspace *own = NULL;
+    if (!ws || ws->w != w || ws->h != h || ws->scale != scale || ws->bpc != bpc) {
+        ws = own = ssim_workspace_alloc(w, h, scale, bpc);
+        if (!ws) return -ENOMEM;
     }
-    float *ref_f = malloc(sizeof(float) * sw * sh);
-    float *cmp_f = malloc(sizeof(float) * sw * sh);
-    int err = (!ref_f || !cmp_f) ? -ENOMEM : 0;
-    if (!err) err = decimate_picture(ref, scale, ref_f, sw, sh, table);
-    if (!err) err = decimate_picture(cmp, scale, cmp_f, sw, sh, table);
-    if (!err)
-        err = ssim_of_floats(ref_f, cmp_f, sw, sh, score, l_score, c_score, s_score);
-    free(ref_f);
-    free(cmp_f);
-    free(table);
+    int simd = 0;
+#ifdef SSIM_DECIMATE_SIMD_FLAG
+    simd = !!(vmaf_get_cpu_flags() & SSIM_DECIMATE_SIMD_FLAG);
+#endif
+    decimate_picture(ref, ws, simd, ws->ref_f);
+    decimate_picture(cmp, ws, simd, ws->cmp_f);
+    const int err = ssim_of_floats(ws->ref_f, ws->cmp_f, ws->sw, ws->sh, ws->iqa,
+                                   score, l_score, c_score, s_score);
+    ssim_workspace_free(own);
     return err;
 }
 
-/* compute_ssim()'s SSIM of two (decimated) float images, as it is there. */
-static int ssim_of_floats(float *ref_f, float *cmp_f, int w, int h,
+/* compute_ssim()'s SSIM of two (decimated) float images, as it is there,
+ * with iqa (6 * w * h floats) for _iqa_ssim_ws's buffers. */
+static int ssim_of_floats(float *ref_f, float *cmp_f, int w, int h, float *iqa,
                           double *score, double *l_score, double *c_score,
                           double *s_score)
 {
@@ -196,7 +354,7 @@ static int ssim_of_floats(float *ref_f, float *cmp_f, int w, int h,
     window.w = window.h = GAUSSIAN_LEN;
     window.normalized = 1;
     window.bnd_opt = KBND_SYMMETRIC;
-    const float result = _iqa_ssim(ref_f, cmp_f, w, h, &window, &mr, args, &l, &c, &s);
+    const float result = _iqa_ssim_ws(ref_f, cmp_f, w, h, &window, &mr, args, &l, &c, &s, iqa);
     *score = (double)result;
     *l_score = (double)l;
     *c_score = (double)c;

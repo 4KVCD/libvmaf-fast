@@ -62,6 +62,54 @@ int vmaf_picture_priv_init(VmafPicture *pic)
     return 0;
 }
 
+static int wrap_release_picture(VmafPicture *pic, void *cookie)
+{
+    (void) pic;
+    (void) cookie;
+    return 0;
+}
+
+int vmaf_picture_wrap(VmafPicture *pic,
+                      VmafPictureWrapped pic_wrapped)
+{
+    if (!pic) return -EINVAL;
+    if (!pic_wrapped.pix_fmt) return -EINVAL;
+    if (pic_wrapped.bpc < 8 || pic_wrapped.bpc > 16) return -EINVAL;
+
+    int err = 0;
+
+    memset(pic, 0, sizeof(*pic));
+    pic->pix_fmt = pic_wrapped.pix_fmt;
+    pic->bpc = pic_wrapped.bpc;
+    const int ss_hor = pic->pix_fmt != VMAF_PIX_FMT_YUV444P;
+    const int ss_ver = pic->pix_fmt == VMAF_PIX_FMT_YUV420P;
+    pic->w[0] = pic_wrapped.w;
+    pic->w[1] = pic->w[2] = pic_wrapped.w >> ss_hor;
+    pic->h[0] = pic_wrapped.h;
+    pic->h[1] = pic->h[2] = pic_wrapped.h >> ss_ver;
+    if (pic->pix_fmt == VMAF_PIX_FMT_YUV400P)
+        pic->w[1] = pic->w[2] = pic->h[1] = pic->h[2] = 0;
+
+    for (int i = 0; i < 3; i++) {
+        pic->data[i] = pic_wrapped.data[i];
+        pic->stride[i] = pic_wrapped.stride[i];
+    }
+
+    err |= vmaf_picture_priv_init(pic);
+    err |= vmaf_picture_set_release_callback(pic, pic_wrapped.cookie,
+               pic_wrapped.release_picture ? pic_wrapped.release_picture : wrap_release_picture);
+    if (err) goto free_priv;
+
+    err = vmaf_ref_init(&pic->ref);
+    if (err) goto free_priv;
+
+    return 0;
+
+free_priv:
+    free(pic->priv);
+    return -ENOMEM;
+}
+
 int vmaf_picture_alloc(VmafPicture *pic, enum VmafPixelFormat pix_fmt,
                        unsigned bpc, unsigned w, unsigned h)
 {
@@ -421,12 +469,16 @@ int vmaf_picture_convert_context_init(VmafPictureConvertContext **ctx,
     c->src.color = src->color;
 
     zimg_graph_builder_params params;
-    const zimg_graph_builder_params *params_ptr = NULL;
-    if (target->resample_filter != VMAF_RESAMPLE_DEFAULT) {
-        zimg_graph_builder_params_default(&params, ZIMG_API_VERSION);
+    const zimg_graph_builder_params *params_ptr = &params;
+    zimg_graph_builder_params_default(&params, ZIMG_API_VERSION);
+    /* Match FFmpeg's zscale (agamma=1): exact transfer functions are ~20x
+     * slower for PQ and change scores negligibly. */
+    params.allow_approximate_gamma = 1;
+    /* Pin chroma to zimg's current default, so a change to that default
+     * cannot change scores. */
+    params.resample_filter_uv = ZIMG_RESIZE_BILINEAR;
+    if (target->resample_filter != VMAF_RESAMPLE_DEFAULT)
         params.resample_filter = resample_filter_to_zimg(target->resample_filter);
-        params_ptr = &params;
-    }
 
     c->graph = zimg_filter_graph_build(&src_fmt, &dst_fmt, params_ptr);
     if (!c->graph) {

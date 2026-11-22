@@ -17,6 +17,9 @@
  */
 
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "config.h"
 #include "test.h"
@@ -371,6 +374,405 @@ static char *test_model_set_flags()
     return NULL;
 }
 
+static char *read_model_json_with_block(char **out, const char *block)
+{
+    const char *path = JSON_MODEL_PATH"vmaf_v0.6.1.json";
+    FILE *f = fopen(path, "rb");
+    mu_assert("could not open model json", f);
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc(n + 1);
+    mu_assert("out of memory", buf);
+    mu_assert("could not read model json", fread(buf, 1, n, f) == (size_t) n);
+    fclose(f);
+    buf[n] = '\0';
+
+    const char *key = "\"model_dict\": {";
+    char *at = strstr(buf, key);
+    mu_assert("model_dict not found", at);
+    at += strlen(key);
+
+    size_t block_len = strlen(block);
+    char *res = malloc(n + block_len + 1);
+    mu_assert("out of memory", res);
+    memcpy(res, buf, at - buf);
+    memcpy(res + (at - buf), block, block_len);
+    strcpy(res + (at - buf) + block_len, at);
+    free(buf);
+    *out = res;
+    return NULL;
+}
+
+static int load_model_with_block(VmafModel **model, const char *block)
+{
+    char *json;
+    if (read_model_json_with_block(&json, block)) return -EIO;
+    VmafModelConfig cfg = { 0 };
+    int err = vmaf_read_json_model_from_buffer(model, &cfg, json,
+                                               (int) strlen(json));
+    free(json);
+    return err;
+}
+
+static char *test_model_without_conversion_target()
+{
+    VmafModel *model;
+    int err = load_model_with_block(&model, "");
+    mu_assert("problem loading model", !err);
+    mu_assert("model without a block should have no conversion target",
+              !model->conversion_target.enabled);
+    vmaf_model_destroy(model);
+
+    return NULL;
+}
+
+static char *test_model_conversion_target()
+{
+    VmafModel *model;
+    int err = load_model_with_block(&model,
+        "\"conversion_target\": {\"colorspace\": {\"range\": \"limited\", "
+        "\"primaries\": \"bt2020\", \"trc\": \"smpte2084\", "
+        "\"matrix\": \"ictcp\"}}, ");
+    mu_assert("problem loading model with conversion_target", !err);
+    mu_assert("conversion target should be enabled",
+              model->conversion_target.enabled);
+    const VmafColor *c = &model->conversion_target.color;
+    mu_assert("range", c->range == VMAF_COLOR_RANGE_LIMITED);
+    mu_assert("primaries", c->primaries == VMAF_COLOR_PRIMARIES_BT2020);
+    mu_assert("trc", c->trc == VMAF_COLOR_TRC_SMPTE2084);
+    mu_assert("matrix", c->matrix == VMAF_COLOR_MATRIX_ICTCP);
+    vmaf_model_destroy(model);
+
+    return NULL;
+}
+
+static char *test_model_conversion_target_rejects_bad_input()
+{
+    const char *bad[] = {
+        /* unknown name */
+        "\"conversion_target\": {\"colorspace\": {\"range\": \"limited\", "
+        "\"primaries\": \"bt2020\", \"trc\": \"hlg\", "
+        "\"matrix\": \"ictcp\"}}, ",
+        /* missing attribute */
+        "\"conversion_target\": {\"colorspace\": {\"range\": \"limited\", "
+        "\"primaries\": \"bt2020\", \"trc\": \"smpte2084\"}}, ",
+        /* "unknown" is not a valid target value */
+        "\"conversion_target\": {\"colorspace\": {\"range\": \"unknown\", "
+        "\"primaries\": \"bt2020\", \"trc\": \"smpte2084\", "
+        "\"matrix\": \"ictcp\"}}, ",
+        /* block without a colorspace */
+        "\"conversion_target\": {}, ",
+    };
+
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
+        VmafModel *model = NULL;
+        int err = load_model_with_block(&model, bad[i]);
+        /* a failed load leaves the half-built model with the caller */
+        if (model) vmaf_model_destroy(model);
+        mu_assert("a malformed conversion_target should be rejected", err);
+    }
+
+    return NULL;
+}
+
+static char *test_model_conversion_target_format_and_depth()
+{
+    VmafModel *model;
+    int err = load_model_with_block(&model,
+        "\"conversion_target\": {\"colorspace\": {\"range\": \"limited\", "
+        "\"primaries\": \"bt2020\", \"trc\": \"smpte2084\", "
+        "\"matrix\": \"ictcp\"}, \"pixel_format\": \"420\", "
+        "\"bit_depth\": 16}, ");
+    mu_assert("problem loading model with format and depth", !err);
+    mu_assert("pixel_format should be parsed",
+              model->conversion_target.pix_fmt == VMAF_PIX_FMT_YUV420P);
+    mu_assert("bit_depth should be parsed", model->conversion_target.bpc == 16);
+    vmaf_model_destroy(model);
+
+    err = load_model_with_block(&model,
+        "\"conversion_target\": {\"colorspace\": {\"range\": \"limited\", "
+        "\"primaries\": \"bt2020\", \"trc\": \"smpte2084\", "
+        "\"matrix\": \"ictcp\"}}, ");
+    mu_assert("problem loading model without format and depth", !err);
+    mu_assert("an absent pixel_format should mean keep the source's",
+              model->conversion_target.pix_fmt == VMAF_PIX_FMT_UNKNOWN);
+    mu_assert("an absent bit_depth should mean keep the source's",
+              model->conversion_target.bpc == 0);
+    vmaf_model_destroy(model);
+
+    return NULL;
+}
+
+static char *test_model_conversion_target_rejects_bad_format_and_depth()
+{
+    const char *colorspace =
+        "\"colorspace\": {\"range\": \"limited\", \"primaries\": \"bt2020\", "
+        "\"trc\": \"smpte2084\", \"matrix\": \"ictcp\"}";
+    const char *extra[] = {
+        "\"pixel_format\": \"400\"",
+        "\"pixel_format\": \"yuv420p\"",
+        "\"pixel_format\": 420",
+        "\"bit_depth\": 7",
+        "\"bit_depth\": 17",
+        "\"bit_depth\": 10.5",
+        "\"bit_depth\": \"16\"",
+    };
+
+    for (unsigned i = 0; i < sizeof(extra) / sizeof(*extra); i++) {
+        char block[512];
+        snprintf(block, sizeof(block), "\"conversion_target\": {%s, %s}, ",
+                 colorspace, extra[i]);
+        VmafModel *model = NULL;
+        int err = load_model_with_block(&model, block);
+        if (model) vmaf_model_destroy(model);
+        mu_assert("a bad pixel_format or bit_depth should be rejected", err);
+    }
+
+    return NULL;
+}
+
+static char *test_model_conversion_target_resolution()
+{
+    VmafModel *model;
+    int err = load_model_with_block(&model,
+        "\"conversion_target\": {\"colorspace\": {\"range\": \"limited\", "
+        "\"primaries\": \"bt2020\", \"trc\": \"smpte2084\", "
+        "\"matrix\": \"ictcp\"}, \"resolution\": {\"display\": 2160}}, ");
+    mu_assert("problem loading model with a resolution", !err);
+    mu_assert("display should be parsed",
+              model->conversion_target.display_resolution == 2160);
+    vmaf_model_destroy(model);
+
+    err = load_model_with_block(&model,
+        "\"conversion_target\": {\"colorspace\": {\"range\": \"limited\", "
+        "\"primaries\": \"bt2020\", \"trc\": \"smpte2084\", "
+        "\"matrix\": \"ictcp\"}}, ");
+    mu_assert("problem loading model without a resolution", !err);
+    mu_assert("an absent resolution should mean keep the source's size",
+              model->conversion_target.display_resolution == 0);
+    vmaf_model_destroy(model);
+
+    return NULL;
+}
+
+static const struct {
+    const char *version;
+    const char *path;
+    unsigned display;
+} hdr_v118_models[] = {
+    { "hdr_vmaf_v1.1.8_3d0h",
+      "hdr_vmaf_v1.1.8/hdr_vmaf_v1.1.8_3d0h.json", 1080 },
+    { "hdr_vmaf_v1.1.8_3d0h_2160",
+      "hdr_vmaf_v1.1.8/hdr_vmaf_v1.1.8_3d0h_2160.json", 2160 },
+    { "hdr_vmaf_v1.1.8_5d0h",
+      "hdr_vmaf_v1.1.8/hdr_vmaf_v1.1.8_5d0h.json", 1080 },
+    { "hdr_vmaf_v1.1.8_1d5h_2160",
+      "hdr_vmaf_v1.1.8/hdr_vmaf_v1.1.8_1d5h_2160.json", 2160 },
+    { "hdr_vmaf_v1.1.8_hfr_3d0h",
+      "hdr_vmaf_v1.1.8_hfr/hdr_vmaf_v1.1.8_hfr_3d0h.json", 1080 },
+    { "hdr_vmaf_v1.1.8_hfr_3d0h_2160",
+      "hdr_vmaf_v1.1.8_hfr/hdr_vmaf_v1.1.8_hfr_3d0h_2160.json", 2160 },
+    { "hdr_vmaf_v1.1.8_hfr_5d0h",
+      "hdr_vmaf_v1.1.8_hfr/hdr_vmaf_v1.1.8_hfr_5d0h.json", 1080 },
+    { "hdr_vmaf_v1.1.8_hfr_1d5h_2160",
+      "hdr_vmaf_v1.1.8_hfr/hdr_vmaf_v1.1.8_hfr_1d5h_2160.json", 2160 },
+};
+
+static char *check_hdr_v118_target(const VmafModel *model, unsigned display)
+{
+    mu_assert("v1.1.8 model should declare a conversion target",
+              model->conversion_target.enabled);
+    mu_assert("v1.1.8 target should be 4:2:0",
+              model->conversion_target.pix_fmt == VMAF_PIX_FMT_YUV420P);
+    mu_assert("v1.1.8 target should be 16-bit",
+              model->conversion_target.bpc == 16);
+    mu_assert("v1.1.8 target range",
+              model->conversion_target.color.range == VMAF_COLOR_RANGE_LIMITED);
+    mu_assert("v1.1.8 target primaries",
+              model->conversion_target.color.primaries ==
+              VMAF_COLOR_PRIMARIES_BT2020);
+    mu_assert("v1.1.8 target trc",
+              model->conversion_target.color.trc == VMAF_COLOR_TRC_SMPTE2084);
+    mu_assert("v1.1.8 target matrix",
+              model->conversion_target.color.matrix == VMAF_COLOR_MATRIX_ICTCP);
+    mu_assert("v1.1.8 target display resolution",
+              model->conversion_target.display_resolution == display);
+    return NULL;
+}
+
+static char *test_shipped_hdr_v118_models_declare_yuv420p16le_target()
+{
+    for (unsigned i = 0; i < sizeof(hdr_v118_models) / sizeof(*hdr_v118_models);
+         i++)
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s%s", JSON_MODEL_PATH,
+                 hdr_v118_models[i].path);
+        VmafModel *model;
+        VmafModelConfig cfg = { 0 };
+        int err = vmaf_model_load_from_path(&model, &cfg, path);
+        mu_assert("problem loading shipped v1.1.8 model from path", !err);
+        char *msg = check_hdr_v118_target(model, hdr_v118_models[i].display);
+        vmaf_model_destroy(model);
+        if (msg) return msg;
+
+#if VMAF_BUILT_IN_MODELS
+        VmafModelConfig built_in_cfg = { 0 };
+        err = vmaf_model_load(&model, &built_in_cfg, hdr_v118_models[i].version);
+        mu_assert("problem loading built-in v1.1.8 model", !err);
+        msg = check_hdr_v118_target(model, hdr_v118_models[i].display);
+        vmaf_model_destroy(model);
+        if (msg) return msg;
+#endif
+    }
+    return NULL;
+}
+
+static char *test_model_conversion_target_rejects_bad_resolution()
+{
+    const char *colorspace =
+        "\"colorspace\": {\"range\": \"limited\", \"primaries\": \"bt2020\", "
+        "\"trc\": \"smpte2084\", \"matrix\": \"ictcp\"}";
+    const char *extra[] = {
+        "\"resolution\": {\"display\": 720}",
+        "\"resolution\": {\"display\": \"1080\"}",
+        "\"resolution\": {\"display\": 1080.5}",
+        "\"resolution\": {}",
+        "\"resolution\": 1080",
+        "\"resolution\": {\"display\": 1080, "
+            "\"filter\": {\"upscale\": \"bicubic\"}}",
+    };
+
+    for (unsigned i = 0; i < sizeof(extra) / sizeof(*extra); i++) {
+        char block[512];
+        snprintf(block, sizeof(block), "\"conversion_target\": {%s, %s}, ",
+                 colorspace, extra[i]);
+        VmafModel *model = NULL;
+        int err = load_model_with_block(&model, block);
+        if (model) vmaf_model_destroy(model);
+        mu_assert("a bad resolution should be rejected", err);
+    }
+
+    return NULL;
+}
+
+static char *test_model_conversion_target_assumed_color()
+{
+    VmafModel *model;
+    int err = load_model_with_block(&model,
+        "\"conversion_target\": {\"colorspace\": {\"range\": \"limited\", "
+        "\"primaries\": \"bt709\", \"trc\": \"bt709\", "
+        "\"matrix\": \"bt709\"}, \"assumed_color_if_untagged\": "
+        "{\"range\": \"full\", \"primaries\": \"smpte432\", "
+        "\"trc\": \"bt709\", \"matrix\": \"bt709\"}}, ");
+    mu_assert("problem loading model with an assumed color", !err);
+    mu_assert("the assumed color should be recorded",
+              model->conversion_target.has_assumed_color);
+    mu_assert("the assumed color should be parsed",
+              model->conversion_target.assumed_color.range ==
+                  VMAF_COLOR_RANGE_FULL &&
+              model->conversion_target.assumed_color.primaries ==
+                  VMAF_COLOR_PRIMARIES_SMPTE432);
+    vmaf_model_destroy(model);
+
+    err = load_model_with_block(&model,
+        "\"conversion_target\": {\"colorspace\": {\"range\": \"limited\", "
+        "\"primaries\": \"bt709\", \"trc\": \"bt709\", "
+        "\"matrix\": \"bt709\"}}, ");
+    mu_assert("problem loading model without an assumed color", !err);
+    mu_assert("an absent assumed color should mean none",
+              !model->conversion_target.has_assumed_color);
+    vmaf_model_destroy(model);
+
+    return NULL;
+}
+
+static char *test_model_conversion_target_rejects_bad_assumed_color()
+{
+    const char *colorspace =
+        "\"colorspace\": {\"range\": \"limited\", \"primaries\": \"bt709\", "
+        "\"trc\": \"bt709\", \"matrix\": \"bt709\"}";
+    const char *extra[] = {
+        /* all four attributes are required */
+        "\"assumed_color_if_untagged\": {\"range\": \"limited\", "
+            "\"primaries\": \"bt709\", \"trc\": \"bt709\"}",
+        "\"assumed_color_if_untagged\": {}",
+        "\"assumed_color_if_untagged\": \"bt709\"",
+        "\"assumed_color_if_untagged\": {\"range\": \"limited\", "
+            "\"primaries\": \"nope\", \"trc\": \"bt709\", "
+            "\"matrix\": \"bt709\"}",
+    };
+
+    for (unsigned i = 0; i < sizeof(extra) / sizeof(*extra); i++) {
+        char block[512];
+        snprintf(block, sizeof(block), "\"conversion_target\": {%s, %s}, ",
+                 colorspace, extra[i]);
+        VmafModel *model = NULL;
+        int err = load_model_with_block(&model, block);
+        if (model) vmaf_model_destroy(model);
+        mu_assert("a bad assumed color should be rejected", err);
+    }
+
+    return NULL;
+}
+
+static char *test_model_conversion_target_rejects_unknown_key()
+{
+    const char *colorspace =
+        "\"colorspace\": {\"range\": \"limited\", \"primaries\": \"bt2020\", "
+        "\"trc\": \"smpte2084\", \"matrix\": \"ictcp\"}";
+    const char *extra[] = {
+        /* misspellings that would otherwise skip the conversion */
+        "\"bit-depth\": 16",
+        "\"pix_fmt\": \"420\"",
+        /* a field this libvmaf does not know */
+        "\"future_field\": {\"x\": \"y\"}",
+    };
+
+    for (unsigned i = 0; i < sizeof(extra) / sizeof(*extra); i++) {
+        char block[512];
+        snprintf(block, sizeof(block), "\"conversion_target\": {%s, %s}, ",
+                 colorspace, extra[i]);
+        VmafModel *model = NULL;
+        int err = load_model_with_block(&model, block);
+        if (model) vmaf_model_destroy(model);
+        mu_assert("an unknown conversion_target key should be rejected", err);
+    }
+
+    return NULL;
+}
+
+static char *test_model_conversion_target_rejects_unknown_colorspace_key()
+{
+    VmafModel *model = NULL;
+    int err = load_model_with_block(&model,
+        "\"conversion_target\": {\"colorspace\": {\"range\": \"limited\", "
+        "\"primaries\": \"bt2020\", \"trc\": \"smpte2084\", "
+        "\"matrix\": \"ictcp\", \"transfer\": \"pq\"}}, ");
+    if (model) vmaf_model_destroy(model);
+    mu_assert("an unknown colorspace key should be rejected", err);
+
+    return NULL;
+}
+
+static char *test_model_conversion_target_rejects_unknown_assumed_color_key()
+{
+    VmafModel *model = NULL;
+    int err = load_model_with_block(&model,
+        "\"conversion_target\": {\"colorspace\": {\"range\": \"limited\", "
+        "\"primaries\": \"bt709\", \"trc\": \"bt709\", "
+        "\"matrix\": \"bt709\"}, \"assumed_color_if_untagged\": "
+        "{\"range\": \"full\", \"primaries\": \"smpte432\", "
+        "\"trc\": \"bt709\", \"matrix\": \"bt709\", "
+        "\"transfer\": \"pq\"}}, ");
+    if (model) vmaf_model_destroy(model);
+    mu_assert("an unknown assumed_color_if_untagged key should be rejected",
+              err);
+
+    return NULL;
+}
+
 char *run_tests()
 {
     mu_run_test(test_json_model);
@@ -382,5 +784,18 @@ char *run_tests()
     mu_run_test(test_model_check_default_behavior_set_flags);
     mu_run_test(test_model_set_flags);
     mu_run_test(test_model_feature);
+    mu_run_test(test_model_without_conversion_target);
+    mu_run_test(test_model_conversion_target);
+    mu_run_test(test_model_conversion_target_rejects_bad_input);
+    mu_run_test(test_model_conversion_target_format_and_depth);
+    mu_run_test(test_model_conversion_target_rejects_bad_format_and_depth);
+    mu_run_test(test_model_conversion_target_resolution);
+    mu_run_test(test_model_conversion_target_rejects_bad_resolution);
+    mu_run_test(test_model_conversion_target_assumed_color);
+    mu_run_test(test_model_conversion_target_rejects_bad_assumed_color);
+    mu_run_test(test_shipped_hdr_v118_models_declare_yuv420p16le_target);
+    mu_run_test(test_model_conversion_target_rejects_unknown_key);
+    mu_run_test(test_model_conversion_target_rejects_unknown_colorspace_key);
+    mu_run_test(test_model_conversion_target_rejects_unknown_assumed_color_key);
     return NULL;
 }

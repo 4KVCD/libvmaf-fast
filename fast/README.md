@@ -15,7 +15,7 @@ Everything the fork adds lives under `fast/`:
 
 Needs Windows x64, Visual Studio 2022 Build Tools (C++), git, and for libvmaf
 also the CUDA Toolkit 13.x, Python with meson and ninja
-(`pip install meson ninja`), and nasm, cmake and xxd on PATH (Git for
+(`pip install meson ninja pkgconf`), and nasm, cmake and xxd on PATH (Git for
 Windows has xxd in `usr\bin`). Slang, the shader compiler, and the Vulkan
 headers are downloaded at pinned versions.
 
@@ -126,7 +126,8 @@ and `vv_commit` to write frames in place), `vv_flush`, `vv_features` /
 without them leaving the GPU: `vv_shared_next` / `vv_export` /
 `vv_shared_device` (and `vv_shared_chroma` for VMAF v1) to share the input
 buffers with its CUDA or Vulkan device, `vv_import_timeline` /
-`vv_commit_after` to wait for its copies on the GPU, and `vv_pictures` to read
+`vv_commit_after` to have each frame submitted once its copies are done (by a
+thread of the context, so that neither side waits for them), and `vv_pictures` to read
 VMAF v1's pictures where it left them (Direct3D 11 textures).
 
 ## Releasing
