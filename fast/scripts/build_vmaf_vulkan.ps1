@@ -130,6 +130,12 @@ $shaders = [ordered]@{
     'speed_dec_img'     = 'speed', 'STAGE=1', 'NO_CONTRACTION=1', 'FROM_IMAGE=1'
     'speed_dec_split'   = 'speed', 'STAGE=1', 'NO_CONTRACTION=1', 'SPLIT=1'  # vv_export_part's two buffers
     'speed_blur'        = 'speed', 'STAGE=2', 'NO_CONTRACTION=1'
+    # The HDR models' picture conversion (shaders/convert.slang): zimg's
+    # float arithmetic exactly, so every multiply and add rounded.
+    'convert_resize_float' = 'convert', 'STEP=1', 'NO_CONTRACTION=1'
+    'convert_resize_int16' = 'convert', 'STEP=2', 'NO_CONTRACTION=1'
+    'convert_colour'       = 'convert', 'STEP=3', 'NO_CONTRACTION=1'
+    'convert_samples'      = 'convert', 'STEP=4', 'NO_CONTRACTION=1'
 }
 
 # A SPIR-V module with every float multiply, add, subtract and negation

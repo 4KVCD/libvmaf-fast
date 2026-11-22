@@ -49,6 +49,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -62,6 +63,7 @@
 #include "v1_host.h"
 #include "v1_speed.h"
 #include "cambi_lut.h"
+#include "../../libvmaf/include/libvmaf/picture_gpu_plan.h"
 
 #define VV_EXPORT extern "C" __declspec(dllexport)
 
@@ -874,6 +876,41 @@ struct vv_context {
     Buffer speedFilterTaps, speedOperating, speedScaling;
     int enable_speed(const double *values);
 
+    // The HDR models' picture conversion on the GPU (vv_v1_convert, shaders/
+    // convert.slang): the source pictures go in, and the context's size at 16
+    // bits comes out where the features read it -- the luma in picRef and
+    // picDis, the chroma in the slot's speedChroma (or convertChroma, which
+    // nothing reads, without SpEED). Per side (0 the reference, 1 the
+    // distorted): its plan (libvmaf's vmaf_picture_convert_gpu_plan) followed
+    // by where each of the plan's buffers is for each slot (convert.slang's
+    // places), the plan on the GPU, its scratch planes, and a pass per step.
+    struct ConvertSide {
+        std::vector<uint32_t> words;
+        uint32_t planeW[3] = {}, planeH[3] = {};
+        uint32_t planeOffset[3] = {};  // the source planes' bytes into a slot's part of convertSource
+        uint32_t placesAt = 0, placesWords = 0;  // slot k's places: words placesAt + k * placesWords on
+        Buffer tables, scratch;
+        std::vector<Pass> passes;
+    };
+    ConvertSide convertSides[2];
+    bool converting = false;
+    // The source pictures, both sides' planes, for each slot at k *
+    // convertSourceBytes (host-visible, written by vv_submit_v1). One buffer,
+    // not one a slot: a slot is picked by its places, so that a pass needs no
+    // descriptor set a slot.
+    Buffer convertSource;
+    uint32_t convertSourceBytes = 0;
+    Buffer convertChroma;
+    int enable_convert(const uint32_t *const plans[2], const size_t words[2]);
+    int load_convert_plan(int side, const uint32_t *plan, size_t words);
+    int add_convert_side(int side);
+    // The steps of the sides in `sides` (bit 0 the reference, 1 the distorted),
+    // a barrier after each step of both; `stamp(shader)` after each when given.
+    void record_convert(VkCommandBuffer cb, size_t slotIndex, unsigned sides, const std::function<void(int)> &stamp);
+    void write_convert_source(size_t slotIndex, int side, const uint16_t *const planes[3], const ptrdiff_t strides[3]);
+    int test_convert(int side, const uint16_t *const planes[3], const ptrdiff_t strides[3], uint16_t *const out[3],
+                     const ptrdiff_t outStrides[3]);
+
     // Profiling (vv_profile, for the speed work): the GPU's time per pass,
     // summed by shader, from timestamps around each, and the CPU's per step.
     bool profile = false;
@@ -915,6 +952,8 @@ struct vv_context {
     // `upload`: host memory the CPU only writes and the GPU reads (frames' planes).
     int create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported = false, bool upload = false);
     void destroy_last_buffer(Buffer &buffer);
+    // A buffer made again at another size, before any pass binds it.
+    int remake_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool upload);
     VkPipeline find_pipeline(int shader, const std::vector<uint32_t> &words) const;
     VkResult compile_pipeline(int shader, const std::vector<uint32_t> &words, VkPipeline *out) const;
     int compile_pipelines();
@@ -1180,6 +1219,18 @@ void vv_context::destroy_last_buffer(Buffer &buffer)
     buffers.pop_back();
 }
 
+int vv_context::remake_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool upload)
+{
+    if (buffer.buffer)
+        vk.vkDestroyBuffer(device, buffer.buffer, nullptr);
+    if (buffer.memory)
+        vk.vkFreeMemory(device, buffer.memory, nullptr);
+    buffer = Buffer();
+    const int error = create_buffer(buffer, size, hostVisible, false, upload);
+    buffers.pop_back();  // listed once already, from when it was first made
+    return error;
+}
+
 // The pipeline made for `shader` and these push constants (a specialized
 // shader's for exactly these; another's for any), or none yet.
 VkPipeline vv_context::find_pipeline(int shader, const std::vector<uint32_t> &words) const
@@ -1235,7 +1286,7 @@ int vv_context::compile_pipelines()
     struct Job { int shader; std::vector<uint32_t> words; VkPipeline made = VK_NULL_HANDLE; VkResult result = VK_SUCCESS; };
     std::vector<Job> jobs;
     std::vector<Pass *> passes;
-    for (std::vector<Pass> *list : { &motion[0], &motion[1], &scored })
+    for (std::vector<Pass> *list : { &motion[0], &motion[1], &scored, &convertSides[0].passes, &convertSides[1].passes })
         for (Pass &pass : *list)
             passes.push_back(&pass);
     for (Slot &slot : slots)  // VMAF v1's per slot (CAMBI's kept c-values, SpEED)
@@ -2947,6 +2998,8 @@ int vv_context::enable_speed(const double *values)
         return fail(-3, "SpEED is calculated in a VMAF v1 context only");
     if (frames || speed)
         return fail(-3, "SpEED is started before the first frame");
+    if (converting)  // whose passes write the chroma where SpEED would not read it
+        return fail(-3, "SpEED is started before the conversion (vv_v1_convert)");
     V1SpeedOptions &o = speedOptions;
     o.kernelscale = values[0];
     o.prescale = values[1];
@@ -3054,6 +3107,328 @@ int vv_context::enable_speed(const double *values)
         return fail(-2, "SpEED: its threads could not be started");
     speed = true;
     return 0;
+}
+
+// ------------------------------------------------- the HDR picture conversion
+
+// Every plan buffer of `kind` this engine lays out: a source plane (Y, U or
+// V of the 4:2:0 source), a target plane (this context's size: the features'
+// luma, SpEED's chroma) or scratch.
+static bool plan_buffer_fits(uint32_t kind, uint32_t plane, uint64_t elements, const uint32_t sourceW[3],
+                             const uint32_t sourceH[3], int w, int h)
+{
+    if (kind == VMAF_GPU_PLAN_SCRATCH)
+        return elements > 0 && elements < (1ull << 30);
+    if (plane > 2)
+        return false;
+    if (kind == VMAF_GPU_PLAN_SOURCE)
+        return elements == (uint64_t)sourceW[plane] * sourceH[plane];
+    const uint64_t targetW = plane ? (uint64_t)(w >> 1) : (uint64_t)w, targetH = plane ? (uint64_t)(h >> 1) : (uint64_t)h;
+    return kind == VMAF_GPU_PLAN_TARGET && elements == targetW * targetH;
+}
+
+// A side's plan checked, step by step, so that the shaders read and write
+// only inside their buffers whatever the words (a read past a buffer's end
+// can reset the GPU), and kept.
+int vv_context::load_convert_plan(int side, const uint32_t *plan, size_t words)
+{
+    if (!plan || words < VMAF_GPU_PLAN_HEADER_WORDS || words > (1u << 26)
+        || plan[VMAF_GPU_PLAN_H_MAGIC] != VMAF_GPU_PLAN_MAGIC || plan[VMAF_GPU_PLAN_H_VERSION] != VMAF_GPU_PLAN_VERSION
+        || plan[VMAF_GPU_PLAN_H_WORDS] != words)
+        return fail(-3, "not a picture conversion plan of this version");
+    if (plan[VMAF_GPU_PLAN_H_DST_W] != (uint32_t)w || plan[VMAF_GPU_PLAN_H_DST_H] != (uint32_t)h
+        || plan[VMAF_GPU_PLAN_H_DST_BPC] != 16)
+        return fail(-3, "the conversion plan's target is not this context's size at 16 bits");
+    const uint32_t buffers = plan[VMAF_GPU_PLAN_H_BUFFER_COUNT], steps = plan[VMAF_GPU_PLAN_H_STEP_COUNT];
+    if (buffers > 64 || steps > 64 || (uint64_t)plan[VMAF_GPU_PLAN_H_BUFFERS] + (uint64_t)buffers * VMAF_GPU_PLAN_BUFFER_WORDS > words
+        || (uint64_t)plan[VMAF_GPU_PLAN_H_STEPS] + (uint64_t)steps * VMAF_GPU_PLAN_STEP_WORDS > words)
+        return fail(-3, "the conversion plan's buffers or steps run past its end");
+    ConvertSide &c = convertSides[side];
+    const uint32_t srcW = plan[VMAF_GPU_PLAN_H_SRC_W], srcH = plan[VMAF_GPU_PLAN_H_SRC_H];
+    if (srcW < 2 || srcH < 2 || srcW > 16384 || srcH > 16384)
+        return fail(-3, "the conversion plan's source size is not taken");
+    if (plan[VMAF_GPU_PLAN_H_SRC_BPC] <= 8 || plan[VMAF_GPU_PLAN_H_SRC_BPC] > 16)  // (the shaders read 16-bit samples)
+        return fail(-4, "the conversion runs on the GPU for sources of 9 to 16 bits");
+    const uint32_t planeW[3] = { srcW, srcW >> 1, srcW >> 1 }, planeH[3] = { srcH, srcH >> 1, srcH >> 1 };
+    std::vector<uint64_t> elements(buffers);
+    std::vector<uint32_t> kinds(buffers);
+    for (uint32_t b = 0; b < buffers; ++b) {
+        const uint32_t *record = plan + plan[VMAF_GPU_PLAN_H_BUFFERS] + b * VMAF_GPU_PLAN_BUFFER_WORDS;
+        kinds[b] = record[VMAF_GPU_PLAN_B_KIND];
+        elements[b] = record[VMAF_GPU_PLAN_B_ELEMENTS];
+        if (!plan_buffer_fits(kinds[b], record[VMAF_GPU_PLAN_B_PLANE], elements[b], planeW, planeH, w, h))
+            return fail(-3, "a conversion plan buffer is not a plane this engine lays out");
+    }
+    auto table_fits = [&](uint64_t at, uint64_t count) { return at + count <= words; };
+    for (uint32_t i = 0; i < steps; ++i) {
+        const uint32_t *s = plan + plan[VMAF_GPU_PLAN_H_STEPS] + i * VMAF_GPU_PLAN_STEP_WORDS;
+        const uint32_t kind = s[VMAF_GPU_PLAN_S_KIND], planes = s[VMAF_GPU_PLAN_S_PLANES];
+        const uint32_t inW = s[VMAF_GPU_PLAN_S_IN_W], inH = s[VMAF_GPU_PLAN_S_IN_H];
+        const uint32_t outW = s[VMAF_GPU_PLAN_S_OUT_W], outH = s[VMAF_GPU_PLAN_S_OUT_H];
+        const bool resize = kind >= VMAF_GPU_PLAN_RESIZE_FLOAT_H && kind <= VMAF_GPU_PLAN_RESIZE_INT16_V;
+        if ((!resize && kind != VMAF_GPU_PLAN_COLOUR && kind != VMAF_GPU_PLAN_CONVERT)
+            || planes != (kind == VMAF_GPU_PLAN_COLOUR ? 3u : 1u) || !inW || !inH || !outW || !outH
+            || inW > 16384 || inH > 16384 || outW > 16384 || outH > 16384 || (!resize && (inW != outW || inH != outH)))
+            return fail(-3, "a conversion plan step is not one this engine runs");
+        for (uint32_t p = 0; p < planes; ++p) {
+            const uint32_t in = s[VMAF_GPU_PLAN_S_IN + p], out = s[VMAF_GPU_PLAN_S_OUT + p];
+            const uint32_t read = s[VMAF_GPU_PLAN_S_READ + 4 * p], write = s[VMAF_GPU_PLAN_S_WRITE + 4 * p];
+            if (in >= buffers || out >= buffers || kinds[in] == VMAF_GPU_PLAN_TARGET || kinds[out] == VMAF_GPU_PLAN_SOURCE
+                || elements[in] < (uint64_t)inW * inH || elements[out] < (uint64_t)outW * outH
+                || read > VMAF_GPU_PLAN_READ_W2F || write > VMAF_GPU_PLAN_WRITE_F2W || (resize && in == out))
+                return fail(-3, "a conversion plan step reads or writes outside its buffers");
+            // A target plane is written row by row at the engine's stride: the step makes all of it.
+            if (kinds[out] == VMAF_GPU_PLAN_TARGET && elements[out] != (uint64_t)outW * outH)
+                return fail(-3, "a conversion plan step writes part of a target plane");
+        }
+        const uint32_t table = s[VMAF_GPU_PLAN_S_TABLE], width = s[VMAF_GPU_PLAN_S_FILTER_WIDTH];
+        if (resize) {
+            const bool vertical = kind == VMAF_GPU_PLAN_RESIZE_FLOAT_V || kind == VMAF_GPU_PLAN_RESIZE_INT16_V;
+            const uint32_t dim = vertical ? outH : outW, inDim = vertical ? inH : inW;
+            if ((vertical ? outW != inW : outH != inH) || width < 1 || width > 64
+                || !table_fits(table, (uint64_t)dim * (1 + width)))
+                return fail(-3, "a conversion plan resize's filter runs past the plan or its picture");
+            for (uint32_t k = 0; k < dim; ++k)
+                if ((uint64_t)plan[table + k] + width > inDim)
+                    return fail(-3, "a conversion plan resize's filter runs past the plan or its picture");
+        } else if (kind == VMAF_GPU_PLAN_COLOUR) {
+            if (width > 8 || !table_fits(table, 2ull * width))
+                return fail(-3, "a conversion plan's colour operations run past its end");
+            for (uint32_t k = 0; k < width; ++k) {
+                const uint32_t op = plan[table + 2 * k], at = plan[table + 2 * k + 1];
+                const uint32_t size = op == VMAF_GPU_PLAN_OP_MATRIX ? 9 : op == VMAF_GPU_PLAN_OP_TO_LINEAR ? 65537
+                                    : op == VMAF_GPU_PLAN_OP_TO_GAMMA ? 65536 : 0;
+                if (!size || !table_fits(at, size))
+                    return fail(-3, "a conversion plan's colour operations run past its end");
+            }
+        }
+    }
+    c.words.assign(plan, plan + words);
+    memcpy(c.planeW, planeW, sizeof planeW);
+    memcpy(c.planeH, planeH, sizeof planeH);
+    return 0;
+}
+
+// The chroma target's row and plane bytes: SpEED's chroma upload buffer's,
+// or convertChroma's in the same layout.
+static uint32_t chroma_stride_bytes(int w) { return ((uint32_t)(w / 2) * 2 + 3) & ~3u; }
+
+// A side's places (convert.slang: where each plan buffer is, for each slot),
+// its plan and places on the GPU, its scratch, and a pass per step.
+int vv_context::add_convert_side(int side)
+{
+    ConvertSide &c = convertSides[side];
+    const uint32_t buffers = c.words[VMAF_GPU_PLAN_H_BUFFER_COUNT];
+    const uint32_t chromaStride = chroma_stride_bytes(w), chromaPlane = chromaStride * (uint32_t)(h / 2);
+    std::vector<uint32_t> places;
+    uint64_t scratchWords = 0;
+    for (size_t k = 0; k < slots.size(); ++k) {
+        scratchWords = 0;
+        for (uint32_t b = 0; b < buffers; ++b) {
+            const uint32_t *record = c.words.data() + c.words[VMAF_GPU_PLAN_H_BUFFERS] + b * VMAF_GPU_PLAN_BUFFER_WORDS;
+            const uint32_t plane = record[VMAF_GPU_PLAN_B_PLANE];
+            switch (record[VMAF_GPU_PLAN_B_KIND]) {
+            case VMAF_GPU_PLAN_SOURCE:  // in slot k's part of convertSource (16-bit samples)
+                places.insert(places.end(), { 0u, (uint32_t)((k * convertSourceBytes + c.planeOffset[plane]) / 2), 0u });
+                break;
+            case VMAF_GPU_PLAN_SCRATCH:  // the side's own, the same for every slot: commit's first two barriers
+                                         // (compute -> transfer -> compute) order it after the last frame's passes
+                places.insert(places.end(), { 1u, (uint32_t)scratchWords, 0u });
+                scratchWords += record[VMAF_GPU_PLAN_B_ELEMENTS];
+                break;
+            default:  // the target's: luma at the features' stride, chroma in SpEED's layout (ref U, ref V, dis U, dis V)
+                if (plane == 0)
+                    places.insert(places.end(), { 2u, 0u, strideBytes / 2 });
+                else
+                    places.insert(places.end(),
+                                  { 3u, ((uint32_t)side * 2 + plane - 1) * chromaPlane / 2, chromaStride / 2 });
+                break;
+            }
+        }
+    }
+    if (scratchWords >= (1ull << 30) || (uint64_t)slots.size() * convertSourceBytes >= (1ull << 32))
+        return fail(-3, "the conversion's pictures are too large");
+    c.placesAt = (uint32_t)c.words.size();
+    c.placesWords = 3 * buffers;
+    c.words.insert(c.words.end(), places.begin(), places.end());
+    const uint32_t *plan = c.words.data();
+    const uint32_t placesAt = c.placesAt;
+    if (int error = create_buffer(c.tables, c.words.size() * 4, false))
+        return error;
+    if (int error = upload(c.tables, c.words.data(), c.words.size() * 4))
+        return error;
+    if (int error = create_buffer(c.scratch, std::max<uint64_t>(scratchWords, 1) * 4, false))
+        return error;
+    Buffer *luma = side ? &picDis : &picRef;
+    for (uint32_t i = 0; i < plan[VMAF_GPU_PLAN_H_STEP_COUNT]; ++i) {
+        const uint32_t at = plan[VMAF_GPU_PLAN_H_STEPS] + i * VMAF_GPU_PLAN_STEP_WORDS;
+        const uint32_t kind = plan[at + VMAF_GPU_PLAN_S_KIND];
+        const int shader = kind == VMAF_GPU_PLAN_COLOUR ? kShader_convert_colour
+                           : kind == VMAF_GPU_PLAN_CONVERT ? kShader_convert_samples
+                           : kind <= VMAF_GPU_PLAN_RESIZE_FLOAT_V ? kShader_convert_resize_float
+                                                                  : kShader_convert_resize_int16;
+        const uint32_t vertical = kind == VMAF_GPU_PLAN_RESIZE_FLOAT_V || kind == VMAF_GPU_PLAN_RESIZE_INT16_V;
+        // (the places' offset is slot 0's here: record_convert pushes the frame's slot's)
+        const uint32_t constants[4] = { at, placesAt, vertical, 0 };  // (the last: 0.0f)
+        const uint32_t outW = plan[at + VMAF_GPU_PLAN_S_OUT_W], outH = plan[at + VMAF_GPU_PLAN_S_OUT_H];
+        // A thread makes two samples of a row (convert.slang's 16 x 8 groups).
+        if (int error = add_pass(c.passes, shader, { &c.tables, &convertSource, &c.scratch, luma,
+                                 speed ? &slots[0].speedChroma : &convertChroma }, constants, sizeof constants,
+                                 groups((int)(outW + 1) / 2, 16), groups((int)outH, 8)))
+            return error;
+        // SpEED's chroma is the slot's own: a set a slot for a step that writes it.
+        bool writesChroma = false;
+        for (uint32_t p = 0; p < plan[at + VMAF_GPU_PLAN_S_PLANES]; ++p) {
+            const uint32_t *out = plan + plan[VMAF_GPU_PLAN_H_BUFFERS]
+                                  + plan[at + VMAF_GPU_PLAN_S_OUT + p] * VMAF_GPU_PLAN_BUFFER_WORDS;
+            writesChroma = writesChroma || (out[VMAF_GPU_PLAN_B_KIND] == VMAF_GPU_PLAN_TARGET && out[VMAF_GPU_PLAN_B_PLANE]);
+        }
+        if (speed && writesChroma) {
+            if (int error = per_slot(c.passes, [&](Slot &slot) {
+                    return std::vector<Bound>{ &c.tables, &convertSource, &c.scratch, luma, &slot.speedChroma };
+                }))
+                return error;
+        }
+    }
+    return 0;
+}
+
+// The HDR models' picture conversion on the GPU (vv_v1_convert).
+int vv_context::enable_convert(const uint32_t *const plans[2], const size_t words[2])
+{
+    if (!v1 || shared || pictures || direct || bpc != 16)
+        return fail(-3, "the conversion runs in a VMAF v1 context of 16 bits whose frames come through vv_submit_v1");
+    if (frames || converting)
+        return fail(-3, "the conversion is set once, before the first frame");
+    for (int side = 0; side < 2; ++side) {
+        if (int error = load_convert_plan(side, plans[side], words[side]))
+            return error;
+    }
+    // Both sides' source planes in each slot's part of convertSource, rows
+    // packed, each plane starting on a word.
+    convertSourceBytes = 0;
+    for (ConvertSide &c : convertSides) {
+        for (int p = 0; p < 3; ++p) {
+            c.planeOffset[p] = convertSourceBytes;
+            convertSourceBytes += (c.planeW[p] * c.planeH[p] * 2 + 3) & ~3u;
+        }
+    }
+    if (int error = create_buffer(convertSource, (VkDeviceSize)slots.size() * convertSourceBytes, true, false, true))
+        return error;
+    // The staging buffers the conversion leaves unused (VMAF v1 copies them
+    // into picRef and picDis, which the conversion writes instead): 4K, two
+    // 16-bit planes, 31.6 MB a slot.
+    for (Slot &slot : slots) {
+        if (int error = remake_buffer(slot.staging, 4, true, true))
+            return error;
+    }
+    if (!speed) {  // the chroma's target, which only SpEED reads
+        const VkDeviceSize chromaPlane = (VkDeviceSize)chroma_stride_bytes(w) * (uint32_t)(h / 2);
+        if (int error = create_buffer(convertChroma, 4 * chromaPlane, false))
+            return error;
+    }
+    for (int side = 0; side < 2; ++side) {
+        if (int error = add_convert_side(side))
+            return error;
+    }
+    if (int error = compile_pipelines())
+        return error;
+    converting = true;
+    return 0;
+}
+
+void vv_context::record_convert(VkCommandBuffer cb, size_t slotIndex, unsigned sides,
+                                const std::function<void(int)> &stamp)
+{
+    size_t steps = 0;
+    for (int side = 0; side < 2; ++side)
+        if ((sides >> side) & 1)
+            steps = std::max(steps, convertSides[side].passes.size());
+    for (size_t i = 0; i < steps; ++i) {
+        int shader = -1;
+        for (int side = 0; side < 2; ++side) {
+            const std::vector<Pass> &passes = convertSides[side].passes;
+            if (!((sides >> side) & 1) || i >= passes.size())
+                continue;
+            const Pass &pass = passes[i];
+            const VkPipelineLayout layout = pipelines[pass.shader].layout;
+            const VkDescriptorSet set = pass.slotSets.empty() ? pass.set : pass.slotSets[slotIndex];
+            uint32_t constants[4];
+            memcpy(constants, pass.constants, sizeof constants);
+            constants[1] += (uint32_t)slotIndex * convertSides[side].placesWords;  // the slot's places
+            vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pass.pipeline);
+            vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+            vk.vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof constants, constants);
+            vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], 1);
+            shader = pass.shader;
+        }
+        barrier(vk, cb, kCompute, kCompute);
+        if (stamp)
+            stamp(shader);
+    }
+}
+
+// A side's source picture into slot `slotIndex`'s part of convertSource,
+// rows packed.
+void vv_context::write_convert_source(size_t slotIndex, int side, const uint16_t *const planes[3],
+                                      const ptrdiff_t strides[3])
+{
+    const ConvertSide &c = convertSides[side];
+    uint8_t *base = (uint8_t *)convertSource.mapped + slotIndex * convertSourceBytes;
+    for (int p = 0; p < 3; ++p) {
+        const size_t rowBytes = (size_t)c.planeW[p] * 2;
+        for (uint32_t y = 0; y < c.planeH[p]; ++y)
+            memcpy(base + c.planeOffset[p] + y * rowBytes, (const uint8_t *)planes[p] + y * strides[p], rowBytes);
+    }
+}
+
+// One picture through a side's conversion, read back (vv_test_convert).
+int vv_context::test_convert(int side, const uint16_t *const planes[3], const ptrdiff_t strides[3],
+                             uint16_t *const out[3], const ptrdiff_t outStrides[3])
+{
+    if (!converting || side < 0 || side > 1)
+        return fail(-3, "no conversion on this side (vv_v1_convert)");
+    if (pending)
+        return fail(-3, "a frame was started and not committed");
+    for (Slot &slot : slots) {  // the frames in flight read picRef and picDis, which the conversion writes
+        if (int error = collect(slot))
+            return error;
+    }
+    write_convert_source(0, side, planes, strides);
+    const uint32_t chromaStride = chroma_stride_bytes(w), chromaPlane = chromaStride * (uint32_t)(h / 2);
+    Buffer back;
+    if (int error = create_buffer(back, (VkDeviceSize)planeBytes + 2ull * chromaPlane, true)) {
+        destroy_last_buffer(back);
+        return error;
+    }
+    VkCommandBuffer cb = slots[0].commands;
+    VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vk.vkBeginCommandBuffer(cb, &begin);
+    record_convert(cb, 0, 1u << side, nullptr);
+    barrier(vk, cb, kCompute, kTransfer);
+    const VkBufferCopy luma = { 0, 0, planeBytes };
+    vk.vkCmdCopyBuffer(cb, (side ? picDis : picRef).buffer, back.buffer, 1, &luma);
+    const VkBufferCopy chroma = { (VkDeviceSize)side * 2 * chromaPlane, planeBytes, 2ull * chromaPlane };
+    vk.vkCmdCopyBuffer(cb, (speed ? slots[0].speedChroma : convertChroma).buffer, back.buffer, 1, &chroma);
+    VkMemoryBarrier toHost = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vk.vkCmdPipelineBarrier(cb, kTransfer, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, nullptr, 0, nullptr);
+    vk.vkEndCommandBuffer(cb);
+    const VkResult result = run_now(cb);
+    if (result == VK_SUCCESS) {
+        const uint8_t *from = (const uint8_t *)back.mapped;
+        for (int p = 0; p < 3; ++p) {
+            const uint32_t rowBytes = (p ? (uint32_t)w / 2 : (uint32_t)w) * 2, rows = p ? (uint32_t)h / 2 : (uint32_t)h;
+            const uint8_t *plane = p ? from + planeBytes + (size_t)(p - 1) * chromaPlane : from;
+            const uint32_t stride = p ? chromaStride : strideBytes;
+            for (uint32_t y = 0; y < rows; ++y)
+                memcpy((uint8_t *)out[p] + y * outStrides[p], plane + (size_t)y * stride, rowBytes);
+        }
+    }
+    destroy_last_buffer(back);
+    return result == VK_SUCCESS ? 0 : fail(-5, "the conversion on the GPU failed (" + std::to_string(result) + ")");
 }
 
 double vv_context::now_ns() const
@@ -3379,6 +3754,8 @@ int vv_context::submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *d
     uint8_t *targets[2];
     if (shared)
         return fail(-3, "this context takes its frames from GPU memory");
+    if (converting)
+        return fail(-3, "this context converts its pictures: they go in with vv_submit_v1");
     if (int error = staging(&targets[0], &targets[1]))
         return error;
     const double copyBegun = profile ? now_ns() : 0.0;
@@ -3409,6 +3786,12 @@ int vv_context::submit_v1(const uint8_t *const planes[6], const ptrdiff_t stride
                 return fail(-3, "SpEED needs the chroma planes");
         }
     }
+    if (converting) {
+        for (int plane : { 1, 2, 4, 5 }) {
+            if (!planes[plane] && (plane < 3 || score))
+                return fail(-3, "the conversion needs the chroma planes");
+        }
+    }
     uint8_t *targets[2];
     if (int error = staging(&targets[0], &targets[1]))
         return error;
@@ -3418,12 +3801,26 @@ int vv_context::submit_v1(const uint8_t *const planes[6], const ptrdiff_t stride
     // 4K 10-bit, about 420 frame pairs a second).
     const size_t sampleBytes = bpc > 8 ? 2 : 1;
     copyJob.count = 0;
-    copyJob.planes[copyJob.count++] = { targets[0], strideBytes, planes[0], strides[0], (size_t)w * sampleBytes,
-                                        (uint32_t)h };
-    if (score)
-        copyJob.planes[copyJob.count++] = { targets[1], strideBytes, planes[3], strides[3], (size_t)w * sampleBytes,
+    if (converting) {
+        // The source pictures into the slot's part of convertSource, rows
+        // packed: commit converts them into picRef, picDis and the chroma.
+        const size_t slotIndex = (size_t)(pending - slots.data());
+        uint8_t *base = (uint8_t *)convertSource.mapped + slotIndex * convertSourceBytes;
+        for (int side = 0; side < (score ? 2 : 1); ++side) {
+            const ConvertSide &c = convertSides[side];
+            for (int p = 0; p < 3; ++p)
+                copyJob.planes[copyJob.count++] = { base + c.planeOffset[p], (uint32_t)c.planeW[p] * 2,
+                                                    planes[3 * side + p], strides[3 * side + p],
+                                                    (size_t)c.planeW[p] * 2, c.planeH[p] };
+        }
+    } else {
+        copyJob.planes[copyJob.count++] = { targets[0], strideBytes, planes[0], strides[0], (size_t)w * sampleBytes,
                                             (uint32_t)h };
-    if (speed && score) {
+        if (score)
+            copyJob.planes[copyJob.count++] = { targets[1], strideBytes, planes[3], strides[3],
+                                                (size_t)w * sampleBytes, (uint32_t)h };
+    }
+    if (speed && score && !converting) {
         uint8_t *chroma = (uint8_t *)pending->speedChroma.mapped;
         const int order[4] = { 1, 2, 4, 5 };  // ref U, ref V, dis U, dis V
         for (int i = 0; i < 4; ++i)
@@ -3521,7 +3918,7 @@ int vv_context::commit(bool score)
             vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
                                     nullptr, 0, nullptr, 1, &give);
         }
-    } else if (!direct) {
+    } else if (!direct && !converting) {  // (converting: the conversion writes them, after the barrier below)
         VkBufferCopy copy = { 0, 0, planeBytes };
         vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
         if (score) {
@@ -3549,6 +3946,8 @@ int vv_context::commit(bool score)
     if (pictures)
         picture_barriers(cb, slot, true);
     stamp(kProfileUpload);
+    if (converting)  // the frame's pictures converted on the GPU, ending with a barrier
+        record_convert(cb, slotIndex, score ? 3u : 1u, stamp);
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
     const std::vector<Pass> *lists[4] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
                                           score && cambi ? &slot.cambiKeepPasses : nullptr,
@@ -4048,6 +4447,8 @@ VV_EXPORT int vv_staging(vv_context *context, uint8_t **reference, uint8_t **dis
     *stride = context->strideBytes;
     if (context->shared)
         return fail(-3, "this context takes its frames from GPU memory");
+    if (context->converting)
+        return fail(-3, "this context converts its pictures: they go in with vv_submit_v1");
     return context->staging(reference, distorted);
 }
 
@@ -4330,6 +4731,30 @@ VV_EXPORT int vv_submit_v1(vv_context *context, const uint8_t *const *planes, co
     return context->submit_v1(planes, strides, score != 0);
 }
 
+// The HDR models' picture conversion (libvmaf's vmaf_picture_convert) on the
+// GPU, for a context made by vv_create_v1 at the conversion's target size
+// and 16 bits, after vv_v1_speed if SpEED is wanted and before the first
+// frame: plans[0] the reference's, plans[1] the distorted's, as
+// vmaf_picture_convert_gpu_plan gives them (words[i] 32-bit words each).
+// Its frames then go in with vv_submit_v1 as the source pictures (4:2:0,
+// more than 8 bits). -4 for a plan it does not run (the caller then
+// converts on the CPU).
+VV_EXPORT int vv_v1_convert(vv_context *context, const uint32_t *const *plans, const size_t *words)
+{
+    return context->enable_convert(plans, words);
+}
+
+// To check the conversion against libvmaf's (VideoMetricsLab does on a run's
+// first frame): a source picture (`side` 0 the reference, 1 the distorted)
+// through the context's conversion and read back -- the luma at out[0], the
+// chroma at out[1] and out[2], rows outStrides[i] bytes apart. Waits for the
+// frames in flight first.
+VV_EXPORT int vv_test_convert(vv_context *context, int side, const uint16_t *const *planes, const ptrdiff_t *strides,
+                              uint16_t *const *out, const ptrdiff_t *outStrides)
+{
+    return context->test_convert(side, planes, strides, out, outStrides);
+}
+
 // For a frame begun with vv_staging or vv_shared_next, in a context with
 // SpEED: where its four chroma planes go before vv_commit -- the reference's
 // U and V, then the distorted's, at planes[0..3], rows *stride bytes apart
@@ -4342,6 +4767,8 @@ VV_EXPORT int vv_chroma_staging(vv_context *context, uint8_t **planes, uint32_t 
         return fail(-3, "no frame was started");
     if (context->pictures)
         return fail(-3, "this context reads the pictures where a decoder left them (vv_pictures)");
+    if (context->converting)
+        return fail(-3, "this context converts its pictures: they go in with vv_submit_v1");
     uint8_t *chroma = (uint8_t *)context->pending->speedChroma.mapped;
     for (int i = 0; i < 4; ++i)
         planes[i] = chroma + (size_t)i * context->chromaPlaneBytes;
