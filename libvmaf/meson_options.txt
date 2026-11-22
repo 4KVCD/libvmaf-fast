@@ -64,3 +64,10 @@ option('enable_zimg',
     value: false,
     description: 'Enable zimg-based picture colorspace conversion ' +
                  '(requires zimg to be installed, e.g. via pkg-config)')
+
+option('zimg_source_dir',
+    type: 'string',
+    value: '',
+    description: 'Source tree of the zimg libvmaf links (x86-64, with ' +
+                 'enable_zimg): builds vmaf_picture_convert_gpu_plan(), ' +
+                 'which reads zimg\'s internal headers')

@@ -33,7 +33,8 @@ $exports = @(
     'vmaf_score_pooled', 'vmaf_score_pooled_model_collection', 'vmaf_feature_score_pooled',
     'vmaf_preallocate_pictures', 'vmaf_fetch_preallocated_picture', 'vmaf_write_output',
     'vmaf_picture_alloc', 'vmaf_picture_unref', 'vmaf_picture_wrap', 'vmaf_picture_convert_context_init',
-    'vmaf_picture_convert', 'vmaf_picture_convert_context_close', 'vmaf_model_load', 'vmaf_model_load_from_path',
+    'vmaf_picture_convert', 'vmaf_picture_convert_context_close', 'vmaf_picture_convert_gpu_plan',
+    'vmaf_picture_convert_gpu_plan_free', 'vmaf_model_load', 'vmaf_model_load_from_path',
     'vmaf_model_feature_overload', 'vmaf_model_destroy', 'vmaf_model_collection_load',
     'vmaf_model_collection_load_from_path', 'vmaf_model_collection_feature_overload',
     'vmaf_model_collection_destroy', 'vmaf_feature_dictionary_set', 'vmaf_feature_dictionary_free',
@@ -180,7 +181,7 @@ try {
         & $Python -m mesonbuild.mesonmain setup (Join-Path $vmaf 'libvmaf') $build --buildtype release `
             --default-library static "-Denable_cuda=$cuda" "-Denable_nvcc=$cuda" -Denable_tests=false `
             -Denable_tools=false -Denable_docs=false -Denable_float=false -Dbuilt_in_models=true -Denable_zimg=true `
-            -Db_vscrt=mt `
+            -Db_vscrt=mt "-Dzimg_source_dir=$zimg" `
             -Dc_args=/Brepro -Dcpp_args=/Brepro -Dc_link_args=/Brepro -Dcpp_link_args=/Brepro
     }
     Invoke-Checked 'Building libvmaf' { & $Python -m mesonbuild.mesonmain compile -C $build }

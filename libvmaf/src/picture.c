@@ -26,9 +26,13 @@
 #include <zimg.h>
 #endif
 
+#include "libvmaf/picture_gpu_plan.h"
 #include "log.h"
 #include "mem.h"
 #include "picture.h"
+#ifdef HAVE_ZIMG
+#include "picture_zimg.h"
+#endif
 #include "ref.h"
 
 #define DATA_ALIGN 32
@@ -390,6 +394,63 @@ static bool color_is_specified(const VmafColor *color)
            color->matrix != VMAF_COLOR_MATRIX_UNKNOWN;
 }
 
+int vmaf_picture_zimg_args(const VmafPicture *src,
+                           const VmafPictureConvertTarget *target,
+                           const char *caller, zimg_image_format *src_fmt,
+                           zimg_image_format *dst_fmt,
+                           zimg_graph_builder_params *params)
+{
+    if (!color_is_specified(&src->color)) {
+        vmaf_log(VMAF_LOG_LEVEL_ERROR,
+                 "%s: source picture color metadata must be fully "
+                 "specified\n", caller);
+        return -EINVAL;
+    }
+
+    if (!color_is_specified(&target->color)) {
+        vmaf_log(VMAF_LOG_LEVEL_ERROR,
+                 "%s: target color metadata must be fully specified\n",
+                 caller);
+        return -EINVAL;
+    }
+
+    if (target->bpc < 8 || target->bpc > 16) {
+        vmaf_log(VMAF_LOG_LEVEL_ERROR,
+                 "%s: unsupported target bit depth %u (supported: 8 to 16)\n",
+                 caller, target->bpc);
+        return -EINVAL;
+    }
+
+    const unsigned dst_w = target->w ? target->w : src->w[0];
+    const unsigned dst_h = target->h ? target->h : src->h[0];
+
+    int err = format_to_zimg(src_fmt, src->pix_fmt, src->bpc,
+                             src->w[0], src->h[0], &src->color);
+    if (err) {
+        vmaf_log(VMAF_LOG_LEVEL_ERROR,
+                 "%s: source picture cannot be converted\n", caller);
+        return err;
+    }
+    err = format_to_zimg(dst_fmt, target->pix_fmt, target->bpc,
+                         dst_w, dst_h, &target->color);
+    if (err) {
+        vmaf_log(VMAF_LOG_LEVEL_ERROR,
+                 "%s: target picture cannot be converted\n", caller);
+        return err;
+    }
+
+    zimg_graph_builder_params_default(params, ZIMG_API_VERSION);
+    /* Match FFmpeg's zscale (agamma=1): exact transfer functions are ~20x
+     * slower for PQ and change scores negligibly. */
+    params->allow_approximate_gamma = 1;
+    /* Pin chroma to zimg's current default, so a change to that default
+     * cannot change scores. */
+    params->resample_filter_uv = ZIMG_RESIZE_BILINEAR;
+    if (target->resample_filter != VMAF_RESAMPLE_DEFAULT)
+        params->resample_filter = resample_filter_to_zimg(target->resample_filter);
+    return 0;
+}
+
 struct VmafPictureConvertContext {
     zimg_filter_graph *graph;
     void *tmp;
@@ -414,47 +475,14 @@ int vmaf_picture_convert_context_init(VmafPictureConvertContext **ctx,
 {
     if (!ctx || !src || !target) return -EINVAL;
 
-    if (!color_is_specified(&src->color)) {
-        vmaf_log(VMAF_LOG_LEVEL_ERROR,
-                 "vmaf_picture_convert_context_init: source picture color "
-                 "metadata must be fully specified\n");
-        return -EINVAL;
-    }
-
-    if (!color_is_specified(&target->color)) {
-        vmaf_log(VMAF_LOG_LEVEL_ERROR,
-                 "vmaf_picture_convert_context_init: target color "
-                 "metadata must be fully specified\n");
-        return -EINVAL;
-    }
-
-    if (target->bpc < 8 || target->bpc > 16) {
-        vmaf_log(VMAF_LOG_LEVEL_ERROR,
-                 "vmaf_picture_convert_context_init: unsupported target "
-                 "bit depth %u (supported: 8 to 16)\n", target->bpc);
-        return -EINVAL;
-    }
-
-    const unsigned dst_w = target->w ? target->w : src->w[0];
-    const unsigned dst_h = target->h ? target->h : src->h[0];
-
     zimg_image_format src_fmt, dst_fmt;
-    int err = format_to_zimg(&src_fmt, src->pix_fmt, src->bpc,
-                             src->w[0], src->h[0], &src->color);
-    if (err) {
-        vmaf_log(VMAF_LOG_LEVEL_ERROR,
-                 "vmaf_picture_convert_context_init: source picture cannot "
-                 "be converted\n");
-        return err;
-    }
-    err = format_to_zimg(&dst_fmt, target->pix_fmt, target->bpc,
-                         dst_w, dst_h, &target->color);
-    if (err) {
-        vmaf_log(VMAF_LOG_LEVEL_ERROR,
-                 "vmaf_picture_convert_context_init: target picture cannot "
-                 "be converted\n");
-        return err;
-    }
+    zimg_graph_builder_params params;
+    int err = vmaf_picture_zimg_args(src, target,
+                                     "vmaf_picture_convert_context_init",
+                                     &src_fmt, &dst_fmt, &params);
+    if (err) return err;
+    const unsigned dst_w = dst_fmt.width;
+    const unsigned dst_h = dst_fmt.height;
 
     VmafPictureConvertContext *c = malloc(sizeof(*c));
     if (!c) return -ENOMEM;
@@ -468,19 +496,7 @@ int vmaf_picture_convert_context_init(VmafPictureConvertContext **ctx,
     c->src.h = src->h[0];
     c->src.color = src->color;
 
-    zimg_graph_builder_params params;
-    const zimg_graph_builder_params *params_ptr = &params;
-    zimg_graph_builder_params_default(&params, ZIMG_API_VERSION);
-    /* Match FFmpeg's zscale (agamma=1): exact transfer functions are ~20x
-     * slower for PQ and change scores negligibly. */
-    params.allow_approximate_gamma = 1;
-    /* Pin chroma to zimg's current default, so a change to that default
-     * cannot change scores. */
-    params.resample_filter_uv = ZIMG_RESIZE_BILINEAR;
-    if (target->resample_filter != VMAF_RESAMPLE_DEFAULT)
-        params.resample_filter = resample_filter_to_zimg(target->resample_filter);
-
-    c->graph = zimg_filter_graph_build(&src_fmt, &dst_fmt, params_ptr);
+    c->graph = zimg_filter_graph_build(&src_fmt, &dst_fmt, &params);
     if (!c->graph) {
         char err_msg[256];
         zimg_get_last_error(err_msg, sizeof(err_msg));
@@ -611,3 +627,25 @@ int vmaf_picture_convert_context_close(VmafPictureConvertContext *ctx)
 }
 
 #endif /* HAVE_ZIMG */
+
+#ifndef HAVE_ZIMG_GPU_PLAN
+
+/* The plan builder (picture_gpu_plan.cpp) is compiled only where meson is
+ * given zimg's sources (-Dzimg_source_dir): it reads zimg's own graph. */
+int vmaf_picture_convert_gpu_plan(const VmafPicture *src,
+                                  const VmafPictureConvertTarget *target,
+                                  uint32_t **plan, size_t *words)
+{
+    (void) src;
+    (void) target;
+    if (plan) *plan = NULL;
+    if (words) *words = 0;
+    return -ENOTSUP;
+}
+
+void vmaf_picture_convert_gpu_plan_free(uint32_t *plan)
+{
+    (void) plan;
+}
+
+#endif /* !HAVE_ZIMG_GPU_PLAN */

@@ -19,7 +19,8 @@ endif
 install_headers(['libvmaf.h',
                 'feature.h',
                 'model.h',
-                'picture.h'],
+                'picture.h',
+                'picture_gpu_plan.h'],
                 version_h_target,
                 platform_specific_headers,
                 subdir : 'libvmaf')

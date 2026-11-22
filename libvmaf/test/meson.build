@@ -376,6 +376,20 @@ test_colorspace = executable('test_colorspace',
 test('test_colorspace', test_colorspace)
 endif
 
+if gpu_plan_objects.length() > 0
+test_picture_gpu_plan_args = []
+if cc.get_id() != 'msvc'
+    test_picture_gpu_plan_args += ['-ffp-contract=off']  # the plan's arithmetic, unfused
+endif
+test_picture_gpu_plan = executable('test_picture_gpu_plan',
+    ['test.c', 'test_picture_gpu_plan.c'],
+    include_directories : [libvmaf_inc, test_inc],
+    c_args : test_picture_gpu_plan_args,
+    link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
+)
+test('test_picture_gpu_plan', test_picture_gpu_plan)
+endif
+
 test_read_pictures_convert_args = ['-DJSON_MODEL_PATH="'+join_paths(meson.project_source_root(), '../model/')+'"']
 if get_option('enable_zimg')
     test_read_pictures_convert_args += ['-DHAVE_ZIMG=1']
