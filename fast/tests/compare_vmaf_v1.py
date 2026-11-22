@@ -7,12 +7,18 @@ score per frame, and times both.
     python fast/tests/compare_vmaf_v1.py --matrix [--device 1]
 
 --matrix: every bundled VMAF v1 model over sizes, bit depths, frame skipping
-and the frames that take rare paths. Exit code 0 when all are identical.
+and the frames that take rare paths, then the --hdr cases. --hdr: the HDR
+VMAF models' features (ADM's adm_csf_mode 3 and adm_skip_scale0, CAMBI with
+the PQ curve, SpEED's chroma prescale) on the frames as they are: each model
+without its conversion_target, so that libvmaf converts nothing either. Exit
+code 0 when all are identical.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -34,6 +40,41 @@ def model_path(name: str) -> Path:
     if not matches:
         raise SystemExit(f"no bundled VMAF v1 model named {name}")
     return matches[0]
+
+
+def hdr_model(name: str, folder: Path) -> Path:
+    """The bundled HDR VMAF model `name` (as 3d0h or hfr_1d5h_2160) without its
+    conversion_target, written into `folder`."""
+    source = next(MODELS.glob(f"hdr_vmaf_v1.1.8*/hdr_vmaf_v1.1.8_{name}.json"), None)
+    if source is None:
+        raise SystemExit(f"no bundled HDR VMAF model named {name}")
+    model = json.loads(source.read_text(encoding="utf-8"))
+    del model["model_dict"]["conversion_target"]
+    target = folder / source.name
+    target.write_text(json.dumps(model), encoding="utf-8")
+    return target
+
+
+def hdr_matrix(device: int | None) -> bool:
+    """The HDR VMAF models' four ADM tables (1080 at 3H and 5H, 2160 at 1.5H
+    and 3H) at 16 bits, as their converted pictures are, and the rarer paths."""
+    same = True
+    with tempfile.TemporaryDirectory(prefix="vmaf-hdr-models-") as folder:
+        model = {name: hdr_model(name, Path(folder)) for name in ("3d0h", "5d0h", "1d5h_2160", "3d0h_2160",
+                                                                    "hfr_3d0h")}
+        for name, (width, height) in (("3d0h", (1920, 1080)), ("5d0h", (1920, 1080)), ("1d5h_2160", (3840, 2160)),
+                                      ("3d0h_2160", (3840, 2160))):
+            count = 4 if width * height > 2_000_000 else 6
+            same &= compare("synthetic", model[name], width, height, 16,
+                            *frames_of.synthetic(width, height, 16, count, width + len(name)), 1, device)
+        for width, height, bits in ((642, 362, 10), (160, 400, 12), (1365, 768, 8)):
+            same &= compare("synthetic", model["3d0h"], width, height, bits,
+                            *frames_of.synthetic(width, height, bits, 5, height), 1, device)
+        for kind in ("black", "identical", "extremes"):
+            same &= compare(kind, model["3d0h"], 640, 360, 16, *frames_of.special(kind, 640, 360, 16, 6), 1, device)
+        same &= compare("every 2nd frame", model["hfr_3d0h"], 640, 360, 16, *frames_of.synthetic(640, 360, 16, 9, 3),
+                        2, device)
+    return same
 
 
 def cpu_run(model: Path, width: int, height: int, bits: int, reference, distorted, step: int, threads: int):
@@ -108,6 +149,7 @@ def matrix(device: int | None) -> bool:
     same &= compare("every 5th frame", model, 640, 360, 10, *frames_of.synthetic(640, 360, 10, 11, 4), 5, device)
     for count in (1, 2, 3):
         same &= compare(f"{count} frame(s)", hfr, 640, 360, 8, *frames_of.synthetic(640, 360, 8, count, 5), 1, device)
+    same &= hdr_matrix(device)
     print("ALL IDENTICAL" if same else "SOME DIFFER")
     return same
 
@@ -126,11 +168,16 @@ def main() -> int:
     parser.add_argument("--device", type=int)
     parser.add_argument("--threads", type=int, default=12)
     parser.add_argument("--matrix", action="store_true")
+    parser.add_argument("--hdr", action="store_true")
     arguments = parser.parse_args()
     for device in vmaf_vulkan.devices():
         print(f"Vulkan GPU {device.index}: {device.name}")
     if arguments.matrix:
         return 0 if matrix(arguments.device) else 1
+    if arguments.hdr:
+        same = hdr_matrix(arguments.device)
+        print("ALL IDENTICAL" if same else "SOME DIFFER")
+        return 0 if same else 1
     model = model_path(arguments.model)
     if arguments.synthetic:
         width, height = (int(part) for part in arguments.synthetic.split("x"))

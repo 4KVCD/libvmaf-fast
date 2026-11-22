@@ -25,10 +25,16 @@
 // workgroups cover the whole band image, and do the next scale's wavelet
 // transform of its approximation bands (a), as adm_dwt.slang does it,
 // writing the next scale's bands (next_vertical, next_horizontal).
+// SKIP_SCALE0 (with FROM_PICTURE; adm_skip_scale0, the HDR VMAF models'):
+// scale 0 is not measured, only transformed for scale 1 (its a, which equals
+// libvmaf's adm_dwt2_*_lo): no decoupling, masking or sums.
 #include "common.slang"
 
 #ifndef NEXT_SCALE
 #define NEXT_SCALE 0
+#endif
+#ifndef SKIP_SCALE0
+#define SKIP_SCALE0 0
 #endif
 #if FROM_PICTURE || NEXT_SCALE
 #define NEXT 1
@@ -361,6 +367,13 @@ void slide_row(int i, int j, uint local, bool own, inout int restored[3], inout 
     for (int b = 0; b < 3; ++b) den[b] = 0;
     // Outside the band (a neighbour only): the pixel the masking reads instead.
     const int ci = cm_neighbour(i, BH), cj = cm_neighbour(j, BW);
+#if SKIP_SCALE0
+    if (cj >= 0 && cj < BW) {  // (h, v and d, which nothing reads, the compiler leaves out)
+        int o[3], t[3];
+        aRef = transform(refPicture, PICTURE_REFERENCE, ci, cj, o);
+        aDis = transform(disPicture, PICTURE_DISTORTED, ci, cj, t);
+    }
+#else
 #if FROM_PICTURE
     // Everywhere in the band (also outside the masking's region, for scale
     // 1's transform of a); rows and columns past it as the masking reads them.
@@ -404,6 +417,7 @@ void slide_row(int i, int j, uint local, bool own, inout int restored[3], inout 
     const uint ring = uint((i + 3) % 3);
     gRingF[ring * GROUP + local] = sumF;
     gRingRF[ring * GROUP + local] = sumRF;
+#endif  // SKIP_SCALE0
 }
 
 #if NEXT
@@ -514,6 +528,7 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
                 scale1_horizontal(I, J, c0);
         }
 #endif
+#if !SKIP_SCALE0
         int64_t cm[6] = { 0, 0, 0, 0, 0, 0 };
         if (ownColumn && j >= CM_LEFT && j < CM_RIGHT && i >= CM_TOP && i < CM_BOTTOM) {
             int thresholdA = centerA, thresholdR = centerR;
@@ -541,12 +556,16 @@ void main(uint3 group : SV_GroupID, uint local : SV_GroupIndex)
             const int64_t total = wave_sum64(ownColumn ? int64_t(den[b]) : 0);
             if (WaveIsFirstLane()) gRow[wave * 9 + 6 + uint(b)] = total;
         }
+#endif
+        // (Also with SKIP_SCALE0: gScale1 is read above before the next step writes it.)
         GroupMemoryBarrierWithGroupSync();
+#if !SKIP_SCALE0
         if (local < 9) {
             int64_t total = 0;
             for (uint w = 0; w < waves; ++w) total += gRow[w * 9 + local];
             partial[(uint(i - FIRST_ROW) * pc[1] + group.x) * 9 + local] = total;
         }
+#endif
         restored = nextRestored;
         additive = nextAdditive;
         centerA = nextA;

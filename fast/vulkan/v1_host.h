@@ -55,6 +55,14 @@ double v1_cambi_pool(float *c_values, double topk, unsigned width, unsigned heig
 // cambi.c's weight_scores_per_scale and extract's MIN with cambi_max_val.
 double v1_cambi_score(const double scores_per_scale[V1_CAMBI_SCALES], int pixels_in_window, double max_val);
 
+// ADM's contrast sensitivity factors of a scale (0-3) for the Barten-Watson
+// blends, as integer_adm.c takes them: adm_csf_mode 2 (barten_watson_blend_csf)
+// or 3 (barten_watson_blend_csf_mae), *factor1 for the horizontal and
+// vertical bands, *factor2 for the diagonal one. 0, or -1 for a mode, or a
+// viewing distance and display height, that libvmaf has no table for.
+int v1_adm_blend_factors(int csf_mode, int scale, double view_dist, int display_height, float *factor1,
+                         float *factor2);
+
 #ifdef __cplusplus
 }
 #endif

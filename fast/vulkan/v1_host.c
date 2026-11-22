@@ -8,6 +8,9 @@
 // as C with the same compiler and runtime as libvmaf.dll, so that its doubles
 // and CRT pow round as libvmaf's do.
 
+// M_PI (barten_csf_tools.h's), which MSVC's math.h defines only on request.
+#define _USE_MATH_DEFINES
+
 #include "v1_host.h"
 
 #include <errno.h>
@@ -364,4 +367,29 @@ double v1_cambi_score(const double scores_per_scale[V1_CAMBI_SCALES], int pixels
     memcpy(scores, scores_per_scale, sizeof scores);
     double dist_score = weight_scores_per_scale(scores, (uint16_t)pixels_in_window);
     return MIN(dist_score, max_val);
+}
+
+// ------------------------------------------------------------ ADM's contrast sensitivity
+
+// libvmaf's own tables and functions, included as they are (one copy of the
+// tables).
+#pragma warning(push)
+#pragma warning(disable : 4141)  // its FORCE_INLINE inline: "inline" twice
+#include "../../libvmaf/src/feature/barten_csf_tools.h"
+#pragma warning(pop)
+
+int v1_adm_blend_factors(int csf_mode, int scale, double view_dist, int display_height, float *factor1,
+                         float *factor2)
+{
+    if (csf_mode == 2) {
+        *factor1 = barten_watson_blend_csf(scale, 0, view_dist, display_height);
+        *factor2 = barten_watson_blend_csf(scale, 1, view_dist, display_height);
+    } else if (csf_mode == 3) {
+        *factor1 = barten_watson_blend_csf_mae(scale, 0, view_dist, display_height);
+        *factor2 = barten_watson_blend_csf_mae(scale, 1, view_dist, display_height);
+    } else {
+        return -1;
+    }
+    // (They return -EINVAL where they have no table; every table's factor is positive.)
+    return *factor1 > 0.0f && *factor2 > 0.0f ? 0 : -1;
 }

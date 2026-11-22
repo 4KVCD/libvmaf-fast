@@ -553,7 +553,8 @@ const int kDcmTile[2] = { 16, 8 };
 struct V1Options {
     double viewDistance = 3.0;   // adm_norm_view_dist
     int displayHeight = 1080;    // adm_ref_display_height
-    int csfMode = 0;             // adm_csf_mode: 0 Watson97, 2 Barten-Watson blend
+    int csfMode = 0;             // adm_csf_mode: 0 Watson97, 2 Barten-Watson blend, 3 its MAE fit
+    bool skipScale0 = false;     // adm_skip_scale0: scale 0 only downsamples (HDR VMAF)
     double noiseWeight = 0.03125;
     double dlmWeight = 1.0;
     double minValue = 0.0;       // adm_min_val
@@ -1315,7 +1316,8 @@ int vv_context::make_layouts(int shader, uint32_t bindings)
     // vv_pictures' shaders: the pictures' textures (the bindings in `images`).
     uint32_t images = 0;
     if (shader == kShader_motion_v1_8_img || shader == kShader_motion_v1_16_img || shader == kShader_adm_fused_0_8_img
-        || shader == kShader_adm_fused_0_16_img)
+        || shader == kShader_adm_fused_0_16_img || shader == kShader_adm_fused_0_8_img_skip
+        || shader == kShader_adm_fused_0_16_img_skip)
         images = 3;
     if (shader == kShader_cambi_front_8_img || shader == kShader_cambi_front_16_img
         || shader == kShader_cambi_front_8_1_img || shader == kShader_cambi_front_16_1_img)
@@ -1851,33 +1853,16 @@ int vv_context::build_passes()
 
 namespace {
 
-// barten_watson_blend_csf() of libvmaf's barten_csf_tools.h: [theta][scale].
-const float BLENDED_CSF_1080_3H[2][4] = { { 0.01183, 0.025026, 0.04295, 0.058621 },
-                                          { 0.004302, 0.011778, 0.023918, 0.035901 } };
-const float BLENDED_CSF_1080_5H[2][4] = { { 0.004212, 0.014809, 0.029642, 0.047464 },
-                                          { 0.000984, 0.005852, 0.0146, 0.027574 } };
-const float BLENDED_CSF_2160_3H[2][4] = { { 0.00226, 0.01183, 0.025026, 0.04295 },
-                                          { 0.000479, 0.004302, 0.011778, 0.023918 } };
-const float BLENDED_CSF_2160_5H[2][4] = { { 0.000092, 0.004212, 0.014809, 0.029642 },
-                                          { 0.000050, 0.000984, 0.005852, 0.0146 } };
-
 // The contrast sensitivity factors of a scale ({h, v, d}) as libvmaf's CPU
-// code takes them (adm_csf and the others of integer_adm.c). False when the
-// options are ones it has no table for.
+// code takes them (adm_csf and the others of integer_adm.c): Watson97's
+// (mode 0), or the Barten-Watson blends' tables (modes 2 and 3, libvmaf's
+// own: v1_host.c). False when the options are ones it has no table for.
 bool v1_rfactors(const V1Options &o, int scale, float rfactor[3])
 {
     float factor1, factor2;
-    if (o.csfMode == 2) {
-        const float (*table)[4] =
-            (o.displayHeight == 1080 && o.viewDistance == 3.0) ? BLENDED_CSF_1080_3H :
-            (o.displayHeight == 1080 && o.viewDistance == 5.0) ? BLENDED_CSF_1080_5H :
-            (o.displayHeight == 2160 && o.viewDistance == 1.5) ? BLENDED_CSF_1080_3H :
-            (o.displayHeight == 2160 && o.viewDistance == 3.0) ? BLENDED_CSF_2160_3H :
-            (o.displayHeight == 2160 && o.viewDistance == 5.0) ? BLENDED_CSF_2160_5H : nullptr;
-        if (!table)
+    if (o.csfMode == 2 || o.csfMode == 3) {
+        if (v1_adm_blend_factors(o.csfMode, scale, o.viewDistance, o.displayHeight, &factor1, &factor2))
             return false;
-        factor1 = table[0][scale];
-        factor2 = table[1][scale];
     } else if (o.csfMode == 0) {
         factor1 = 1.0f / dwt_quant_step(&dwt_7_9_YCbCr_threshold[0], scale, 1, o.viewDistance, o.displayHeight);
         factor2 = 1.0f / dwt_quant_step(&dwt_7_9_YCbCr_threshold[0], scale, 2, o.viewDistance, o.displayHeight);
@@ -2084,9 +2069,13 @@ int vv_context::build_passes_v1()
             const int rows = std::max(0, p[43] - p[42]);
             const uint32_t chunks = groups(std::max(0, colEnd - colStart), kAdmOwnColumns);
             const uint32_t constants[] = { (uint32_t)(scale * kAdmParams), chunks };
+            // adm_skip_scale0: scale 0 only transformed for scale 1, nothing summed (no ROWSUM).
+            const bool skip = scale == 0 && options.skipScale0;
             if (scale == 0 && pictures) {
                 uint32_t pushed[kPushBytes / 4] = { constants[0], constants[1] };
-                error = add_pass(scored, deep ? kShader_adm_fused_0_16_img : kShader_adm_fused_0_8_img,
+                const int shader = skip ? (deep ? kShader_adm_fused_0_16_img_skip : kShader_adm_fused_0_8_img_skip)
+                                        : (deep ? kShader_adm_fused_0_16_img : kShader_adm_fused_0_8_img);
+                error = add_pass(scored, shader,
                                  { kPictureBinding, kPictureBinding, &divTable, &admParams, &acc, &bandsRef[1],
                                    &bandsDis[1], &admPartial },
                                  pushed, kPushBytes, chunks, groups(rows, kAdmBandRows));
@@ -2099,7 +2088,9 @@ int vv_context::build_passes_v1()
                 if (!error)
                     scored.back().pictureRole = kPictureAdm;
             } else if (scale == 0) {
-                error = add_pass(scored, deep ? kShader_adm_fused_0_16 : kShader_adm_fused_0_8,
+                const int shader = skip ? (deep ? kShader_adm_fused_0_16_skip : kShader_adm_fused_0_8_skip)
+                                        : (deep ? kShader_adm_fused_0_16 : kShader_adm_fused_0_8);
+                error = add_pass(scored, shader,
                                  { inRef, inDis, &divTable, &admParams, &acc, &bandsRef[1], &bandsDis[1], &admPartial },
                                  constants, sizeof constants, chunks, groups(rows, kAdmBandRows));
                 if (!error && direct)
@@ -2116,7 +2107,7 @@ int vv_context::build_passes_v1()
                                         &acc, &admPartial }, constants, sizeof constants, chunks,
                                         groups(rows, kAdmBandRowsSmall));
             }
-            if (!error)
+            if (!error && !skip)
                 error = add_pass(scored, kShader_adm_rowsum, { &bandsRef[set], &bandsDis[set], &divTable, &admParams, &acc,
                                  &admPartial }, constants, sizeof constants, groups(rows * 9, 256), 1);
         }
@@ -2204,9 +2195,17 @@ void v1_adm(const vv_context &context, const uint64_t *slots, double out[3])
         h = (h + 1) / 2;
         const int64_t *cm = (const int64_t *)&slots[kSlotCm + scale * 3];
         const int64_t *aim = (const int64_t *)&slots[kSlotCm + kScales * 3 + scale * 3];
-        float den_scale = v1_csf_den(&slots[kSlotCsfDen + scale * 3], w, h, scale, context.rfactorV1[scale], o.noiseWeight);
-        float num_scale = v1_cm(cm, w, h, scale, o.noiseWeight);
-        float aim_num_scale = v1_cm(aim, w, h, scale, 0.0);
+        float den_scale, num_scale, aim_num_scale;
+        if (scale == 0 && o.skipScale0) {  // as libvmaf: no measure at scale 0, a denominator above 0
+            den_scale = 1e-10f;
+            num_scale = 0.0f;
+            aim_num_scale = 0.0f;
+        } else {
+            den_scale = v1_csf_den(&slots[kSlotCsfDen + scale * 3], w, h, scale, context.rfactorV1[scale],
+                                   o.noiseWeight);
+            num_scale = v1_cm(cm, w, h, scale, o.noiseWeight);
+            aim_num_scale = v1_cm(aim, w, h, scale, 0.0);
+        }
         num += num_scale;
         den += den_scale;
         aim_num += aim_num_scale;
@@ -2307,7 +2306,8 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     if (narrowSubgroup) {
         for (int shader : { kShader_cambi_cvalues_slide_16, kShader_cambi_cvalues_slide, kShader_adm_fused_0_8,
                             kShader_adm_fused_0_16, kShader_adm_fused, kShader_adm_fused_0_8_img,
-                            kShader_adm_fused_0_16_img })
+                            kShader_adm_fused_0_16_img, kShader_adm_fused_0_8_skip, kShader_adm_fused_0_16_skip,
+                            kShader_adm_fused_0_8_img_skip, kShader_adm_fused_0_16_img_skip })
             subgroupSizes[shader] = narrowSubgroup;
     }
     // A decoder's copies waited for by the context (vv_import_timeline,
@@ -4543,9 +4543,23 @@ VV_EXPORT int vv_read_buffer(vv_context *context, int which, void *out, uint64_t
 // adm_min_val, motion_max_val, motion_five_frame_window,
 // motion_moving_average (nine doubles). Frames go in with vv_submit or
 // vv_staging / vv_commit as for VMAF v0.6.1.
+VV_EXPORT int vv_create_v1_ex(vv_context **out, int device, int width, int height, int bitDepth, int flags,
+                              const double *options, int count);
+
 VV_EXPORT int vv_create_v1(vv_context **out, int device, int width, int height, int bitDepth, int flags,
                            const double *options)
 {
+    return vv_create_v1_ex(out, device, width, height, bitDepth, flags, options, 9);
+}
+
+// vv_create_v1 with `count` options: its nine, then adm_skip_scale0 (the
+// HDR VMAF models'; 0 where not given).
+VV_EXPORT int vv_create_v1_ex(vv_context **out, int device, int width, int height, int bitDepth, int flags,
+                              const double *options, int count)
+{
+    *out = nullptr;
+    if (count < 9)
+        return fail(-3, "VMAF v1: fewer options than its nine");
     vv_context *context = new vv_context();
     context->v1 = true;
     V1Options &o = context->options;
@@ -4558,6 +4572,7 @@ VV_EXPORT int vv_create_v1(vv_context **out, int device, int width, int height, 
     o.motionMax = options[6];
     o.fiveFrameWindow = options[7] != 0;
     o.movingAverage = options[8] != 0;
+    o.skipScale0 = count > 9 && options[9] != 0;
     int error = o.viewDistance * o.displayHeight < kAdmNormViewDist * kAdmRefDisplayHeight
         ? fail(-3, "VMAF v1: the viewing distance is nearer than ADM's 16-bit pipeline takes")
         : context->init(device, width, height, bitDepth, flags);

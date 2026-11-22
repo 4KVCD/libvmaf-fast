@@ -116,6 +116,11 @@ $shaders = [ordered]@{
     'adm_fused_0_16'    = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=1', 'SLIDE=1'
     'adm_fused_0_8_img'  = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=0', 'SLIDE=1', 'FROM_IMAGE=1'
     'adm_fused_0_16_img' = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=1', 'SLIDE=1', 'FROM_IMAGE=1'
+    # adm_skip_scale0 (HDR VMAF): scale 0 only transformed for scale 1.
+    'adm_fused_0_8_skip'      = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=0', 'SLIDE=1', 'SKIP_SCALE0=1'
+    'adm_fused_0_16_skip'     = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=1', 'SLIDE=1', 'SKIP_SCALE0=1'
+    'adm_fused_0_8_img_skip'  = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=0', 'SLIDE=1', 'FROM_IMAGE=1', 'SKIP_SCALE0=1'
+    'adm_fused_0_16_img_skip' = 'adm_fused', 'SCALE0=1', 'FROM_PICTURE=1', 'BPC16=1', 'SLIDE=1', 'FROM_IMAGE=1', 'SKIP_SCALE0=1'
     'adm_fused'         = 'adm_fused', 'SCALE0=0', 'FROM_PICTURE=0', 'BPC16=0', 'SLIDE=1', 'BAND=8'
     'adm_fused_next'    = 'adm_fused', 'SCALE0=0', 'FROM_PICTURE=0', 'BPC16=0', 'SLIDE=1', 'BAND=8', 'NEXT_SCALE=1'
     'adm_rowsum'        = 'adm_fused', 'SCALE0=0', 'FROM_PICTURE=0', 'BPC16=0', 'ROWSUM=1'
