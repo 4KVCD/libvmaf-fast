@@ -3,7 +3,7 @@
 # and VMAF NEG on NVIDIA GPUs.
 #
 # Needs git, Visual Studio 2022 Build Tools (C++), the CUDA Toolkit (13.x; not with -NoCuda),
-# Python with meson and ninja (pip install meson ninja), and nasm, cmake and
+# Python with meson, ninja and pkg-config (pip install meson ninja pkgconf), and nasm, cmake and
 # xxd on PATH (Git for Windows has xxd in usr\bin). The CUDA runtime is not
 # linked: libvmaf loads the NVIDIA driver (nvcuda.dll) when it starts.
 #
@@ -16,6 +16,8 @@
 # against official libvmaf: VideoMetricsLab's scripts/bench_release.py).
 param(
     [string]$NvCodecHeadersCommit = 'eddcea9e27f6b772057c9b3f87de2cc1737faffc',  # 13.1.15.1 in development
+    [string]$ZimgCommit = 'f819b14e8f39d1282400b0d9543e8ef73c1b2bbd',  # tag release-3.0.6
+    [string]$ZimgVersion = '3.0.6',
     [string]$Python = 'python',
     [string]$CudaPath = $env:CUDA_PATH,
     [string]$WorkDirectory = (Join-Path $env:TEMP 'libvmaf-fast-build'),
@@ -61,6 +63,45 @@ function Invoke-Native([scriptblock]$command, [switch]$Quiet) {
 function Invoke-Checked([string]$what, [scriptblock]$command) {
     Invoke-Native $command
     if ($LASTEXITCODE -ne 0) { throw "$what failed (exit code $LASTEXITCODE)" }
+}
+
+# Builds zimg's own Visual Studio project as a static zimg.lib with the
+# DLL's settings -- the static C runtime (/MT, as b_vscrt=mt), no
+# whole-program optimisation (the DLL is linked without /LTCG), reproducible
+# objects -- and gives meson a zimg.pc for it. Returns the library's path.
+function Build-Zimg([string]$source) {
+    $out = Join-Path $WorkDirectory 'zimg-build'
+    if (Test-Path $out) { Remove-Item -Recurse -Force $out }
+    New-Item -ItemType Directory -Path $out | Out-Null
+    $settings = Join-Path $out 'settings.props'
+    Set-Content -Path $settings -Encoding utf8 -Value @'
+<Project>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <AdditionalOptions>/Brepro %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Lib>
+      <AdditionalOptions>/Brepro %(AdditionalOptions)</AdditionalOptions>
+    </Lib>
+  </ItemDefinitionGroup>
+</Project>
+'@
+    Invoke-Checked 'Building zimg' {
+        msbuild (Join-Path $source '_msvc/zimg/zimg.vcxproj') /nologo /m /v:minimal /p:Configuration=Release `
+            /p:Platform=x64 /p:WholeProgramOptimization=false /p:TargetName=zimg "/p:OutDir=$out\" `
+            "/p:IntDir=$out\obj\" "/p:ForceImportBeforeCppTargets=$settings"
+    }
+    $library = Join-Path $out 'zimg.lib'
+    if (-not (Test-Path $library)) { throw "zimg's build made no $library" }
+    # pkg-config's file: libvmaf's meson.build finds zimg through it. Forward
+    # slashes, which pkg-config keeps as they are.
+    $include = (Join-Path $source 'src/zimg/api') -replace '\\', '/'
+    Set-Content -Path (Join-Path $out 'zimg.pc') -Encoding ascii -Value @(
+        'Name: zimg', 'Description: Scaling, colorspace conversion, and dithering library', "Version: $ZimgVersion",
+        "Libs: -L$($out -replace '\\', '/') -lzimg", "Cflags: -I$include")
+    $env:PKG_CONFIG_PATH = $out
+    return $library
 }
 
 # The script runs in the caller's PowerShell session, and what it sets there
@@ -124,11 +165,22 @@ try {
     # compiles too), for the reason INCLUDE carries the headers.
     $env:_CL_ = "/experimental:deterministic `"/pathmap:$([IO.Path]::GetFullPath($vmaf).TrimEnd('\'))=.`" " +
         "`"/pathmap:$([IO.Path]::GetFullPath($WorkDirectory).TrimEnd('\'))=work`""
+
+    # zimg: the colour conversion and scaling of the HDR-VMAF models'
+    # conversion_target (picture.c), a static library linked into the DLL.
+    $zimg = Join-Path $WorkDirectory 'zimg'
+    if (-not (Test-Path (Join-Path $zimg '.git'))) {
+        Invoke-Checked 'Cloning zimg' { git clone --quiet https://github.com/sekrit-twc/zimg.git $zimg }
+    }
+    Invoke-Checked 'Checking out zimg' { git -C $zimg -c advice.detachedHead=false checkout --quiet --force $ZimgCommit }
+    $zimgLibrary = Build-Zimg $zimg
+
     if (Test-Path $build) { Remove-Item -Recurse -Force $build }
     Invoke-Checked 'Configuring libvmaf' {
         & $Python -m mesonbuild.mesonmain setup (Join-Path $vmaf 'libvmaf') $build --buildtype release `
             --default-library static "-Denable_cuda=$cuda" "-Denable_nvcc=$cuda" -Denable_tests=false `
-            -Denable_tools=false -Denable_docs=false -Denable_float=false -Dbuilt_in_models=true -Db_vscrt=mt `
+            -Denable_tools=false -Denable_docs=false -Denable_float=false -Dbuilt_in_models=true -Denable_zimg=true `
+            -Db_vscrt=mt `
             -Dc_args=/Brepro -Dcpp_args=/Brepro -Dc_link_args=/Brepro -Dcpp_link_args=/Brepro
     }
     Invoke-Checked 'Building libvmaf' { & $Python -m mesonbuild.mesonmain compile -C $build }
@@ -155,7 +207,8 @@ try {
     }
     New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
     Invoke-Checked 'Linking libvmaf.dll' {
-        link /nologo /DLL /MACHINE:X64 /Brepro /OUT:$output /DEF:$definitions (Join-Path $build 'src/vmaf.lib') $pthreads
+        link /nologo /DLL /MACHINE:X64 /Brepro /OUT:$output /DEF:$definitions (Join-Path $build 'src/vmaf.lib') $pthreads `
+            $zimgLibrary
     }
     Remove-Item (Join-Path $outputDirectory 'libvmaf.lib'), (Join-Path $outputDirectory 'libvmaf.exp') -ErrorAction SilentlyContinue
 
@@ -166,6 +219,7 @@ try {
     New-Item -ItemType Directory -Path $licenses -Force | Out-Null
     Copy-Item (Join-Path $vmaf 'LICENSE') (Join-Path $licenses 'LICENSE.libvmaf.txt')
     Copy-Item (Join-Path $vmaf 'libvmaf/subprojects/pthread-win32/docs/LICENSE.md') (Join-Path $licenses 'LICENSE.pthreads4w.txt')
+    Copy-Item (Join-Path $zimg 'COPYING') (Join-Path $licenses 'LICENSE.zimg.txt')
     # The xpsnr extractor is a port of FFmpeg's filter, under its licence
     # (this fork's; Netflix's tree has none).
     if (Test-Path (Join-Path $vmaf 'libvmaf/src/feature/xpsnr.c')) {

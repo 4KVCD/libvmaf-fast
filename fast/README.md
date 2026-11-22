@@ -14,7 +14,7 @@ Everything the fork adds lives under `fast/`:
 
 Needs Windows x64, Visual Studio 2022 Build Tools (C++), git, and for libvmaf
 also the CUDA Toolkit 13.x, Python with meson and ninja
-(`pip install meson ninja`), and nasm, cmake and xxd on PATH (Git for
+(`pip install meson ninja pkgconf`), and nasm, cmake and xxd on PATH (Git for
 Windows has xxd in `usr\bin`). Slang, the shader compiler, and the Vulkan
 headers are downloaded at pinned versions.
 
