@@ -50,4 +50,12 @@ void calculate_c_values_avx2(struct VmafPicture *pic, const struct VmafPicture *
                              const uint16_t num_diffs, const uint16_t *tvi_for_diff, uint16_t vlt_luma,
                              const int *diff_weights, const int *all_diffs, int width, int height);
 
+/* libvmaf-fast: cambi.c's preprocessing rows and top-k sum */
+void cambi_u8_to_10b_row_avx2(const uint8_t *src, uint16_t *dst, int width, int shift);
+void cambi_u16_shl_row_avx2(const uint16_t *src, uint16_t *dst, int width, int shift);
+void cambi_u16_round_shr_row_avx2(const uint16_t *src, uint16_t *dst, int width, int shift);
+uint16_t cambi_max_row_avx2(const uint16_t *row, int width);
+void cambi_anti_dither_row_avx2(uint16_t *row, const uint16_t *below, int width);
+double cambi_sum_nonzero_avx2(const float *arr, int n);
+
 #endif /* X86_AVX2_CAMBI_H_ */

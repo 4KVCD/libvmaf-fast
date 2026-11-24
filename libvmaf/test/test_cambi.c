@@ -16,6 +16,8 @@
  *
  */
 
+#include <string.h>
+
 #include "test.h"
 #include "ref.h"
 #include "feature/cambi.c"
@@ -744,6 +746,108 @@ static char *test_get_vlt_luma()
     return NULL;
 }
 
+/* libvmaf-fast: a w x h picture of random samples below 2^bpc, with flat
+ * runs (equal neighbours) and the largest sample; 0 on success. */
+static int random_picture(VmafPicture *pic, unsigned bpc, unsigned w, unsigned h, uint32_t seed)
+{
+    int err = vmaf_picture_alloc(pic, VMAF_PIX_FMT_YUV420P, bpc, w, h);
+    if (err) return err;
+    const unsigned peak = (1u << bpc) - 1;
+    uint32_t state = seed * 2654435761u + 1;
+    for (unsigned i = 0; i < h; i++) {
+        for (unsigned j = 0; j < w; j++) {
+            state = state * 1664525u + 1013904223u;
+            unsigned v = (state >> 8) & peak;
+            if ((j / 5) % 3 == 0) v = peak - (i % 7);   /* flat runs near the top */
+            if (bpc > 8)
+                ((uint16_t *)pic->data[0])[i * (pic->stride[0] >> 1) + j] = (uint16_t)v;
+            else
+                ((uint8_t *)pic->data[0])[i * pic->stride[0] + j] = (uint8_t)v;
+        }
+    }
+    return 0;
+}
+
+/* cambi_preprocessing with the AVX2 rows and with the scalar ones (CPU flags
+ * masked): the same 10-bit picture or the same error. */
+static int preprocessing_matches(VmafPicture *in, unsigned out_w, unsigned out_h, int enc_bitdepth)
+{
+    VmafPicture got, want;
+    if (vmaf_picture_alloc(&got, VMAF_PIX_FMT_YUV420P, 10, out_w, out_h) ||
+        vmaf_picture_alloc(&want, VMAF_PIX_FMT_YUV420P, 10, out_w, out_h))
+        return 0;
+    const int err_got = cambi_preprocessing(in, &got, out_w, out_h, enc_bitdepth);
+    vmaf_set_cpu_flags_mask(0);
+    const int err_want = cambi_preprocessing(in, &want, out_w, out_h, enc_bitdepth);
+    vmaf_set_cpu_flags_mask(~0u);
+    const int same = err_got == err_want && (err_got || pic_data_equality(&got, &want));
+    vmaf_picture_unref(&got);
+    vmaf_picture_unref(&want);
+    return same;
+}
+
+static char *test_avx2_preprocessing_is_the_scalar_preprocessing()
+{
+    /* every same-size conversion (8-, 9-, 10-bit, rounded 12- and 16-bit),
+     * the anti-dithering filter after each (enc_bitdepth 8), an odd width
+     * for the leftover samples, and the resizing route */
+    static const unsigned depths[] = { 8, 9, 10, 12, 16 };
+    const unsigned w = 203, h = 37;
+    vmaf_init_cpu();
+    for (size_t d = 0; d < sizeof depths / sizeof depths[0]; d++) {
+        VmafPicture in;
+        mu_assert("alloc", !random_picture(&in, depths[d], w, h, (uint32_t)d));
+        mu_assert("preprocessing differs", preprocessing_matches(&in, w, h, depths[d]));
+        mu_assert("anti-dithered preprocessing differs", preprocessing_matches(&in, w, h, 8));
+        mu_assert("resized preprocessing differs", preprocessing_matches(&in, w / 2, h / 2, 8));
+        vmaf_picture_unref(&in);
+    }
+
+    /* a sample above 10 bits fails both ways, in the vector part of a row
+     * and in its leftover samples */
+    const unsigned bad_columns[] = { 17, w - 1 };
+    for (size_t c = 0; c < 2; c++) {
+        VmafPicture in;
+        mu_assert("alloc", !random_picture(&in, 10, w, h, 9));
+        ((uint16_t *)in.data[0])[5 * (in.stride[0] >> 1) + bad_columns[c]] = 1024;
+        VmafPicture out;
+        mu_assert("alloc", !vmaf_picture_alloc(&out, VMAF_PIX_FMT_YUV420P, 10, w, h));
+        mu_assert("a sample above 10 bits is accepted",
+                  cambi_preprocessing(&in, &out, w, h, 10) == -EINVAL);
+        mu_assert("validation differs", preprocessing_matches(&in, w, h, 10));
+        vmaf_picture_unref(&out);
+        vmaf_picture_unref(&in);
+    }
+    return NULL;
+}
+
+static char *test_avx2_topk_sum_is_the_scalar_sum()
+{
+    /* mostly 0 (as c-values are) and dense, with a length that leaves
+     * values after the groups of 8 */
+    enum { N = 1003 };
+    static float arr[N];
+    uint32_t state = 7;
+    for (int dense = 0; dense < 2; dense++) {
+        for (int i = 0; i < N; i++) {
+            state = state * 1664525u + 1013904223u;
+            const int zero = !dense && (state >> 28) < 13;
+            arr[i] = zero ? 0.0f : (float)(state >> 9) * 1e-5f / (float)(1 + (i % 97));
+        }
+        double got = average_topk_elements(arr, N);
+        vmaf_set_cpu_flags_mask(0);
+        double want = average_topk_elements(arr, N);
+        vmaf_set_cpu_flags_mask(~0u);
+        mu_assert("the AVX2 top-k sum differs", !memcmp(&got, &want, sizeof got));
+        got = average_topk_elements(arr, 5);
+        vmaf_set_cpu_flags_mask(0);
+        want = average_topk_elements(arr, 5);
+        vmaf_set_cpu_flags_mask(~0u);
+        mu_assert("the AVX2 top-k sum of 5 differs", !memcmp(&got, &want, sizeof got));
+    }
+    return NULL;
+}
+
 char *run_tests()
 {
     /* Preprocessing functions */
@@ -764,6 +868,8 @@ char *run_tests()
     mu_run_test(test_spatial_pooling);
     mu_run_test(test_quick_select);
     mu_run_test(test_average_topk_elements);
+    mu_run_test(test_avx2_topk_sum_is_the_scalar_sum);
+    mu_run_test(test_avx2_preprocessing_is_the_scalar_preprocessing);
 
     mu_run_test(test_get_pixels_in_window);
     mu_run_test(test_weight_scores_per_scale);

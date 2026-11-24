@@ -674,6 +674,58 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
 /* Preprocessing functions */
 
 // For bitdepths <= 8.
+/* libvmaf-fast: the preprocessing below works row by row, with the AVX2
+ * rows (x86/cambi_avx2.c) where the CPU has AVX2: the same values. */
+typedef struct PreprocessRows {
+    void (*u8_to_10b)(const uint8_t *src, uint16_t *dst, int width, int shift);
+    void (*u16_shl)(const uint16_t *src, uint16_t *dst, int width, int shift);
+    void (*u16_round_shr)(const uint16_t *src, uint16_t *dst, int width, int shift);
+    uint16_t (*row_max)(const uint16_t *row, int width);  /* not max: a macro on MSVC */
+    void (*anti_dither)(uint16_t *row, const uint16_t *below, int width);
+} PreprocessRows;
+
+static void u8_to_10b_row(const uint8_t *src, uint16_t *dst, int width, int shift) {
+    for (int j = 0; j < width; j++)
+        dst[j] = src[j] << shift;
+}
+
+static void u16_shl_row(const uint16_t *src, uint16_t *dst, int width, int shift) {
+    for (int j = 0; j < width; j++)
+        dst[j] = src[j] << shift;
+}
+
+/* src >> shift (shift >= 1), rounded to nearest with halves up */
+static void u16_round_shr_row(const uint16_t *src, uint16_t *dst, int width, int shift) {
+    const int rounding_offset = 1 << (shift - 1);
+    for (int j = 0; j < width; j++)
+        dst[j] = (src[j] + rounding_offset) >> shift;
+}
+
+static uint16_t max_row(const uint16_t *row, int width) {
+    uint16_t best = 0;
+    for (int j = 0; j < width; j++)
+        best = row[j] > best ? row[j] : best;
+    return best;
+}
+
+/* The anti-dithering filter's outputs [0, width - 1) of a row, in place. */
+static void anti_dither_row(uint16_t *row, const uint16_t *below, int width) {
+    for (int j = 0; j < width - 1; j++)
+        row[j] = (row[j] + row[j + 1] + below[j] + below[j + 1]) >> 2;
+}
+
+static PreprocessRows preprocess_rows(void) {
+    PreprocessRows rows = { u8_to_10b_row, u16_shl_row, u16_round_shr_row, max_row, anti_dither_row };
+#if ARCH_X86
+    if (vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2) {
+        rows = (PreprocessRows){ cambi_u8_to_10b_row_avx2, cambi_u16_shl_row_avx2,
+                                 cambi_u16_round_shr_row_avx2, cambi_max_row_avx2,
+                                 cambi_anti_dither_row_avx2 };
+    }
+#endif
+    return rows;
+}
+
 static void decimate_generic_uint8_and_convert_to_10b(const VmafPicture *pic, VmafPicture *out_pic, unsigned out_w, unsigned out_h) {
     uint8_t *data = pic->data[0];
     uint16_t *out_data = out_pic->data[0];
@@ -686,11 +738,9 @@ static void decimate_generic_uint8_and_convert_to_10b(const VmafPicture *pic, Vm
 
     // if the input and output sizes are the same
     if (in_w == out_w && in_h == out_h){
-        for (unsigned i = 0; i < out_h; i++) {
-            for (unsigned j = 0; j < out_w; j++) {
-                out_data[i * out_stride + j] = data[i * stride + j] << shift_factor;
-            }
-        }
+        const PreprocessRows rows = preprocess_rows();
+        for (unsigned i = 0; i < out_h; i++)
+            rows.u8_to_10b(data + i * stride, out_data + i * out_stride, out_w, shift_factor);
         return;
     }
 
@@ -724,11 +774,9 @@ static void decimate_generic_9b_and_convert_to_10b(const VmafPicture *pic, VmafP
 
     // if the input and output sizes are the same
     if (in_w == out_w && in_h == out_h) {
-        for (unsigned i = 0; i < out_h; i++) {
-            for (unsigned j = 0; j < out_w; j++) {
-                out_data[i * out_stride + j] = data[i * stride + j] << 1;
-            }
-        }
+        const PreprocessRows rows = preprocess_rows();
+        for (unsigned i = 0; i < out_h; i++)
+            rows.u16_shl(data + i * stride, out_data + i * out_stride, out_w, 1);
         return;
     }
 
@@ -775,11 +823,9 @@ static void decimate_generic_uint16_and_convert_to_10b(const VmafPicture *pic, V
             }
         }
         else {
-            for (unsigned i = 0; i < out_h; i++) {
-                for (unsigned j = 0; j < out_w; j++) {
-                    out_data[i * out_stride + j] = (data[i * stride + j] + rounding_offset) >> shift_factor;
-                }
-            }
+            const PreprocessRows rows = preprocess_rows();
+            for (unsigned i = 0; i < out_h; i++)
+                rows.u16_round_shr(data + i * stride, out_data + i * out_stride, out_w, shift_factor);
         }
         return;
     }
@@ -806,14 +852,10 @@ static void decimate_generic_uint16_and_convert_to_10b(const VmafPicture *pic, V
 static void anti_dithering_filter(VmafPicture *pic, unsigned width, unsigned height) {
     uint16_t *data = pic->data[0];
     int stride = pic->stride[0] >> 1;
+    const PreprocessRows rows = preprocess_rows();
 
     for (unsigned i = 0; i < height - 1; i++) {
-        for (unsigned j = 0; j < width - 1; j++) {
-            data[i * stride + j] = (data[i * stride + j] +
-                                    data[i * stride + j + 1] +
-                                    data[(i + 1) * stride + j] +
-                                    data[(i + 1) * stride + j + 1]) >> 2;
-        }
+        rows.anti_dither(data + i * stride, data + (i + 1) * stride, width);
 
         // Last column
         unsigned j = width - 1;
@@ -858,16 +900,15 @@ static int validate_image_hbd(const VmafPicture *pic) {
     int channel = 0;
     uint16_t *data = (uint16_t *)pic->data[channel];
     size_t stride = pic->stride[channel] / 2;
+    const PreprocessRows rows = preprocess_rows();
     for (unsigned i = 0; i < pic->h[channel]; i++) {
-        for (unsigned j = 0; j < pic->w[channel]; j++) {
-            if (data[i * stride + j] > max_val) {
-                vmaf_log(
-                    VMAF_LOG_LEVEL_ERROR,
-                    "Invalid input. The input contains values greater than %d, which exceeds the maximum value for a %d-bit depth format.",
-                    max_val, bpc
-                );
-                return -EINVAL;
-            }
+        if (rows.row_max(data + i * stride, pic->w[channel]) > max_val) {
+            vmaf_log(
+                VMAF_LOG_LEVEL_ERROR,
+                "Invalid input. The input contains values greater than %d, which exceeds the maximum value for a %d-bit depth format.",
+                max_val, bpc
+            );
+            return -EINVAL;
         }
     }
     return 0;
@@ -1245,6 +1286,11 @@ static void calculate_c_values_neon(VmafPicture *pic, const VmafPicture *mask_pi
 #endif
 
 static double average_topk_elements(const float *arr, int topk_elements) {
+#if ARCH_X86
+    /* libvmaf-fast: the same sum, skipping the 0s (x86/cambi_avx2.c) */
+    if (vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2)
+        return cambi_sum_nonzero_avx2(arr, topk_elements) / topk_elements;
+#endif
     double sum = 0;
     for (int i = 0; i < topk_elements; i++)
         sum += arr[i];
