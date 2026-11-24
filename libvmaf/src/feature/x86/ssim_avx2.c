@@ -213,10 +213,12 @@ void ssim_accumulate_avx2(const float *ref_mu, const float *cmp_mu, const float 
     const __m256 vC2 = _mm256_set1_ps(C2);
     const __m256 vC3 = _mm256_set1_ps(C3);
     const __m256 vzero = _mm256_setzero_ps();
-    double local_ssim = 0.0;
-    double local_l = 0.0;
-    double local_c = 0.0;
-    double local_s = 0.0;
+    /* libvmaf-fast: from the running sums, so a picture added in parts gets
+     * the sums of one call (from 0.0, the same as adding to 0.0 after) */
+    double local_ssim = *ssim_sum;
+    double local_l = *l_sum;
+    double local_c = *c_sum;
+    double local_s = *s_sum;
 
     int i = 0;
     for (; i + 8 <= n; i += 8) {
@@ -229,8 +231,8 @@ void ssim_accumulate_avx2(const float *ref_mu, const float *cmp_mu, const float 
                                     sigma_both[i], C1, C2, C3, &local_ssim, &local_l, &local_c,
                                     &local_s);
     }
-    *ssim_sum += local_ssim;
-    *l_sum += local_l;
-    *c_sum += local_c;
-    *s_sum += local_s;
+    *ssim_sum = local_ssim;
+    *l_sum = local_l;
+    *c_sum = local_c;
+    *s_sum = local_s;
 }

@@ -52,4 +52,16 @@
  */
 int _iqa_decimate(float *img, int w, int h, int factor, const struct _kernel *k, float *result, int *rw, int *rh);
 
+/* libvmaf-fast: row r (0 <= r < h) of a picture as floats: a pointer to it,
+ * or scratch (w floats) filled with it. */
+typedef const float *(*iqa_row_fn)(void *ctx, int r, float *scratch);
+
+/* libvmaf-fast: _iqa_decimate at factor 2 into result (another buffer) of a
+ * w x h picture read row by row through row_fn: the same values, without
+ * the picture as one float image. Returns nonzero, having written nothing,
+ * where it cannot: a kernel that is not odd-sized up to 15 x 15 or not
+ * KBND_SYMMETRIC, a picture smaller than the kernel, no memory. */
+int _iqa_decimate2_rows(iqa_row_fn row_fn, void *ctx, int w, int h,
+                        const struct _kernel *k, float *result, int *rw, int *rh);
+
 #endif /*_DECIMATE_H_*/
