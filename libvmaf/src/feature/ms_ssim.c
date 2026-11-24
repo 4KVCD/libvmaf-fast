@@ -60,10 +60,14 @@ static float g_betas[]  = { 0.0448f, 0.2856f, 0.3001f, 0.2363f, 0.1333f };
 static float g_gammas[] = { 0.0448f, 0.2856f, 0.3001f, 0.2363f, 0.1333f };
 
 /* libvmaf-fast: each scale's SSIM is calculated in stripes of this many
- * output rows, whose buffers stay in the CPU's caches (at 4K, 6.8 MB instead
- * of six full-size pictures per scale). The same sums in the same order as
- * one pass over the picture, so the same score. */
-#define STRIPE_ROWS 64
+ * output rows, whose buffers stay in the CPU's caches: at 4K, 4.0 MB per
+ * thread (the two input stripes and _iqa_ssim_add_sums' six buffers, 34 rows
+ * each) instead of six full-size pictures per scale. The same sums in the
+ * same order as one pass over the picture, so the same score. 24 rows was
+ * the fastest at 4K with 24 threads (64 rows: 20.6 ms a frame, 32: 13.6, 24:
+ * 12.3, 16: 12.7; Core Ultra 9 285K); a stripe filters the 10 rows it shares
+ * with the next one again, which costs 4 % at 4K with one thread. */
+#define STRIPE_ROWS 24
 
 /* The input rows of one stripe. */
 #define STRIPE_IN_ROWS (STRIPE_ROWS + GAUSSIAN_LEN - 1)
