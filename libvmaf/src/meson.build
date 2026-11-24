@@ -344,6 +344,9 @@ if is_asm_enabled
           feature_src_dir + 'arm64/ssim_decimate_neon.c',
           feature_src_dir + 'arm64/xpsnr_any_neon.c',
           feature_src_dir + 'arm64/cambi_neon.c',
+          feature_src_dir + 'arm64/decimate_neon.c',
+          feature_src_dir + 'arm64/psnr_hvs_neon.c',
+          feature_src_dir + 'arm64/ciede_neon.c',
         ]
 
           arm64_static_lib = static_library(
