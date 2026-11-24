@@ -371,6 +371,7 @@ if is_asm_enabled
           feature_src_dir + 'x86/psnr_avx2.c',
           feature_src_dir + 'x86/ciede_avx2.c',
           feature_src_dir + 'x86/decimate_avx2.c',
+          feature_src_dir + 'x86/psnr_hvs_avx2.c',
       ]
 
       if cc.get_id() == 'msvc'

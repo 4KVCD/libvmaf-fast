@@ -31,9 +31,13 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdint.h>
 #include <string.h>
 
+#include "cpu.h"
 #include "feature_collector.h"
 #include "feature_extractor.h"
 #include "log.h"
+#if ARCH_X86
+#include "../../x86/psnr_hvs_avx2.h"
+#endif
 
 typedef int32_t od_coeff;
 
@@ -238,8 +242,19 @@ static double calc_psnrhvs(const unsigned char *_src, int _systride,
             mask[x][y] = (_csf[x][y] * 0.3885746225901003) *
                          (_csf[x][y] * 0.3885746225901003);
 
+#if ARCH_X86
+    const int avx2 = !!(vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2);
+#endif
     for (y = 0; y < _h - 7; y += _step) {
-        for (x = 0; x < _w - 7; x += _step) {
+        x = 0;
+#if ARCH_X86
+        /* libvmaf-fast: the row's blocks 8 at a time (x86/psnr_hvs_avx2.c),
+         * the same values; the last few here */
+        if (avx2)
+            x = psnr_hvs_blocks_avx2(_src, _systride, _dst, _dystride, depth, y, _w, _step,
+                                     &mask[0][0], &_csf[0][0], &ret, &pixels);
+#endif
+        for (; x < _w - 7; x += _step) {
             int i;
             int j;
             float s_means[4];
