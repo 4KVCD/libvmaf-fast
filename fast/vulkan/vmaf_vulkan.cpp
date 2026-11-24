@@ -2566,7 +2566,8 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
             narrowSubgroup = 32;
     }
     if (narrowSubgroup) {
-        for (int shader : { kShader_cambi_cvalues_slide_16, kShader_cambi_cvalues_slide, kShader_adm_fused_0_8,
+        for (int shader : { kShader_cambi_cvalues_slide_16, kShader_cambi_cvalues_slide_24,
+                            kShader_cambi_cvalues_slide, kShader_adm_fused_0_8,
                             kShader_adm_fused_0_16, kShader_adm_fused, kShader_adm_fused_0_8_img,
                             kShader_adm_fused_0_16_img, kShader_adm_fused_0_8_skip, kShader_adm_fused_0_16_skip,
                             kShader_adm_fused_0_8_img_skip, kShader_adm_fused_0_16_img_skip })
@@ -3135,7 +3136,13 @@ int vv_context::enable_cambi(const double *values)
             }
             constants[14] = rows;
             const bool slide = (c.window_size >> 1) <= 32 && c.v_band_size <= 32 * 56 && !cambiBruteForce;
-            const int slideShader = (c.window_size >> 1) <= 16 ? kShader_cambi_cvalues_slide_16 : kShader_cambi_cvalues_slide;
+            // The variant of the smallest shared tile that takes the pad: HDR
+            // VMAF's 5158x2160 pictures (a letterboxed 4K film scaled to the
+            // model's 2160 rows) have pad 20.
+            const int pad = c.window_size >> 1;
+            const int slideShader = pad <= 16   ? kShader_cambi_cvalues_slide_16
+                                    : pad <= 24 ? kShader_cambi_cvalues_slide_24
+                                                : kShader_cambi_cvalues_slide;
             error = slide ? add_pass(cvalues, slideShader, { &cambiFiltered[scale], mask, &cambiC[scale],
                                      &cambiReciprocal }, constants, sizeof constants, groups(sw, 64), groups(sh, (int)rows))
                           : add_pass(cvalues, kShader_cambi_cvalues, { &cambiFiltered[scale], mask, &cambiC[scale],
