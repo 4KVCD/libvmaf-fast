@@ -37,55 +37,66 @@
 #include "feature/picture_copy.h"
 #include "mem.h"
 
-/* A picture of noise over smooth gradients, with hard edges and extremes. */
+/* A picture of noise over smooth gradients, with hard edges and extremes, in
+ * each of its planes. */
 static int make_picture(VmafPicture *pic, unsigned bpc, unsigned w, unsigned h, uint32_t seed)
 {
     int err = vmaf_picture_alloc(pic, VMAF_PIX_FMT_YUV420P, bpc, w, h);
     if (err) return err;
     const uint32_t peak = (1u << bpc) - 1;
     uint32_t state = seed * 2654435761u + 1;
-    for (unsigned y = 0; y < h; y++) {
-        for (unsigned x = 0; x < w; x++) {
+    for (int p = 0; p < 3; p++)
+    for (unsigned y = 0; y < pic->h[p]; y++) {
+        for (unsigned x = 0; x < pic->w[p]; x++) {
             state = state * 1664525u + 1013904223u;
             uint32_t value = ((x * 37 + y * 11) % 512) * peak / 511;
             value = (value + (state >> 24) * peak / 1023) % (peak + 1);
             if (((x / 23) + (y / 17)) % 7 == 0)
                 value = (x & 1) ? peak : 0;
             if (bpc > 8)
-                ((uint16_t *) pic->data[0])[y * (pic->stride[0] / 2) + x] = (uint16_t) value;
+                ((uint16_t *) pic->data[p])[y * (pic->stride[p] / 2) + x] = (uint16_t) value;
             else
-                ((uint8_t *) pic->data[0])[y * pic->stride[0] + x] = (uint8_t) value;
+                ((uint8_t *) pic->data[p])[y * pic->stride[p] + x] = (uint8_t) value;
         }
     }
     return 0;
 }
 
-static int compare(unsigned bpc, unsigned w, unsigned h)
+/* compute_ssim_decimated of one plane of two w x h pictures against
+ * picture_copy() + compute_ssim() of that plane: 1 where they differ. */
+static int compare(unsigned bpc, unsigned picture_w, unsigned picture_h, int plane)
 {
     VmafPicture ref, dis;
-    if (make_picture(&ref, bpc, w, h, w + h) || make_picture(&dis, bpc, w, h, w * 3 + bpc))
+    if (make_picture(&ref, bpc, picture_w, picture_h, picture_w + picture_h) ||
+        make_picture(&dis, bpc, picture_w, picture_h, picture_w * 3 + bpc))
         return -1;
+    const unsigned w = ref.w[plane], h = ref.h[plane];
     const int scale = ssim_scale(w, h, 0);
     const size_t stride = ALIGN_CEIL(w * sizeof(float));
     float *ref_f = aligned_malloc(stride * h, 32), *dis_f = aligned_malloc(stride * h, 32);
-    picture_copy(ref_f, stride, &ref, 0, bpc, 0);
-    picture_copy(dis_f, stride, &dis, 0, bpc, 0);
+    picture_copy(ref_f, stride, &ref, 0, bpc, plane);
+    picture_copy(dis_f, stride, &dis, 0, bpc, plane);
     double want[4];
     int err = compute_ssim(ref_f, dis_f, w, h, stride, stride, &want[0], &want[1], &want[2], &want[3], 0);
     int differs = 0;
     /* with the AVX2 code (where the CPU has it): with a workspace for the
-     * call, and with one kept, used again dirty; then the C code, once */
+     * call, with one kept, used again dirty, and with one using its dirty
+     * floats; then the C code, once */
     static const unsigned masks[] = { ~0u, 0 };
     for (int m = 0; m < 2 && !err; m++) {
         vmaf_set_cpu_flags_mask(masks[m]);
-        SsimWorkspace *ws = ssim_workspace_alloc(w, h, scale, bpc);
-        SsimWorkspace *const use[] = { NULL, ws, ws };
-        err |= !ws;
-        for (int u = m ? 2 : 0; u < 3 && !err; u++) {
+        SsimWorkspace *ws = ssim_workspace_alloc(w, h, scale, bpc, NULL);
+        SsimWorkspace *borrower = ws ? ssim_workspace_alloc(w, h, scale, bpc, ws) : NULL;
+        SsimWorkspace *const use[] = { NULL, ws, ws, borrower };
+        err |= !ws || !borrower;
+        /* floats too small for a wider picture are refused */
+        err |= ws && ssim_workspace_alloc(w + 2 * scale, h, scale, bpc, ws) != NULL;
+        for (int u = m ? 3 : 0; u < 4 && !err; u++) {
             double got[4];
-            err |= compute_ssim_decimated(&ref, &dis, scale, use[u], &got[0], &got[1], &got[2], &got[3]);
+            err |= compute_ssim_decimated(&ref, &dis, plane, scale, use[u], &got[0], &got[1], &got[2], &got[3]);
             differs |= memcmp(want, got, sizeof want) != 0;
         }
+        ssim_workspace_free(borrower);
         ssim_workspace_free(ws);
     }
     vmaf_set_cpu_flags_mask(~0u);
@@ -118,9 +129,28 @@ static char *test_decimated_ssim_is_compute_ssims()
     };
     vmaf_init_cpu();
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        const int result = compare(cases[i][2], cases[i][0], cases[i][1]);
+        const int result = compare(cases[i][2], cases[i][0], cases[i][1], 0);
         mu_assert("compute_ssim_decimated failed", result >= 0);
         mu_assert("compute_ssim_decimated is not compute_ssim's score", result == 0);
+    }
+    return NULL;
+}
+
+/* libvmaf-fast: float_ssim's chroma (enable_chroma) decimates the Cb and Cr
+ * planes the same way: their own sizes, row spacings and scales, rows that
+ * are not a multiple of the SIMD width, and odd sizes. */
+static char *test_decimated_chroma_is_compute_ssims()
+{
+    static const unsigned cases[][4] = {
+        { 1444, 1080, 10, 1 }, /* 722 x 540: scale 2, rows padded */
+        { 1443, 811, 12, 2 },  /* 721 x 405: scale 2, odd */
+        { 1444, 1080, 8, 2 },  /* 8 bits */
+    };
+    vmaf_init_cpu();
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        const int result = compare(cases[i][2], cases[i][0], cases[i][1], (int)cases[i][3]);
+        mu_assert("compute_ssim_decimated failed on a chroma plane", result >= 0);
+        mu_assert("a chroma plane's score is not compute_ssim's", result == 0);
     }
     return NULL;
 }
@@ -166,11 +196,11 @@ static char *test_scale_one_and_odd_depths_are_refused()
     double score, l, c, s;
     mu_assert("alloc", !make_picture(&ref, 9, 320, 240, 1) && !make_picture(&dis, 9, 320, 240, 2));
     /* picture_copy() reads 9-bit samples as 8-bit: left to compute_ssim() */
-    mu_assert("9-bit not refused", compute_ssim_decimated(&ref, &dis, 2, NULL, &score, &l, &c, &s) != 0);
+    mu_assert("9-bit not refused", compute_ssim_decimated(&ref, &dis, 0, 2, NULL, &score, &l, &c, &s) != 0);
     vmaf_picture_unref(&ref);
     vmaf_picture_unref(&dis);
     mu_assert("alloc", !make_picture(&ref, 8, 320, 240, 1) && !make_picture(&dis, 8, 320, 240, 2));
-    mu_assert("scale 1 not refused", compute_ssim_decimated(&ref, &dis, 1, NULL, &score, &l, &c, &s) != 0);
+    mu_assert("scale 1 not refused", compute_ssim_decimated(&ref, &dis, 0, 1, NULL, &score, &l, &c, &s) != 0);
     vmaf_picture_unref(&ref);
     vmaf_picture_unref(&dis);
     return NULL;
@@ -179,6 +209,7 @@ static char *test_scale_one_and_odd_depths_are_refused()
 char *run_tests()
 {
     mu_run_test(test_decimated_ssim_is_compute_ssims);
+    mu_run_test(test_decimated_chroma_is_compute_ssims);
     mu_run_test(test_avx2_ssim_is_the_scalar_ssim);
     mu_run_test(test_scale_one_and_odd_depths_are_refused);
     return NULL;

@@ -35,6 +35,7 @@
 
 typedef struct PsnrState {
     bool enable_chroma;
+    bool enable_luma;
     bool enable_mse;
     bool enable_apsnr;
     bool reduced_hbd_peak;
@@ -56,6 +57,15 @@ static const VmafOption options[] = {
         .name = "enable_chroma",
         .help = "enable calculation for chroma channels",
         .offset = offsetof(PsnrState, enable_chroma),
+        .type = VMAF_OPT_TYPE_BOOL,
+        .default_val.b = true,
+    },
+    {
+        /* libvmaf-fast: off where another extractor gives psnr_y already
+         * (xpsnr's option "psnr"), so that only the chroma is read again */
+        .name = "enable_luma",
+        .help = "enable calculation for the luma channel",
+        .offset = offsetof(PsnrState, enable_luma),
         .type = VMAF_OPT_TYPE_BOOL,
         .default_val.b = true,
     },
@@ -135,6 +145,8 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
 
     if (pix_fmt == VMAF_PIX_FMT_YUV400P)
         s->enable_chroma = false;
+    if (!s->enable_luma && !s->enable_chroma)
+        return -EINVAL;  /* no plane to score */
 
     for (unsigned i = 0; i < 3; i++) {
         if (s->min_sse != 0.0) {
@@ -177,7 +189,7 @@ static int psnr(VmafPicture *ref_pic, VmafPicture *dist_pic,
 
     int err = 0;
 
-    for (unsigned p = 0; p < n; p++) {
+    for (unsigned p = s->enable_luma ? 0 : 1; p < n; p++) {
         uint8_t *ref = ref_pic->data[p];
         uint8_t *dis = dist_pic->data[p];
 
@@ -219,7 +231,7 @@ static int psnr_hbd(VmafPicture *ref_pic, VmafPicture *dist_pic,
 
     int err = 0;
 
-    for (unsigned p = 0; p < n; p++) {
+    for (unsigned p = s->enable_luma ? 0 : 1; p < n; p++) {
         uint16_t *ref = ref_pic->data[p];
         uint16_t *dis = dist_pic->data[p];
 
