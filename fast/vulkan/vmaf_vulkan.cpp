@@ -187,7 +187,8 @@ enum {
     // are in the top k, and whether a value was not a whole number of units.
     kSlotCambi = kSlotCm + 2 * kScales * 3,
     kSlotCambiInvalid = kSlotCambi + V1_CAMBI_SCALES * 4,  // a sample above its bit depth's largest
-    kSlots = kSlotCambiInvalid + 1
+    kSlotCiede = kSlotCambiInvalid + 1,  // CIEDE2000 (vv_v1_ciede): the pixels' dE00 in units of 2^-20
+    kSlots = kSlotCiede + 1
 };
 
 // What vv_features returns per frame.
@@ -202,7 +203,7 @@ enum {
 };
 
 // What the API reads of a frame (vv_features, vv_features_v1,
-// vv_v1_cambi_scores), made from its sums when the GPU is done with it
+// vv_v1_cambi_scores, vv_v1_ciede_scores), made from its sums when the GPU is done with it
 // (collect), by the same functions on the same sums as when they were
 // read later, so the sums themselves (kSlots 64-bit values, about 750
 // bytes) need not be kept: only the first kRawFrames frames' are, for
@@ -214,6 +215,7 @@ struct FrameRecord {
     double adm[2] = {};          // ADM2, gain limit 100 and 1
     double v1Adm[3] = {};        // VMAF v1's adm3, aim and adm2 (v1_adm)
     double cambi = 0.0;          // VMAF v1's CAMBI
+    double ciede = 0.0;          // CIEDE2000 (vv_v1_ciede)
     uint8_t scored = 0;
     int8_t cambiError = 0;       // -5 or -6: vv_v1_cambi_scores fails at this frame
 };
@@ -527,6 +529,8 @@ struct Slot {
     bool planeFromHost[2] = { false, false };
     Buffer speedKeep;                 // and the filtered planes est_params reads (host-visible)
     std::vector<Pass> speedPasses;
+    Buffer ciedeChroma;               // CIEDE2000: the pair's chroma planes (host-visible)
+    std::vector<Pass> ciedePasses;
     // vv_pictures: the frame's pictures (indices of vv_context::pictureCache:
     // the reference, the distorted one, the reference before it for motion)
     // and their first samples' places (previous x, y, reference x, y,
@@ -876,6 +880,24 @@ struct vv_context {
     Buffer speedFilterTaps, speedOperating, speedScaling;
     int enable_speed(const double *values);
 
+    // CIEDE2000 (vv_v1_ciede, shaders/ciede.slang): from the luma the
+    // features read and the 4:2:0 chroma in each slot's ciedeChroma, whole
+    // planes ((w + 1) / 2 x (h + 1) / 2, as libvmaf's pictures hold them;
+    // SpEED's chroma drops an odd last row and column).
+    bool ciede = false;
+    // Its pass reads the luma from the slots' staging, where that is the
+    // GPU's own memory (an integrated GPU, barFrames) and nothing else reads
+    // the pictures (flag bits 16 and 18): no copy into picRef and picDis for
+    // a pass that reads each sample once.
+    bool ciedeFromStaging = false;
+    uint32_t ciedeW = 0, ciedeH = 0, ciedeStrideBytes = 0, ciedePlaneBytes = 0;
+    int enable_ciede();
+    // VMAF v1's copy of the frames into picRef and picDis: whether a pass reads them
+    bool pictures_copied() const
+    {
+        return !(v1 && (skip & 5) == 5 && !cambi && !speed && (!ciede || ciedeFromStaging));
+    }
+
     // The HDR models' picture conversion on the GPU (vv_v1_convert, shaders/
     // convert.slang): the source pictures go in, and the context's size at 16
     // bits comes out where the features read it -- the luma in picRef and
@@ -1028,7 +1050,7 @@ struct vv_context {
         uint32_t rows;
     };
     struct {
-        CopyPlane planes[6];
+        CopyPlane planes[10];  // two luma planes, SpEED's four chroma planes and CIEDE2000's
         int count;
     } copyJob = {};
     void copy_part(unsigned part);
@@ -1289,8 +1311,9 @@ int vv_context::compile_pipelines()
     for (std::vector<Pass> *list : { &motion[0], &motion[1], &scored, &convertSides[0].passes, &convertSides[1].passes })
         for (Pass &pass : *list)
             passes.push_back(&pass);
-    for (Slot &slot : slots)  // VMAF v1's per slot (CAMBI's kept c-values, SpEED)
-        for (std::vector<Pass> *list : { &slot.cambiKeepPasses, &slot.speedPasses, &slot.speedPassesHost })
+    for (Slot &slot : slots)  // VMAF v1's per slot (CAMBI's kept c-values, SpEED, CIEDE2000)
+        for (std::vector<Pass> *list : { &slot.cambiKeepPasses, &slot.speedPasses, &slot.speedPassesHost,
+                                         &slot.ciedePasses })
             for (Pass &pass : *list)
                 passes.push_back(&pass);
     auto words_of = [&](const Pass &pass) {
@@ -1940,7 +1963,7 @@ int vv_context::build_passes_v1()
     // motion_score_pipeline_8 / _16: against the previous reference frame,
     // or the one before it (the five-frame window). Frame i's reference is
     // kept in picPrev[i % 2] once the frame is done.
-    for (int parity = 0; parity < 2 && !error; ++parity) {
+    for (int parity = 0; parity < 2 && !error && !(skip & 1); ++parity) {
         int32_t constants[kPushBytes / 4] = { w, h, strideWords, bpc, 1 << (bpc - 1), kSlotSad };
         Buffer *previous = &picPrev[options.fiveFrameWindow ? parity : 1 - parity];
         if (pictures) {  // the two pictures' textures, each frame
@@ -1965,6 +1988,10 @@ int vv_context::build_passes_v1()
             });
     }
 
+    if (skip & 4) {  // no ADM (vv_create's flag bit 18: a context for CIEDE2000 or CAMBI alone)
+        v1AdmEnd = 0;
+        return error;
+    }
     const float cos_1deg_sq = cos(1.0 * M_PI / 180.0) * cos(1.0 * M_PI / 180.0);
     uint32_t cosBits;
     memcpy(&cosBits, &cos_1deg_sq, sizeof cosBits);
@@ -2661,6 +2688,10 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // ADM's decoupled images: only the separate decouple and masking passes
     // write them -- adm_dcm keeps them in group memory (190 MB at 4K).
     const VkDeviceSize decoupled = admFused ? 0 : 1;
+    // VMAF v1 without motion or ADM (flag bits 16 and 18): the previous
+    // reference and ADM's band images are not made (at 4K 16-bit, 33 and
+    // about 30 MB).
+    const VkDeviceSize prevUsed = v1 && (skip & 1) ? 0 : 1, bandsUsed = v1 && (skip & 4) ? 0 : 1;
     struct { Buffer *buffer; VkDeviceSize bytes; } sized[] = {
         { &picRef, direct ? 4 : planeBytes }, { &picDis, direct ? 4 : planeBytes },
         // Motion's blur, 16-bit: two pixels a word.
@@ -2670,15 +2701,16 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         { &rdRef[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 }, { &rdDis[0], (VkDeviceSize)w1 * h1 * 4 * v0 * twoPass + 4 },
         { &rdRef[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 }, { &rdDis[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 * twoPass + 4 },
         // VMAF v1's previous reference, unless read from its slot (direct).
-        { &picPrev[0], planeBytes * only1 * (direct ? 0 : 1) + 4 },
-        { &picPrev[1], planeBytes * only1 * (direct ? 0 : 1) + 4 },
+        { &picPrev[0], planeBytes * only1 * (direct ? 0 : 1) * prevUsed + 4 },
+        { &picPrev[1], planeBytes * only1 * (direct ? 0 : 1) * prevUsed + 4 },
         { &logTable, 16384 * 4 }, { &divTable, 65536 * 4 },
         // VMAF v0.6.1's: scales 0 and 2 two words a position at scale 0, 1 and 3
         // three. VMAF v1's ADM (adm_fused.slang): scale 2's bands at [0], as
         // wide as they are, and scale 1's or 3's at [1], four words a position.
-        { &bandsRef[0], v1 ? (VkDeviceSize)((w2 + 1) / 2) * ((h2 + 1) / 2) * 16 : (VkDeviceSize)w1 * h1 * 8 },
-        { &bandsDis[0], v1 ? (VkDeviceSize)((w2 + 1) / 2) * ((h2 + 1) / 2) * 16 : (VkDeviceSize)w1 * h1 * 8 },
-        { &bandsRef[1], (VkDeviceSize)w2 * h2 * (v1 ? 16 : 12) }, { &bandsDis[1], (VkDeviceSize)w2 * h2 * (v1 ? 16 : 12) },
+        { &bandsRef[0], (v1 ? (VkDeviceSize)((w2 + 1) / 2) * ((h2 + 1) / 2) * 16 : (VkDeviceSize)w1 * h1 * 8) * bandsUsed + 4 },
+        { &bandsDis[0], (v1 ? (VkDeviceSize)((w2 + 1) / 2) * ((h2 + 1) / 2) * 16 : (VkDeviceSize)w1 * h1 * 8) * bandsUsed + 4 },
+        { &bandsRef[1], (VkDeviceSize)w2 * h2 * (v1 ? 16 : 12) * bandsUsed + 4 },
+        { &bandsDis[1], (VkDeviceSize)w2 * h2 * (v1 ? 16 : 12) * bandsUsed + 4 },
         { &bandsARef[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 }, { &bandsADis[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 },
         { &bandsARef[1], (VkDeviceSize)w2 * h2 * 4 * v0 + 4 }, { &bandsADis[1], (VkDeviceSize)w2 * h2 * 4 * v0 + 4 },
         // VMAF v1 passes nothing between ADM's passes (adm_fused.slang).
@@ -3109,6 +3141,45 @@ int vv_context::enable_speed(const double *values)
     return 0;
 }
 
+// CIEDE2000's pass (shaders/ciede.slang): a thread per 2x2 luma block, the
+// pair's chroma copied into the slot's ciedeChroma by submit_v1.
+int vv_context::enable_ciede()
+{
+    if (!v1)
+        return fail(-3, "CIEDE2000 is calculated in a VMAF v1 context only");
+    if (frames || ciede)
+        return fail(-3, "CIEDE2000 is started before the first frame");
+    // A decoder's frames (their chroma is not copied where the pass reads
+    // it) and converted ones (the conversion writes SpEED's chroma only):
+    // the caller scores those on the CPU.
+    if (shared || converting)
+        return fail(-4, "CIEDE2000 on the GPU takes its frames from host memory (vv_submit_v1)");
+    ciedeW = (uint32_t)(w + 1) / 2;
+    ciedeH = (uint32_t)(h + 1) / 2;
+    ciedeStrideBytes = (ciedeW * (bpc > 8 ? 2 : 1) + 3) & ~3u;
+    ciedePlaneBytes = ciedeStrideBytes * ciedeH;
+    const uint32_t constants[] = { (uint32_t)w, (uint32_t)h, strideBytes / 4, ciedeW, ciedeH, ciedeStrideBytes / 4,
+                                   (uint32_t)bpc, kSlotCiede };
+    const int shader = bpc > 8 ? kShader_ciede_16 : kShader_ciede_8;
+    ciedeFromStaging = !direct && (skip & 5) == 5 && (integratedGpu || barFrames);
+    for (Slot &slot : slots) {
+        if (int error = create_buffer(slot.ciedeChroma, (VkDeviceSize)ciedePlaneBytes * 4, true, false, true))
+            return error;
+        // The luma where the other features read it: the slot's own (direct)
+        // or the copies -- or, read by this pass alone, the slot's staging.
+        const bool fromSlot = direct || ciedeFromStaging;
+        const Bound ref = fromSlot ? slot_ref(slot) : Bound(&picRef);
+        const Bound dis = fromSlot ? slot_dis(slot) : Bound(&picDis);
+        if (int error = add_pass(slot.ciedePasses, shader, { ref, dis, &slot.ciedeChroma, &acc }, constants,
+                                 sizeof constants, groups(ciedeW, 16), groups(ciedeH, 16)))
+            return error;
+    }
+    if (int compiled = compile_pipelines())  // the passes added here
+        return compiled;
+    ciede = true;
+    return 0;
+}
+
 // ------------------------------------------------- the HDR picture conversion
 
 // Every plan buffer of `kind` this engine lays out: a source plane (Y, U or
@@ -3300,6 +3371,8 @@ int vv_context::enable_convert(const uint32_t *const plans[2], const size_t word
         return fail(-3, "the conversion runs in a VMAF v1 context of 16 bits whose frames come through vv_submit_v1");
     if (frames || converting)
         return fail(-3, "the conversion is set once, before the first frame");
+    if (ciede)  // whose pass reads the slots' planes, which the conversion leaves unused
+        return fail(-3, "the conversion is set before CIEDE2000 (which then runs on the CPU)");
     for (int side = 0; side < 2; ++side) {
         if (int error = load_convert_plan(side, plans[side], words[side]))
             return error;
@@ -3643,9 +3716,12 @@ int vv_context::collect(Slot &slot)
                 frame.vif[limit][scale] = (float)vif[scale];  // exact: each is a float quotient
             frame.adm[limit] = adm_score(sums, limit, (unsigned)w, (unsigned)h);
         }
-        v1_adm(*this, sums, frame.v1Adm);
+        if (!(v1 && (skip & 4)))  // (VMAF v1 without ADM: no ADM passes, v1AdmEnd 0)
+            v1_adm(*this, sums, frame.v1Adm);
         if (cambi)
             frame.cambiError = (int8_t)cambi_score(sums, cambiPooled, cambiPooledScales, frame.cambi);
+        if (ciede)  // ciede.c's: 45 - 20 log10 of the mean dE00 (+inf for identical pictures, as there)
+            frame.ciede = 45.0 - 20.0 * log10((double)sums[kSlotCiede] * (1.0 / 1048576.0) / ((double)w * h));
     }
     if (speed && slot.scored)  // est_params on the pool's threads, from a copy of the planes
         speedPool.submit(slot.index, (const float *)slot.speedKeep.mapped);
@@ -3780,10 +3856,10 @@ int vv_context::submit_v1(const uint8_t *const planes[6], const ptrdiff_t stride
         return fail(-3, "this context takes its frames from GPU memory");
     if (!planes[0] || (score && !planes[3]))
         return fail(-3, "a frame needs its reference picture, a scored one its distorted one too");
-    if (speed && score) {
+    if ((speed || ciede) && score) {
         for (int plane : { 1, 2, 4, 5 }) {
             if (!planes[plane])
-                return fail(-3, "SpEED needs the chroma planes");
+                return fail(-3, speed ? "SpEED needs the chroma planes" : "CIEDE2000 needs the chroma planes");
         }
     }
     if (converting) {
@@ -3827,6 +3903,13 @@ int vv_context::submit_v1(const uint8_t *const planes[6], const ptrdiff_t stride
             copyJob.planes[copyJob.count++] = { chroma + (size_t)i * chromaPlaneBytes, chromaStrideBytes,
                                                 planes[order[i]], strides[order[i]], chromaW * sampleBytes,
                                                 chromaH };
+    }
+    if (ciede && score) {
+        uint8_t *chroma = (uint8_t *)pending->ciedeChroma.mapped;
+        const int order[4] = { 1, 2, 4, 5 };  // ref U, ref V, dis U, dis V
+        for (int i = 0; i < 4; ++i)
+            copyJob.planes[copyJob.count++] = { chroma + (size_t)i * ciedePlaneBytes, ciedeStrideBytes,
+                                                planes[order[i]], strides[order[i]], ciedeW * sampleBytes, ciedeH };
     }
     copy_planes();
     if (profile) {
@@ -3918,7 +4001,7 @@ int vv_context::commit(bool score)
             vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
                                     nullptr, 0, nullptr, 1, &give);
         }
-    } else if (!direct && !converting) {  // (converting: the conversion writes them, after the barrier below)
+    } else if (!direct && !converting && pictures_copied()) {  // (converting: the conversion writes them, after the barrier below)
         VkBufferCopy copy = { 0, 0, planeBytes };
         vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
         if (score) {
@@ -3949,10 +4032,11 @@ int vv_context::commit(bool score)
     if (converting)  // the frame's pictures converted on the GPU, ending with a barrier
         record_convert(cb, slotIndex, score ? 3u : 1u, stamp);
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
-    const std::vector<Pass> *lists[4] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
+    const std::vector<Pass> *lists[5] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
                                           score && cambi ? &slot.cambiKeepPasses : nullptr,
                                           score && speed ? (slot.chromaFromHost ? &slot.speedPassesHost
-                                                                                : &slot.speedPasses) : nullptr };
+                                                                                : &slot.speedPasses) : nullptr,
+                                          score && ciede ? &slot.ciedePasses : nullptr };
     if (shared)
         slot.chromaFromHost = false;  // the next frame's: from staging unless vv_chroma_staging says
     auto record = [&](const Pass &pass) {
@@ -3981,12 +4065,12 @@ int vv_context::commit(bool score)
     const bool inTurns = !profile && !passLimit;
     if (v1 && inTurns) {
         // VMAF v1's features, independent of each other -- motion, ADM, CAMBI
-        // (and its kept c-values), SpEED -- each a chain of passes that wait
+        // (and its kept c-values), SpEED, CIEDE2000 -- each a chain of passes that wait
         // for the one before, recorded in turns: a pass (or passes that
         // overlap) of each chain, then one barrier, so that each waits for
         // its own chain's and the others' passes run beside it (the small
         // ones left the GPU idle between barriers, at 1080p most).
-        std::vector<std::vector<const Pass *>> chains(4);
+        std::vector<std::vector<const Pass *>> chains(5);
         if (moves)
             for (const Pass &pass : motion[index % 2]) chains[0].push_back(&pass);
         if (score) {
@@ -3995,12 +4079,14 @@ int vv_context::commit(bool score)
             if (cambi)
                 for (const Pass &pass : slot.cambiKeepPasses) chains[2].push_back(&pass);
         }
-        if (lists[3])
-            for (const Pass &pass : *lists[3]) chains[3].push_back(&pass);
-        size_t at[4] = {};
+        for (int c = 3; c < 5; ++c)
+            if (lists[c])
+                for (const Pass &pass : *lists[c]) chains[(size_t)c].push_back(&pass);
+        size_t at[5] = {};
         // The stage each chain starts at: CAMBI's first (CLEAR's), the rest after
-        // it (the best of the orders tried on a Radeon 780M, by a few percent).
-        const int offsets[4] = { 1, 1, 0, 2 };
+        // it (the best of the orders tried on a Radeon 780M, by a few percent);
+        // CIEDE2000's single pass with CAMBI's first.
+        const int offsets[5] = { 1, 1, 0, 2, 0 };
         int stage = 0;
         for (bool waiting = true; waiting; ++stage) {
             waiting = false;
@@ -4054,7 +4140,7 @@ int vv_context::commit(bool score)
             }
         }
     }
-    if (v1 && !direct) {  // read from its slot otherwise (staging())
+    if (v1 && !direct && !(skip & 1)) {  // read from its slot otherwise (staging()); only motion reads it
         barrier(vk, cb, kCompute, kTransfer);
         VkBufferCopy keep = { 0, 0, planeBytes };
         vk.vkCmdCopyBuffer(cb, picRef.buffer, picPrev[index % 2].buffer, 1, &keep);
@@ -4839,6 +4925,29 @@ VV_EXPORT int vv_v1_speed_scores(vv_context *context, double *out, unsigned fram
             out[3 * (size_t)i] = out[3 * (size_t)i + 1] = out[3 * (size_t)i + 2] = NAN;
     }
     return (int)count;
+}
+
+// CIEDE2000 (libvmaf's ciede.c) of the frame pairs on the GPU, for a context
+// made by vv_create_v1, before its first frame; its frames then go in with
+// vv_submit_v1, 4:2:0 (the chroma (w + 1) / 2 x (h + 1) / 2, as libvmaf's
+// pictures). For CIEDE2000 alone, make the context with flag bits 16 and 18
+// (no motion, no ADM). The score is ciede.c's within about 1e-5 (float
+// arithmetic, shaders/ciede.slang). -4 for a context whose frames come from
+// a decoder or are converted (the caller scores those on the CPU).
+VV_EXPORT int vv_v1_ciede(vv_context *context) { return context->enable_ciede(); }
+
+// Every frame's CIEDE2000 score, after vv_flush; NaN for a frame that was
+// not scored, +inf for identical pictures (as ciede.c). Returns the number
+// of frames.
+VV_EXPORT int vv_v1_ciede_scores(vv_context *context, double *out, unsigned frames)
+{
+    if (!context->ciede)
+        return fail(-3, "CIEDE2000 is not calculated in this context");
+    const Blocks<FrameRecord> &records = context->records;
+    const unsigned n = (unsigned)std::min<size_t>(frames, records.size());
+    for (unsigned i = 0; i < n; ++i)
+        out[i] = records[i].scored ? records[i].ciede : NAN;
+    return (int)records.size();
 }
 
 // Profiling, for the speed work: started before the first frame, it times

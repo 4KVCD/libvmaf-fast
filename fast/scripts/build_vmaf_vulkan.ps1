@@ -136,6 +136,9 @@ $shaders = [ordered]@{
     'convert_resize_int16' = 'convert', 'STEP=2', 'NO_CONTRACTION=1'
     'convert_colour'       = 'convert', 'STEP=3', 'NO_CONTRACTION=1'
     'convert_samples'      = 'convert', 'STEP=4', 'NO_CONTRACTION=1'
+    # CIEDE2000 (shaders/ciede.slang), in float.
+    'ciede_8'           = 'ciede', 'BPC16=0'
+    'ciede_16'          = 'ciede', 'BPC16=1'
 }
 
 # A SPIR-V module with every float multiply, add, subtract and negation
