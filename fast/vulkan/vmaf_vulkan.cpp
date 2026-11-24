@@ -698,6 +698,170 @@ private:
     bool stopping = false;
 };
 
+// VMAF v1's CAMBI: spatial pooling of the scales whose top k the GPU cannot
+// sum exactly in a double (scale 0 of most 4K frames), on worker threads, a
+// frame a job, from a copy of those scales' c-values. It is cambi.c's
+// quick-select and serial double sum, about 18 ms a 4K frame, which the
+// thread that submits the frames would otherwise spend while the GPU waits.
+// The same code on the same values whichever thread runs it, so the scores
+// are identical. The threads start with the first job: contexts whose top k
+// is always exact (most below 4K) start none.
+class CambiPool {
+public:
+    // Pools a job's scales (bits `scales`; their c-values back to back in
+    // `values`, which it reorders) and works out the frame's score; returns
+    // vv_context::cambi_score's error code.
+    using Scorer = std::function<int(const uint64_t *sums, unsigned scales, float *values, double &out)>;
+
+    ~CambiPool() { stop(); }
+
+    void configure(Scorer scorer, int threadCount)
+    {
+        score = std::move(scorer);
+        workers = threadCount;
+    }
+
+    // A buffer for a job's c-values, once fewer than kMaxQueued jobs wait, so
+    // that at most kMaxQueued + workers buffers exist (each keeps its size).
+    std::vector<float> buffer()
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        done.wait(lock, [this] { return queue.size() < kMaxQueued; });
+        std::vector<float> values;
+        if (!spare.empty()) {
+            values = std::move(spare.back());
+            spare.pop_back();
+        }
+        values.clear();
+        return values;
+    }
+
+    // A scored frame's job: its sums (kSlots) and the c-values of `scales`.
+    void submit(unsigned index, const uint64_t *sums, unsigned scales, std::vector<float> values)
+    {
+        Job job{ index, scales, {}, std::move(values) };
+        memcpy(job.sums.data(), sums, sizeof job.sums);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!started)
+                start();
+            if (!threads.empty()) {
+                queue.push_back(std::move(job));
+                ++pending;
+                work.notify_one();
+                return;
+            }
+        }
+        run_job(job);  // no thread could be started: on this one
+    }
+
+    void wait()
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        done.wait(lock, [this] { return pending == 0; });
+    }
+
+    // The pooled frames' scores into their records (after wait()).
+    void merge(Blocks<FrameRecord> &records)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (size_t i = 0; i < results.size() && i < records.size(); ++i) {
+            if (results[i].done) {
+                records[i].cambi = results[i].cambi;
+                records[i].cambiError = results[i].error;
+            }
+        }
+    }
+
+    double busyNs = 0.0;  // the workers' time, summed (the profile)
+    uint64_t jobs = 0;
+
+private:
+    enum { kMaxQueued = 3 };  // a 4K job holds 33 MB
+    struct Job {
+        unsigned index, scales;
+        std::array<uint64_t, kSlots> sums;
+        std::vector<float> values;
+    };
+
+    void start()  // (under the mutex)
+    {
+        started = true;
+        try {
+            for (int i = 0; i < workers; ++i)
+                threads.emplace_back([this] { run(); });
+        } catch (...) {  // the threads started so far do the work
+        }
+    }
+
+    void run()
+    {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                work.wait(lock, [this] { return stopping || !queue.empty(); });
+                if (queue.empty())
+                    return;
+                job = std::move(queue.front());
+                queue.pop_front();
+            }
+            run_job(job);
+            std::lock_guard<std::mutex> lock(mutex);
+            --pending;
+            done.notify_all();
+        }
+    }
+
+    void run_job(Job &job)
+    {
+        const auto begin = std::chrono::steady_clock::now();
+        double cambi = 0.0;
+        const int error = score(job.sums.data(), job.scales, job.values.data(), cambi);
+        const double ns = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin).count();
+        std::lock_guard<std::mutex> lock(mutex);
+        while (results.size() <= job.index)  // frames finish in any order
+            results.add();
+        Result &result = results[job.index];
+        result.cambi = cambi;
+        result.error = (int8_t)error;
+        result.done = true;
+        spare.push_back(std::move(job.values));
+        busyNs += ns;
+        ++jobs;
+    }
+
+    void stop()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+            queue.clear();
+        }
+        work.notify_all();
+        for (std::thread &thread : threads)
+            thread.join();
+        threads.clear();
+    }
+
+    Scorer score;
+    int workers = 1;
+    std::mutex mutex;
+    std::condition_variable work, done;
+    std::deque<Job> queue;
+    std::vector<std::vector<float>> spare;
+    struct Result {
+        double cambi;
+        int8_t error;
+        bool done;
+    };
+    Blocks<Result> results;  // by frame
+    std::vector<std::thread> threads;
+    size_t pending = 0;
+    bool started = false, stopping = false;
+};
+
 } // namespace
 
 struct vv_context {
@@ -868,6 +1032,7 @@ struct vv_context {
     Buffer cambiFiltered[V1_CAMBI_SCALES], cambiMask[V1_CAMBI_SCALES],
         cambiC[V1_CAMBI_SCALES];
     int enable_cambi(const double *values);
+    CambiPool cambiPool;  // the scales the GPU's top k could not sum exactly (after cambiConst: destroyed first)
 
     // VMAF v1's SpEED chroma (vv_v1_speed): the GPU filters the four chroma
     // planes (shaders/speed.slang), v1_speed.c scores them when a frame is
@@ -942,7 +1107,7 @@ struct vv_context {
     std::vector<std::vector<int>> slotLabels;  // per slot: what each interval between its timestamps was
     double gpuNs[kProfileLabels] = {};
     uint64_t gpuCount[kProfileLabels] = {};
-    enum { kCpuCopy, kCpuRecord, kCpuWait, kCpuSpeed, kCpuCambiPool, kCpuSteps };
+    enum { kCpuCopy, kCpuRecord, kCpuWait, kCpuSpeed, kCpuCambiCopy, kCpuCambiPool, kCpuSteps };
     double cpuNs[kCpuSteps] = {};
     uint64_t cpuCount[kCpuSteps] = {};
     double now_ns() const;
@@ -3017,6 +3182,18 @@ int vv_context::enable_cambi(const double *values)
         return error;
     if (int compiled = compile_pipelines())  // the passes added here
         return compiled;
+    // The pool's scorer reads only what is fixed from here on (cambiConst, cambiOptions).
+    cambiPool.configure([this](const uint64_t *sums, unsigned scales, float *values, double &out) {
+        double pooled[V1_CAMBI_SCALES] = {};
+        for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
+            if (!(scales & (1u << scale)))
+                continue;
+            const unsigned sw = (unsigned)cambiConst.scale_w[scale], sh = (unsigned)cambiConst.scale_h[scale];
+            pooled[scale] = v1_cambi_pool(values, cambiOptions.topk, sw, sh);
+            values += (size_t)sw * sh;
+        }
+        return cambi_score(sums, pooled, scales, out);
+    }, (int)std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u));  // as SpEED's
     cambi = true;
     return 0;
 }
@@ -3687,23 +3864,31 @@ int vv_context::collect(Slot &slot)
         sums[i] = (uint64_t)words[2 * i] | ((uint64_t)words[2 * i + 1] << 32);
     if (slot.index < rawSums.size())
         memcpy(rawSums[slot.index].data(), sums, sizeof sums);
-    const double tailStart = profile ? now_ns() : 0.0;
-    double cambiPooled[V1_CAMBI_SCALES] = {};  // spatial_pooling on the CPU, where the GPU's top k was not exact
-    unsigned cambiPooledScales = 0;           // which scales those are (bits)
+    // The scales whose top k the GPU could not sum exactly (bits): spatial_pooling
+    // on the CPU, on cambiPool's threads, from a copy of their c-values; the pool
+    // works out the frame's score, which flush() puts into its record.
+    unsigned cambiPooledScales = 0;
     if (cambi && slot.scored) {
-        const float *kept = (const float *)slot.cambiKeep.mapped;
         for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
-            if (!(sums[kSlotCambi + scale * 4 + 3] & 2))
-                continue;
-            const int sw = cambiConst.scale_w[scale], sh = cambiConst.scale_h[scale];
-            std::vector<float> values(kept + cambiKeepOffset[scale], kept + cambiKeepOffset[scale] + (size_t)sw * sh);
-            cambiPooled[scale] = v1_cambi_pool(values.data(), cambiOptions.topk, (unsigned)sw, (unsigned)sh);
-            cambiPooledScales |= 1u << scale;
+            if (sums[kSlotCambi + scale * 4 + 3] & 2)
+                cambiPooledScales |= 1u << scale;
         }
     }
-    if (profile) {
-        cpuNs[kCpuCambiPool] += now_ns() - tailStart;
-        ++cpuCount[kCpuCambiPool];
+    if (cambiPooledScales) {
+        const double copyStart = profile ? now_ns() : 0.0;
+        std::vector<float> values = cambiPool.buffer();
+        const float *kept = (const float *)slot.cambiKeep.mapped;
+        for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
+            if (cambiPooledScales & (1u << scale)) {
+                const float *c = kept + cambiKeepOffset[scale];
+                values.insert(values.end(), c, c + (size_t)cambiConst.scale_w[scale] * cambiConst.scale_h[scale]);
+            }
+        }
+        cambiPool.submit(slot.index, sums, cambiPooledScales, std::move(values));
+        if (profile) {
+            cpuNs[kCpuCambiCopy] += now_ns() - copyStart;
+            ++cpuCount[kCpuCambiCopy];
+        }
     }
     FrameRecord &frame = records[slot.index];
     frame.sad = sums[kSlotSad];
@@ -3718,8 +3903,8 @@ int vv_context::collect(Slot &slot)
         }
         if (!(v1 && (skip & 4)))  // (VMAF v1 without ADM: no ADM passes, v1AdmEnd 0)
             v1_adm(*this, sums, frame.v1Adm);
-        if (cambi)
-            frame.cambiError = (int8_t)cambi_score(sums, cambiPooled, cambiPooledScales, frame.cambi);
+        if (cambi && !cambiPooledScales)
+            frame.cambiError = (int8_t)cambi_score(sums, nullptr, 0, frame.cambi);
         if (ciede)  // ciede.c's: 45 - 20 log10 of the mean dE00 (+inf for identical pictures, as there)
             frame.ciede = 45.0 - 20.0 * log10((double)sums[kSlotCiede] * (1.0 / 1048576.0) / ((double)w * h));
     }
@@ -4453,6 +4638,10 @@ int vv_context::flush()
     }
     if (speed)
         speedPool.wait();
+    if (cambi) {
+        cambiPool.wait();
+        cambiPool.merge(records);
+    }
     return error;
 }
 
@@ -4971,7 +5160,10 @@ VV_EXPORT int vv_profile_text(vv_context *context, char *out, int bytes)
     }
     context->cpuNs[vv_context::kCpuSpeed] = context->speedPool.busyNs;  // on its threads
     context->cpuCount[vv_context::kCpuSpeed] = context->speedPool.jobs;
-    static const char *const steps[vv_context::kCpuSteps] = { "copy", "record", "wait", "speed_threads", "cambi_pool" };
+    context->cpuNs[vv_context::kCpuCambiPool] = context->cambiPool.busyNs;  // on its threads
+    context->cpuCount[vv_context::kCpuCambiPool] = context->cambiPool.jobs;
+    static const char *const steps[vv_context::kCpuSteps] = { "copy", "record", "wait", "speed_threads", "cambi_copy",
+                                                              "cambi_threads" };
     for (int i = 0; i < vv_context::kCpuSteps; ++i) {
         snprintf(line, sizeof line, "cpu %s %.3f %llu\n", steps[i], context->cpuNs[i] / 1e6,
                  (unsigned long long)context->cpuCount[i]);
