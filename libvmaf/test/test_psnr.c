@@ -60,6 +60,7 @@ static char *test_16b_large_diff()
     mu_assert("test_16b_large_diff vmaf_feature_collector_init error", !err);
     PsnrState psnr_state = {
         .enable_chroma = 1,
+        .enable_luma = 1,
         .enable_mse = 1,
         .enable_apsnr = 0,
         .peak = 65535,
@@ -103,7 +104,7 @@ static char *test_rows_init_picks_are_the_scalar_rows()
     uint16_t r16[N], d16[N];
     uint32_t state = 1;
     vmaf_init_cpu();
-    PsnrState s = { 0 };
+    PsnrState s = { .enable_luma = true };
     VmafFeatureExtractor fex = { .priv = &s };
     mu_assert("init failed", !init(&fex, VMAF_PIX_FMT_YUV400P, 8, 64, 64));
 
@@ -125,9 +126,37 @@ static char *test_rows_init_picks_are_the_scalar_rows()
     return NULL;
 }
 
+/* libvmaf-fast: without the luma (enable_luma off, where xpsnr gives psnr_y)
+ * only psnr_cb and psnr_cr are written, with the values they have beside it;
+ * and a psnr with no plane to score is refused. */
+static char *test_chroma_without_luma()
+{
+    VmafPicture pic1, pic2;
+    int err = get_picture_16b(&pic1, 0) | get_picture_16b(&pic2, 1);
+    mu_assert("alloc error", !err);
+    VmafFeatureCollector *fc;
+    mu_assert("collector error", !vmaf_feature_collector_init(&fc));
+    PsnrState s = { .enable_chroma = 1, .enable_luma = 0, .peak = 65535 };
+    mu_assert("failed psnr_hbd", psnr_hbd(&pic1, &pic2, 0, fc, &s) == 0);
+    double score;
+    mu_assert("psnr_y written", vmaf_feature_collector_get_score(fc, "psnr_y", &score, 0) != 0);
+    mu_assert("no psnr_cb", !vmaf_feature_collector_get_score(fc, "psnr_cb", &score, 0));
+    mu_assert("wrong psnr_cb", almost_equal(score, 0.0));
+    mu_assert("no psnr_cr", !vmaf_feature_collector_get_score(fc, "psnr_cr", &score, 0));
+    vmaf_feature_collector_destroy(fc);
+    vmaf_picture_unref(&pic1);
+    vmaf_picture_unref(&pic2);
+
+    PsnrState none = { .enable_chroma = 1, .enable_luma = 0 };
+    VmafFeatureExtractor fex = { .priv = &none };
+    mu_assert("no plane not refused", init(&fex, VMAF_PIX_FMT_YUV400P, 8, 64, 64) == -EINVAL);
+    return NULL;
+}
+
 char *run_tests()
 {
     mu_run_test(test_16b_large_diff);
+    mu_run_test(test_chroma_without_luma);
     mu_run_test(test_rows_init_picks_are_the_scalar_rows);
 
     return NULL;

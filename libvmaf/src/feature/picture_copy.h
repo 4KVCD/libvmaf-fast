@@ -19,3 +19,8 @@
 
 void picture_copy(float *dst, ptrdiff_t dst_stride, VmafPicture *src,
                   int offset, unsigned bpc, int channel);
+
+/* libvmaf-fast: row `row` of the plane `channel` as picture_copy converts
+ * it, into dst (src->w[channel] floats). */
+void picture_copy_row(float *dst, const VmafPicture *src, int offset, unsigned bpc,
+                      int channel, unsigned row);

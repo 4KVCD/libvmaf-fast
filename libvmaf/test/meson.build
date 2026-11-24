@@ -141,6 +141,20 @@ test_ssim_decimated = executable('test_ssim_decimated',
     link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
 )
 
+test_psnr_hvs = executable('test_psnr_hvs',
+    ['test.c', 'test_psnr_hvs.c'],
+    include_directories : [libvmaf_inc, test_inc, include_directories('../src/')],
+    dependencies: [thread_lib, stdatomic_dependency, math_lib],
+    link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
+)
+
+test_ms_ssim = executable('test_ms_ssim',
+    ['test.c', 'test_ms_ssim.c'],
+    include_directories : [libvmaf_inc, test_inc, include_directories('../src/')],
+    dependencies: [thread_lib, stdatomic_dependency, math_lib],
+    link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
+)
+
 test_xpsnr = executable('test_xpsnr',
     ['test.c', 'test_xpsnr.c'],
     include_directories : [libvmaf_inc, test_inc, include_directories('../src/')],
@@ -333,6 +347,8 @@ test('test_luminance_tools', test_luminance_tools)
 test('test_cli_parse', test_cli_parse)
 test('test_psnr', test_psnr)
 test('test_ssim_decimated', test_ssim_decimated)
+test('test_ms_ssim', test_ms_ssim)
+test('test_psnr_hvs', test_psnr_hvs)
 test('test_xpsnr', test_xpsnr, timeout : 120)
 test('test_framesync', test_framesync)
 test('test_propagate_metadata', test_propagate_metadata)
@@ -374,6 +390,20 @@ test_colorspace = executable('test_colorspace',
 )
 
 test('test_colorspace', test_colorspace)
+endif
+
+if gpu_plan_objects.length() > 0
+test_picture_gpu_plan_args = []
+if cc.get_id() != 'msvc'
+    test_picture_gpu_plan_args += ['-ffp-contract=off']  # the plan's arithmetic, unfused
+endif
+test_picture_gpu_plan = executable('test_picture_gpu_plan',
+    ['test.c', 'test_picture_gpu_plan.c'],
+    include_directories : [libvmaf_inc, test_inc],
+    c_args : test_picture_gpu_plan_args,
+    link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
+)
+test('test_picture_gpu_plan', test_picture_gpu_plan)
 endif
 
 test_read_pictures_convert_args = ['-DJSON_MODEL_PATH="'+join_paths(meson.project_source_root(), '../model/')+'"']

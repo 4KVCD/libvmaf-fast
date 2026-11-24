@@ -369,6 +369,9 @@ if is_asm_enabled
           feature_src_dir + 'x86/ssim_decimate_avx2.c',
           feature_src_dir + 'x86/xpsnr_any_avx2.c',
           feature_src_dir + 'x86/psnr_avx2.c',
+          feature_src_dir + 'x86/ciede_avx2.c',
+          feature_src_dir + 'x86/decimate_avx2.c',
+          feature_src_dir + 'x86/psnr_hvs_avx2.c',
       ]
 
       if cc.get_id() == 'msvc'
@@ -692,6 +695,30 @@ if is_zimg_enabled
     vmaf_cflags_common += '-DHAVE_ZIMG'
 endif
 
+# vmaf_picture_convert_gpu_plan() builds zimg's graph through zimg's internal
+# headers, so it needs the source tree of the zimg linked; without it the
+# function is a stub (picture.c) that answers -ENOTSUP.
+gpu_plan_objects = []
+zimg_source_dir = get_option('zimg_source_dir')
+if is_zimg_enabled and zimg_source_dir != '' and host_machine.cpu_family() == 'x86_64'
+    gpu_plan_cpp_args = vmaf_cflags_common + ['-DZIMG_X86']  # as zimg's x86 build
+    if meson.get_compiler('cpp').get_id() != 'msvc'
+        # the plan states its arithmetic without fused multiply-adds
+        gpu_plan_cpp_args += ['-ffp-contract=off']
+    endif
+    gpu_plan_static_lib = static_library(
+        'picture_gpu_plan',
+        src_dir + 'picture_gpu_plan.cpp',
+        include_directories : [libvmaf_include, vmaf_include, include_directories(
+            zimg_source_dir / 'src' / 'zimg', zimg_source_dir / 'src' / 'zimg' / 'api')],
+        dependencies : [zimg_dependency],
+        cpp_args : gpu_plan_cpp_args,
+        override_options : ['cpp_std=c++14'],  # zimg's headers
+    )
+    gpu_plan_objects += gpu_plan_static_lib.extract_all_objects(recursive: true)
+    vmaf_cflags_common += '-DHAVE_ZIMG_GPU_PLAN'
+endif
+
 if host_machine.system() == 'windows'
     vmaf_soversion = ''
 else
@@ -714,6 +741,7 @@ _vmaf_objs = [
     libvmaf_feature_static_lib.extract_all_objects(recursive: true),
     libvmaf_cpu_static_lib.extract_all_objects(recursive: true),
     libsvm_static_lib.extract_all_objects(recursive: true),
+    gpu_plan_objects,
 ]
 
 if cc.get_id() == 'msvc'

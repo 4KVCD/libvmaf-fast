@@ -445,3 +445,119 @@ void compute_mask_row_avx2(uint16_t *mask_row, const uint32_t *dp_bottom, const 
         mask_row[j] = (uint16_t)(result > mask_index);
     }
 }
+
+/* libvmaf-fast: cambi.c's preprocessing rows (the same-size conversions to
+ * 10 bits, the validation's maximum, the anti-dithering filter) and the
+ * top-k sum, 16 samples (8 floats) at a time with the scalar code's values. */
+
+/* src << shift, 8-bit samples to 16. */
+void cambi_u8_to_10b_row_avx2(const uint8_t *src, uint16_t *dst, int width, int shift)
+{
+    const __m128i count = _mm_cvtsi32_si128(shift);
+    int j = 0;
+    for (; j + 16 <= width; j += 16) {
+        const __m256i v = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(src + j)));
+        _mm256_storeu_si256((__m256i *)(dst + j), _mm256_sll_epi16(v, count));
+    }
+    for (; j < width; j++)
+        dst[j] = src[j] << shift;
+}
+
+/* src << shift (9-bit samples, below 2^15). */
+void cambi_u16_shl_row_avx2(const uint16_t *src, uint16_t *dst, int width, int shift)
+{
+    const __m128i count = _mm_cvtsi32_si128(shift);
+    int j = 0;
+    for (; j + 16 <= width; j += 16) {
+        const __m256i v = _mm256_loadu_si256((const __m256i *)(src + j));
+        _mm256_storeu_si256((__m256i *)(dst + j), _mm256_sll_epi16(v, count));
+    }
+    for (; j < width; j++)
+        dst[j] = src[j] << shift;
+}
+
+/* (src + (1 << (shift - 1))) >> shift for shift >= 1, computed as
+ * ((src >> (shift - 1)) + 1) >> 1: the same value, and avg_epu16 (a + b + 1)
+ * >> 1 adds the 1 without the 16-bit overflow a 16-bit sample plus the
+ * rounding offset would have. */
+void cambi_u16_round_shr_row_avx2(const uint16_t *src, uint16_t *dst, int width, int shift)
+{
+    const __m128i count = _mm_cvtsi32_si128(shift - 1);
+    const __m256i zero = _mm256_setzero_si256();
+    int j = 0;
+    for (; j + 16 <= width; j += 16) {
+        const __m256i v = _mm256_loadu_si256((const __m256i *)(src + j));
+        _mm256_storeu_si256((__m256i *)(dst + j), _mm256_avg_epu16(_mm256_srl_epi16(v, count), zero));
+    }
+    for (; j < width; j++)
+        dst[j] = (src[j] + (1 << (shift - 1))) >> shift;
+}
+
+/* The largest sample of a row. */
+uint16_t cambi_max_row_avx2(const uint16_t *row, int width)
+{
+    __m256i m = _mm256_setzero_si256();
+    int j = 0;
+    for (; j + 16 <= width; j += 16)
+        m = _mm256_max_epu16(m, _mm256_loadu_si256((const __m256i *)(row + j)));
+    __m128i r = _mm_max_epu16(_mm256_castsi256_si128(m), _mm256_extracti128_si256(m, 1));
+    r = _mm_max_epu16(r, _mm_srli_si128(r, 8));
+    r = _mm_max_epu16(r, _mm_srli_si128(r, 4));
+    r = _mm_max_epu16(r, _mm_srli_si128(r, 2));
+    uint16_t best = (uint16_t)_mm_extract_epi16(r, 0);
+    for (; j < width; j++)
+        best = row[j] > best ? row[j] : best;
+    return best;
+}
+
+/* The anti-dithering filter's outputs [0, width - 1) of a row, in place:
+ * each is the mean of a 2x2 square, which reads row[j], row[j + 1] and the
+ * row below, none of them written yet (the outputs before j wrote only
+ * row[0..j)), so 16 at a time give the scalar loop's values. The samples are
+ * 10-bit (at most 1024), so the 16-bit sums do not overflow. */
+void cambi_anti_dither_row_avx2(uint16_t *row, const uint16_t *below, int width)
+{
+    int j = 0;
+    for (; j + 16 < width; j += 16) {  /* reads up to row[j + 16] */
+        const __m256i a = _mm256_loadu_si256((const __m256i *)(row + j));
+        const __m256i b = _mm256_loadu_si256((const __m256i *)(row + j + 1));
+        const __m256i c = _mm256_loadu_si256((const __m256i *)(below + j));
+        const __m256i d = _mm256_loadu_si256((const __m256i *)(below + j + 1));
+        const __m256i sum = _mm256_add_epi16(_mm256_add_epi16(a, b), _mm256_add_epi16(c, d));
+        _mm256_storeu_si256((__m256i *)(row + j), _mm256_srli_epi16(sum, 2));
+    }
+    for (; j < width - 1; j++)
+        row[j] = (row[j] + row[j + 1] + below[j] + below[j + 1]) >> 2;
+}
+
+/* The index of the lowest set bit of m (not 0). */
+static inline int lowest_bit(unsigned m)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    unsigned long index;
+    _BitScanForward(&index, m);
+    return (int)index;
+#else
+    return __builtin_ctz(m);
+#endif
+}
+
+/* The double sum of arr[0..n) in order, as the scalar loop adds it, adding
+ * only the values that are not 0: sum + 0.0 is sum for every sum this loop
+ * can hold (it starts at +0 and never becomes -0, as only a -0 term could
+ * make it), and most c-values are 0. NaN is not 0: it is added. */
+double cambi_sum_nonzero_avx2(const float *arr, int n)
+{
+    double sum = 0;
+    const __m256 zero = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 v = _mm256_loadu_ps(arr + i);
+        unsigned m = (unsigned)_mm256_movemask_ps(_mm256_cmp_ps(v, zero, _CMP_NEQ_UQ));
+        for (; m; m &= m - 1)
+            sum += arr[i + lowest_bit(m)];
+    }
+    for (; i < n; i++)
+        sum += arr[i];
+    return sum;
+}

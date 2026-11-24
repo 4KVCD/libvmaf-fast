@@ -129,22 +129,39 @@ struct SsimWorkspace {
     const uint16_t **rows16;
     float *ref_f, *cmp_f; /* the decimated pictures: sw * sh each */
     float *iqa;           /* _iqa_ssim_ws's buffers: 6 * sw * sh */
+    bool borrowed_floats; /* ref_f, cmp_f and iqa are another workspace's */
 };
 
-SsimWorkspace *ssim_workspace_alloc(int w, int h, int scale, unsigned bpc)
+/* One side of a decimated picture, as compute_ssim() makes it. */
+static int decimated_side(int n, int scale)
+{
+    return n / scale + (n & 1);
+}
+
+size_t ssim_decimated_samples(int w, int h, int scale)
+{
+    return (size_t)decimated_side(w, scale) * decimated_side(h, scale);
+}
+
+SsimWorkspace *ssim_workspace_alloc(int w, int h, int scale, unsigned bpc,
+                                    SsimWorkspace *floats_from)
 {
     if (scale <= 1 || w <= 0 || h <= 0)
         return NULL;
     if (bpc != 8 && bpc != 10 && bpc != 12 && bpc != 16)
         return NULL;  /* picture_copy reads others as 8-bit */
+    if (floats_from &&
+        ssim_decimated_samples(floats_from->w, floats_from->h, floats_from->scale) <
+            ssim_decimated_samples(w, h, scale))
+        return NULL;  /* its float buffers are too small for these pictures */
     SsimWorkspace *ws = calloc(1, sizeof(*ws));
     if (!ws) return NULL;
     ws->w = w;
     ws->h = h;
     ws->scale = scale;
     ws->bpc = bpc;
-    ws->sw = w / scale + (w & 1);
-    ws->sh = h / scale + (h & 1);
+    ws->sw = decimated_side(w, scale);
+    ws->sh = decimated_side(h, scale);
     const float divisor = bpc == 10 ? 4.0f : bpc == 12 ? 16.0f : bpc == 16 ? 256.0f : 1.0f;
     ws->unit = 1.0 / (double)(scale * scale) / (double)divisor;
     const int power_of_two = (scale & (scale - 1)) == 0;
@@ -170,9 +187,17 @@ SsimWorkspace *ssim_workspace_alloc(int w, int h, int scale, unsigned bpc)
     ws->col_table = malloc(sizeof(double) * w);
     ws->rows8 = malloc(sizeof(*ws->rows8) * scale);
     ws->rows16 = malloc(sizeof(*ws->rows16) * scale);
-    ws->ref_f = malloc(sizeof(float) * small);
-    ws->cmp_f = malloc(sizeof(float) * small);
-    ws->iqa = malloc(sizeof(float) * small * 6);
+    if (floats_from) {
+        /* compute_ssim_decimated writes all it reads of them in each call */
+        ws->borrowed_floats = true;
+        ws->ref_f = floats_from->ref_f;
+        ws->cmp_f = floats_from->cmp_f;
+        ws->iqa = floats_from->iqa;
+    } else {
+        ws->ref_f = malloc(sizeof(float) * small);
+        ws->cmp_f = malloc(sizeof(float) * small);
+        ws->iqa = malloc(sizeof(float) * small * 6);
+    }
     if (!ws->columns || !ws->acc || !ws->col || !ws->col_table || !ws->rows8 ||
         !ws->rows16 || !ws->ref_f || !ws->cmp_f || !ws->iqa)
         goto fail;
@@ -197,9 +222,11 @@ void ssim_workspace_free(SsimWorkspace *ws)
     free(ws->col_table);
     free(ws->rows8);
     free(ws->rows16);
-    free(ws->ref_f);
-    free(ws->cmp_f);
-    free(ws->iqa);
+    if (!ws->borrowed_floats) {
+        free(ws->ref_f);
+        free(ws->cmp_f);
+        free(ws->iqa);
+    }
     free(ws);
 }
 
@@ -253,13 +280,13 @@ static void decimate_row_simd(const SsimWorkspace *ws, int wide, float *out)
 }
 #endif
 
-static void decimate_picture(VmafPicture *pic, SsimWorkspace *ws, int simd, float *dst)
+static void decimate_picture(VmafPicture *pic, int plane, SsimWorkspace *ws, int simd, float *dst)
 {
     const int h = ws->h, scale = ws->scale, sw = ws->sw, sh = ws->sh;
     const int wide = pic->bpc > 8;
-    const ptrdiff_t stride = wide ? pic->stride[0] / 2 : pic->stride[0];
-    const uint8_t *data8 = pic->data[0];
-    const uint16_t *data16 = pic->data[0];
+    const ptrdiff_t stride = wide ? pic->stride[plane] / 2 : pic->stride[plane];
+    const uint8_t *data8 = pic->data[plane];
+    const uint16_t *data16 = pic->data[plane];
     const double *table = ws->table;
     const int uc = scale / 2;
     double *acc = ws->acc;
@@ -311,27 +338,29 @@ static int ssim_of_floats(float *ref_f, float *cmp_f, int w, int h, float *iqa,
                           double *score, double *l_score, double *c_score,
                           double *s_score);
 
-int compute_ssim_decimated(VmafPicture *ref, VmafPicture *cmp, int scale,
+int compute_ssim_decimated(VmafPicture *ref, VmafPicture *cmp, int plane, int scale,
                            SsimWorkspace *ws, double *score, double *l_score,
                            double *c_score, double *s_score)
 {
-    const int w = ref->w[0], h = ref->h[0];
+    if (plane < 0 || plane > 2 || !ref->data[plane] || !cmp->data[plane])
+        return -EINVAL;
+    const int w = ref->w[plane], h = ref->h[plane];
     const unsigned bpc = ref->bpc;
-    if (scale <= 1 || cmp->w[0] != (unsigned)w || cmp->h[0] != (unsigned)h)
+    if (scale <= 1 || cmp->w[plane] != (unsigned)w || cmp->h[plane] != (unsigned)h)
         return -EINVAL;
     if (bpc != 8 && bpc != 10 && bpc != 12 && bpc != 16)
         return -EINVAL;  /* picture_copy reads others as 8-bit */
     SsimWorkspace *own = NULL;
     if (!ws || ws->w != w || ws->h != h || ws->scale != scale || ws->bpc != bpc) {
-        ws = own = ssim_workspace_alloc(w, h, scale, bpc);
+        ws = own = ssim_workspace_alloc(w, h, scale, bpc, NULL);
         if (!ws) return -ENOMEM;
     }
     int simd = 0;
 #ifdef SSIM_DECIMATE_SIMD_FLAG
     simd = !!(vmaf_get_cpu_flags() & SSIM_DECIMATE_SIMD_FLAG);
 #endif
-    decimate_picture(ref, ws, simd, ws->ref_f);
-    decimate_picture(cmp, ws, simd, ws->cmp_f);
+    decimate_picture(ref, plane, ws, simd, ws->ref_f);
+    decimate_picture(cmp, plane, ws, simd, ws->cmp_f);
     const int err = ssim_of_floats(ws->ref_f, ws->cmp_f, ws->sw, ws->sh, ws->iqa,
                                    score, l_score, c_score, s_score);
     ssim_workspace_free(own);

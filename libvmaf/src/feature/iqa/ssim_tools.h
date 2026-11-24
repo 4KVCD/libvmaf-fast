@@ -124,4 +124,13 @@ float _iqa_ssim_ws(float *ref, float *cmp, int w, int h, const struct _kernel *k
                    const struct _map_reduce *mr, const struct iqa_ssim_args *args,
                    float *l_mean, float *c_mean, float *s_mean, float *workspace);
 
+/* libvmaf-fast: _iqa_ssim's default case (args NULL) for w x h input pixels,
+ * its (w - k->w + 1) x (h - k->h + 1) output pixels' l * c * s, l, c and s
+ * added to the running sums in pixel order: a picture scored in row
+ * stripes (each k->h - 1 rows taller than its output rows) gets the sums of
+ * one _iqa_ssim over all of it. workspace: 6 * w * h floats. */
+void _iqa_ssim_add_sums(float *ref, float *cmp, int w, int h, const struct _kernel *k,
+                        float *workspace, double *ssim_sum, double *l_sum, double *c_sum,
+                        double *s_sum);
+
 #endif /* _SSIM_TOOLS_H_ */

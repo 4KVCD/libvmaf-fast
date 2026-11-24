@@ -111,6 +111,147 @@ IQA_INLINE static double _calc_structure(float sigma_12, double sigma_comb_12, f
     return sign * pow(fabs(result),(double)gamma);
 }
 
+/* libvmaf-fast: the pixels of a w x h map: none where the picture is
+ * smaller than the window both ways, w and h both negative (w*h is not) */
+static int ssim_pixels(int w, int h)
+{
+    return w > 0 && h > 0 ? w * h : 0;
+}
+
+/* libvmaf-fast: _iqa_ssim_ws's default constants (K1 0.01, K2 0.03, L 255). */
+static void ssim_default_constants(float *C1, float *C2, float *C3)
+{
+    const int L = 255;
+    const float K1 = 0.01f, K2 = 0.03f;
+    *C1 = (K1*L)*(K1*L);
+    *C2 = (K2*L)*(K2*L);
+    *C3 = *C2 / 2.0f;
+}
+
+static int ssim_simd(void)
+{
+#ifdef SSIM_SIMD_FLAG
+    return !!(vmaf_get_cpu_flags() & SSIM_SIMD_FLAG);
+#else
+    return 0;
+#endif
+}
+
+/* libvmaf-fast: the first steps of _iqa_ssim_ws, from its code: the local
+ * means and (co)variances of the w x h input pixels in its five buffers, each
+ * (w - k->w + 1) x (h - k->h + 1), the new *w and *h. */
+static void ssim_maps(float *ref, float *cmp, int *w, int *h, const struct _kernel *k,
+                      float *ref_mu, float *cmp_mu, float *ref_sigma_sqd, float *cmp_sigma_sqd,
+                      float *sigma_both, float *conv_cache, int simd)
+{
+    int x, y, offset;
+    (void) simd;
+
+    /* Calculate mean */
+    _iqa_convolve_ws(ref, *w, *h, k, ref_mu, 0, 0, conv_cache);
+    _iqa_convolve_ws(cmp, *w, *h, k, cmp_mu, 0, 0, conv_cache);
+
+    /* libvmaf-fast: the SIMD copies of the two loops of floats below,
+     * each pixel's arithmetic the scalar code's. */
+#ifdef SSIM_SIMD_FLAG
+    if (simd)
+        ssim_precompute_simd(ref, cmp, ref_sigma_sqd, cmp_sigma_sqd, sigma_both, *w * *h);
+    else
+#endif
+    for (y=0; y<*h; ++y) {
+        offset = y * *w;
+        for (x=0; x<*w; ++x, ++offset) {
+            ref_sigma_sqd[offset] = ref[offset] * ref[offset];
+            cmp_sigma_sqd[offset] = cmp[offset] * cmp[offset];
+            sigma_both[offset] = ref[offset] * cmp[offset];
+        }
+    }
+
+    /* Calculate sigma */
+    _iqa_convolve_ws(ref_sigma_sqd, *w, *h, k, 0,  0,  0, conv_cache);
+    _iqa_convolve_ws(cmp_sigma_sqd, *w, *h, k, 0,  0,  0, conv_cache);
+    _iqa_convolve_ws(sigma_both,    *w, *h, k, 0, w, h, conv_cache); /* Update the width and height */
+
+    /* The convolution results are smaller by the kernel width and height */
+#ifdef SSIM_SIMD_FLAG
+    if (simd)
+        ssim_variance_simd(ref_sigma_sqd, cmp_sigma_sqd, sigma_both, ref_mu, cmp_mu,
+                           ssim_pixels(*w, *h));
+    else
+#endif
+    for (y=0; y<*h; ++y) {
+        offset = y * *w;
+        for (x=0; x<*w; ++x, ++offset) {
+            ref_sigma_sqd[offset] -= ref_mu[offset] * ref_mu[offset];
+            cmp_sigma_sqd[offset] -= cmp_mu[offset] * cmp_mu[offset];
+
+            ref_sigma_sqd[offset] = MAX(0.0, ref_sigma_sqd[offset]); /* zli-nflx */
+            cmp_sigma_sqd[offset] = MAX(0.0, cmp_sigma_sqd[offset]); /* zli-nflx */
+
+            sigma_both[offset] -= ref_mu[offset] * cmp_mu[offset];
+        }
+    }
+}
+
+/* libvmaf-fast: _iqa_ssim_ws's default case (args NULL) for the n pixels of
+ * its maps, from its code: each pixel's l * c * s, l, c and s added to the
+ * running sums in pixel order, so maps scored in parts, one after the
+ * other, give the sums of one call over all of them. */
+static void ssim_add_terms(const float *ref_mu, const float *cmp_mu, const float *ref_sigma_sqd,
+                           const float *cmp_sigma_sqd, const float *sigma_both, int n,
+                           float C1, float C2, float C3, int simd, double *ssim_sum,
+                           double *l_sum, double *c_sum, double *s_sum)
+{
+    (void) simd;
+#ifdef SSIM_SIMD_FLAG
+    if (simd) {
+        ssim_accumulate_simd(ref_mu, cmp_mu, ref_sigma_sqd, cmp_sigma_sqd, sigma_both, n,
+                             C1, C2, C3, ssim_sum, l_sum, c_sum, s_sum);
+        return;
+    }
+#endif
+    for (int offset = 0; offset < n; ++offset) {
+        /* The default case */
+        // numerator   = (2.0 * ref_mu[offset] * cmp_mu[offset] + C1) * (2.0 * sigma_both[offset] + C2);
+        // denominator = (ref_mu[offset]*ref_mu[offset] + cmp_mu[offset]*cmp_mu[offset] + C1) *
+        //     (ref_sigma_sqd[offset] + cmp_sigma_sqd[offset] + C2);
+        // ssim_sum += numerator / denominator;
+
+        /* zli-nflx: */
+        const float sigma_ref_sigma_cmp = sqrt(ref_sigma_sqd[offset] * cmp_sigma_sqd[offset]);
+        const double l = (2.0 * ref_mu[offset] * cmp_mu[offset] + C1) / (ref_mu[offset]*ref_mu[offset] + cmp_mu[offset]*cmp_mu[offset] + C1);
+        const double c = (2.0 * sigma_ref_sigma_cmp + C2) /  (ref_sigma_sqd[offset] + cmp_sigma_sqd[offset] + C2);
+
+        /* zli-nflx: fix corner case where ref and cmp are identical, and the local filtered region is
+         * completely flat (zero std). In this case, sigma_both can become negative due to inprecise
+         * float representation but sigma_ref_sigma_cmp is zero, resulting s < 1.0. The desiired
+         * behavior should be that ssim score is 1.0. */
+        const float clamped_sigma_both = (sigma_both[offset] < 0.0f &&
+                sigma_ref_sigma_cmp <= 0.0f) ? 0.0f : sigma_both[offset];
+        const double s = (clamped_sigma_both + C3) / (sigma_ref_sigma_cmp + C3);
+
+        *ssim_sum += l * c * s;
+        *l_sum += l;
+        *c_sum += c;
+        *s_sum += s;
+    }
+}
+
+void _iqa_ssim_add_sums(float *ref, float *cmp, int w, int h, const struct _kernel *k,
+                        float *workspace, double *ssim_sum, double *l_sum, double *c_sum,
+                        double *s_sum)
+{
+    const size_t n = (size_t)w * h;
+    float C1, C2, C3;
+    ssim_default_constants(&C1, &C2, &C3);
+    const int simd = ssim_simd();
+    ssim_maps(ref, cmp, &w, &h, k, workspace, workspace + n, workspace + 2 * n,
+              workspace + 3 * n, workspace + 4 * n, workspace + 5 * n, simd);
+    ssim_add_terms(workspace, workspace + n, workspace + 2 * n, workspace + 3 * n,
+                   workspace + 4 * n, ssim_pixels(w, h), C1, C2, C3, simd, ssim_sum, l_sum,
+                   c_sum, s_sum);
+}
+
 /* _iqa_ssim */
 float _iqa_ssim(float *ref, float *cmp, int w, int h, const struct _kernel *k,
 		const struct _map_reduce *mr, const struct iqa_ssim_args *args
@@ -134,8 +275,7 @@ float _iqa_ssim_ws(float *ref, float *cmp, int w, int h, const struct _kernel *k
     // double numerator, denominator; /* zli-nflx */
     double luminance_comp, contrast_comp, structure_comp, sigma_root;
     struct _ssim_int sint;
-    double l_sum, c_sum, s_sum, l, c, s; /* zli-nflx */
-    float sigma_ref_sigma_cmp; /* zli-nflx */
+    double l_sum, c_sum, s_sum; /* zli-nflx */
 
     assert(!args); /* zli-nflx: for now only works for default case */
 
@@ -181,118 +321,41 @@ float _iqa_ssim_ws(float *ref, float *cmp, int w, int h, const struct _kernel *k
         return INFINITY;
     }
 
-    /* Calculate mean */
-    _iqa_convolve_ws(ref, w, h, k, ref_mu, 0, 0, conv_cache);
-    _iqa_convolve_ws(cmp, w, h, k, cmp_mu, 0, 0, conv_cache);
-
-    /* libvmaf-fast: the SIMD copies of the three loops of floats below,
-     * each pixel's arithmetic the scalar code's. */
-#ifdef SSIM_SIMD_FLAG
-    const int simd = !!(vmaf_get_cpu_flags() & SSIM_SIMD_FLAG);
-    if (simd)
-        ssim_precompute_simd(ref, cmp, ref_sigma_sqd, cmp_sigma_sqd, sigma_both, w*h);
-    else
-#endif
-    for (y=0; y<h; ++y) {
-        offset = y*w;
-        for (x=0; x<w; ++x, ++offset) {
-            ref_sigma_sqd[offset] = ref[offset] * ref[offset];
-            cmp_sigma_sqd[offset] = cmp[offset] * cmp[offset];
-            sigma_both[offset] = ref[offset] * cmp[offset];
-        }
-    }
-
-    /* Calculate sigma */
-    _iqa_convolve_ws(ref_sigma_sqd, w, h, k, 0,  0,  0, conv_cache);
-    _iqa_convolve_ws(cmp_sigma_sqd, w, h, k, 0,  0,  0, conv_cache);
-    _iqa_convolve_ws(sigma_both,    w, h, k, 0, &w, &h, conv_cache); /* Update the width and height */
-
-    /* The convolution results are smaller by the kernel width and height */
-#ifdef SSIM_SIMD_FLAG
-    /* libvmaf-fast: the pixels the loops below visit: none where the
-     * picture is smaller than the window both ways, w and h both negative
-     * (w*h is not) */
-    const int pixels = w > 0 && h > 0 ? w * h : 0;
-    if (simd)
-        ssim_variance_simd(ref_sigma_sqd, cmp_sigma_sqd, sigma_both, ref_mu, cmp_mu, pixels);
-    else
-#endif
-    for (y=0; y<h; ++y) {
-        offset = y*w;
-        for (x=0; x<w; ++x, ++offset) {
-            ref_sigma_sqd[offset] -= ref_mu[offset] * ref_mu[offset];
-            cmp_sigma_sqd[offset] -= cmp_mu[offset] * cmp_mu[offset];
-
-            ref_sigma_sqd[offset] = MAX(0.0, ref_sigma_sqd[offset]); /* zli-nflx */
-            cmp_sigma_sqd[offset] = MAX(0.0, cmp_sigma_sqd[offset]); /* zli-nflx */
-
-            sigma_both[offset] -= ref_mu[offset] * cmp_mu[offset];
-        }
-    }
+    const int simd = ssim_simd();
+    ssim_maps(ref, cmp, &w, &h, k, ref_mu, cmp_mu, ref_sigma_sqd, cmp_sigma_sqd, sigma_both,
+              conv_cache, simd);
 
     ssim_sum = 0.0;
     l_sum = 0.0; /* zli-nflx */
     c_sum = 0.0; /* zli-nflx */
     s_sum = 0.0; /* zli-nflx */
-#ifdef SSIM_SIMD_FLAG
-    /* Over all the pixels in one call, so its four sums are added up in the
-     * order of the loop below. */
-    if (simd && !args)
-        ssim_accumulate_simd(ref_mu, cmp_mu, ref_sigma_sqd, cmp_sigma_sqd, sigma_both, pixels,
-                             C1, C2, C3, &ssim_sum, &l_sum, &c_sum, &s_sum);
+    if (!args) {
+        ssim_add_terms(ref_mu, cmp_mu, ref_sigma_sqd, cmp_sigma_sqd, sigma_both,
+                       ssim_pixels(w, h), C1, C2, C3, simd, &ssim_sum, &l_sum, &c_sum, &s_sum);
+    }
     else
-#endif
     for (y=0; y<h; ++y) {
         offset = y*w;
         for (x=0; x<w; ++x, ++offset) {
+            /* User tweaked alpha, beta, or gamma */
 
-            if (!args) {
+            /* passing a negative number to sqrt() cause a domain error */
+            if (ref_sigma_sqd[offset] < 0.0f)
+                ref_sigma_sqd[offset] = 0.0f;
+            if (cmp_sigma_sqd[offset] < 0.0f)
+                cmp_sigma_sqd[offset] = 0.0f;
+            sigma_root = sqrt(ref_sigma_sqd[offset] * cmp_sigma_sqd[offset]);
 
-            	/* The default case */
-                // numerator   = (2.0 * ref_mu[offset] * cmp_mu[offset] + C1) * (2.0 * sigma_both[offset] + C2);
-                // denominator = (ref_mu[offset]*ref_mu[offset] + cmp_mu[offset]*cmp_mu[offset] + C1) *
-                //     (ref_sigma_sqd[offset] + cmp_sigma_sqd[offset] + C2);
-                // ssim_sum += numerator / denominator;
+            luminance_comp = _calc_luminance(ref_mu[offset], cmp_mu[offset], C1, alpha);
+            contrast_comp  = _calc_contrast(sigma_root, ref_sigma_sqd[offset], cmp_sigma_sqd[offset], C2, beta);
+            structure_comp = _calc_structure(sigma_both[offset], sigma_root, ref_sigma_sqd[offset], cmp_sigma_sqd[offset], C3, gamma);
 
-                /* zli-nflx: */
-                sigma_ref_sigma_cmp = sqrt(ref_sigma_sqd[offset] * cmp_sigma_sqd[offset]);
-                l = (2.0 * ref_mu[offset] * cmp_mu[offset] + C1) / (ref_mu[offset]*ref_mu[offset] + cmp_mu[offset]*cmp_mu[offset] + C1);
-                c = (2.0 * sigma_ref_sigma_cmp + C2) /  (ref_sigma_sqd[offset] + cmp_sigma_sqd[offset] + C2);
+            sint.l = luminance_comp;
+            sint.c = contrast_comp;
+            sint.s = structure_comp;
 
-                /* zli-nflx: fix corner case where ref and cmp are identical, and the local filtered region is
-                 * completely flat (zero std). In this case, sigma_both can become negative due to inprecise
-                 * float representation but sigma_ref_sigma_cmp is zero, resulting s < 1.0. The desiired
-                 * behavior should be that ssim score is 1.0. */
-                const float clamped_sigma_both = (sigma_both[offset] < 0.0f &&
-                        sigma_ref_sigma_cmp <= 0.0f) ? 0.0f : sigma_both[offset];
-                s = (clamped_sigma_both + C3) / (sigma_ref_sigma_cmp + C3);
-
-                ssim_sum += l * c * s;
-                l_sum += l;
-                c_sum += c;
-                s_sum += s;
-            }
-            else {
-                /* User tweaked alpha, beta, or gamma */
-
-                /* passing a negative number to sqrt() cause a domain error */
-                if (ref_sigma_sqd[offset] < 0.0f)
-                    ref_sigma_sqd[offset] = 0.0f;
-                if (cmp_sigma_sqd[offset] < 0.0f)
-                    cmp_sigma_sqd[offset] = 0.0f;
-                sigma_root = sqrt(ref_sigma_sqd[offset] * cmp_sigma_sqd[offset]);
-
-                luminance_comp = _calc_luminance(ref_mu[offset], cmp_mu[offset], C1, alpha);
-                contrast_comp  = _calc_contrast(sigma_root, ref_sigma_sqd[offset], cmp_sigma_sqd[offset], C2, beta);
-                structure_comp = _calc_structure(sigma_both[offset], sigma_root, ref_sigma_sqd[offset], cmp_sigma_sqd[offset], C3, gamma);
-
-                sint.l = luminance_comp;
-                sint.c = contrast_comp;
-                sint.s = structure_comp;
-
-                if (mr->map(&sint, mr->context))
-                    return INFINITY;
-            }
+            if (mr->map(&sint, mr->context))
+                return INFINITY;
         }
     }
 

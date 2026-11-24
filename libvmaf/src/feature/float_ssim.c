@@ -27,6 +27,10 @@
 #include "ssim.h"
 #include "picture_copy.h"
 
+/* The picture planes float_ssim scores: Y, and with enable_chroma Cb and Cr
+ * (libvmaf-fast), each at its own size, with its own decimation scale. */
+#define SSIM_PLANES 3
+
 typedef struct SsimState {
     size_t float_stride;
     float *ref;
@@ -34,11 +38,12 @@ typedef struct SsimState {
     bool enable_lcs;
     bool enable_db;
     bool clip_db;
-    double max_db;
+    bool enable_chroma;
+    double max_db[SSIM_PLANES];
     int scale;
-    /* libvmaf-fast: compute_ssim_decimated's buffers, kept from frame to
-     * frame; NULL where the pictures are not decimated */
-    SsimWorkspace *ws;
+    /* libvmaf-fast: each plane's compute_ssim_decimated buffers, kept from
+     * frame to frame; NULL where that plane is not decimated */
+    SsimWorkspace *ws[SSIM_PLANES];
 } SsimState;
 
 static const VmafOption options[] = {
@@ -72,10 +77,24 @@ static const VmafOption options[] = {
         .min = 0,
         .max = 10,
     },
+    {
+        /* libvmaf-fast */
+        .name = "enable_chroma",
+        .help = "also score the chroma planes (float_ssim_cb, float_ssim_cr), "
+                "each at its own size",
+        .offset = offsetof(SsimState, enable_chroma),
+        .type = VMAF_OPT_TYPE_BOOL,
+        .default_val.b = false,
+    },
     { 0 }
 };
 
-/* The two float pictures compute_ssim takes, once. */
+static const char *const ssim_name[SSIM_PLANES] = {
+    "float_ssim", "float_ssim_cb", "float_ssim_cr"
+};
+
+/* The two float pictures compute_ssim takes, once, at the luma's size: a
+ * chroma plane, never larger, fits in them at the same row spacing. */
 static int full_size_buffers(SsimState *s, unsigned w, unsigned h)
 {
     if (s->ref)
@@ -95,25 +114,55 @@ static int full_size_buffers(SsimState *s, unsigned w, unsigned h)
 static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
                 unsigned bpc, unsigned w, unsigned h)
 {
-    (void) pix_fmt;
-
     SsimState *s = fex->priv;
 
+    if (pix_fmt == VMAF_PIX_FMT_YUV400P)
+        s->enable_chroma = false;
+    const unsigned planes = s->enable_chroma ? SSIM_PLANES : 1;
+    /* each plane's size, as vmaf_picture_alloc makes it */
+    const int ss_hor = pix_fmt != VMAF_PIX_FMT_YUV444P;
+    const int ss_ver = pix_fmt == VMAF_PIX_FMT_YUV420P;
+
     const unsigned peak = (1 << bpc) - 1;
-    if (s->clip_db) {
-        const double mse = 0.5 / (w * h);
-        s->max_db = ceil(10. * log10(peak * peak / mse));
-    } else {
-        s->max_db = INFINITY;
+    unsigned pw[SSIM_PLANES], ph[SSIM_PLANES];
+    int scale[SSIM_PLANES];
+    int largest = -1;  /* the decimated plane with the most decimated samples */
+    for (unsigned p = 0; p < planes; p++) {
+        pw[p] = p ? w >> ss_hor : w;
+        ph[p] = p ? h >> ss_ver : h;
+        if (s->clip_db) {
+            const double mse = 0.5 / (pw[p] * ph[p]);
+            s->max_db[p] = ceil(10. * log10(peak * peak / mse));
+        } else {
+            s->max_db[p] = INFINITY;
+        }
+        scale[p] = ssim_scale(pw[p], ph[p], s->scale);
+        if (scale[p] > 1 && (largest < 0 ||
+            ssim_decimated_samples(pw[p], ph[p], scale[p]) >
+                ssim_decimated_samples(pw[largest], ph[largest], scale[largest])))
+            largest = p;
     }
 
-    /* libvmaf-fast: decimated pictures need no full-size float copies */
-    const int scale = ssim_scale(w, h, s->scale);
-    if (scale > 1 && (bpc == 8 || bpc == 10 || bpc == 12 || bpc == 16)) {
-        s->ws = ssim_workspace_alloc(w, h, scale, bpc);
-        return s->ws ? 0 : -ENOMEM;
+    /* libvmaf-fast: decimated pictures need no full-size float copies, and
+     * the planes, scored one after the other, share the largest one's
+     * decimated floats */
+    const bool decimates = bpc == 8 || bpc == 10 || bpc == 12 || bpc == 16;
+    if (largest >= 0 && decimates) {
+        s->ws[largest] = ssim_workspace_alloc(pw[largest], ph[largest], scale[largest],
+                                              bpc, NULL);
+        if (!s->ws[largest]) return -ENOMEM;
     }
-    return full_size_buffers(s, w, h);
+    for (unsigned p = 0; p < planes; p++) {
+        if (scale[p] > 1 && decimates) {
+            if ((int)p == largest) continue;
+            s->ws[p] = ssim_workspace_alloc(pw[p], ph[p], scale[p], bpc, s->ws[largest]);
+            if (!s->ws[p]) return -ENOMEM;
+        } else {
+            const int err = full_size_buffers(s, w, h);
+            if (err) return err;
+        }
+    }
+    return 0;
 }
 
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
@@ -123,49 +172,61 @@ static double convert_to_db(double score, double max_db)
     return MIN(-10. * log10(1 - score), max_db);
 }
 
+/* One plane's SSIM and its luminance, contrast and structure terms. */
+static int plane_ssim(SsimState *s, VmafPicture *ref_pic, VmafPicture *dist_pic,
+                      int p, double *score, double *l_score, double *c_score,
+                      double *s_score)
+{
+    /* libvmaf-fast: decimated from the samples, the same score (ssim.c) */
+    const int scale = ssim_scale(ref_pic->w[p], ref_pic->h[p], s->scale);
+    int err = scale > 1 ? compute_ssim_decimated(ref_pic, dist_pic, p, scale, s->ws[p],
+                                                 score, l_score, c_score, s_score)
+                        : -EINVAL;
+    if (err != -EINVAL)
+        return err;
+    err = full_size_buffers(s, ref_pic->w[0], ref_pic->h[0]);
+    if (err) return err;
+    picture_copy(s->ref, s->float_stride, ref_pic, 0, ref_pic->bpc, p);
+    picture_copy(s->dist, s->float_stride, dist_pic, 0, dist_pic->bpc, p);
+    return compute_ssim(s->ref, s->dist, ref_pic->w[p], ref_pic->h[p],
+                        s->float_stride, s->float_stride,
+                        score, l_score, c_score, s_score, s->scale);
+}
+
 static int extract(VmafFeatureExtractor *fex,
                    VmafPicture *ref_pic, VmafPicture *ref_pic_90,
                    VmafPicture *dist_pic, VmafPicture *dist_pic_90,
                    unsigned index, VmafFeatureCollector *feature_collector)
 {
     SsimState *s = fex->priv;
-    int err = 0;
 
     (void) ref_pic_90;
     (void) dist_pic_90;
 
-    double score, l_score, c_score, s_score;
-    /* libvmaf-fast: decimated from the samples, the same score (ssim.c) */
-    const int scale = ssim_scale(ref_pic->w[0], ref_pic->h[0], s->scale);
-    err = scale > 1 ? compute_ssim_decimated(ref_pic, dist_pic, scale, s->ws, &score,
-                                             &l_score, &c_score, &s_score)
-                    : -EINVAL;
-    if (err == -EINVAL) {
-        err = full_size_buffers(s, ref_pic->w[0], ref_pic->h[0]);
+    const int planes = s->enable_chroma ? SSIM_PLANES : 1;
+    for (int p = 0; p < planes; p++) {
+        double score, l_score, c_score, s_score;
+        int err = plane_ssim(s, ref_pic, dist_pic, p, &score, &l_score, &c_score, &s_score);
         if (err) return err;
-        picture_copy(s->ref, s->float_stride, ref_pic, 0, ref_pic->bpc, 0);
-        picture_copy(s->dist, s->float_stride, dist_pic, 0, dist_pic->bpc, 0);
-        err = compute_ssim(s->ref, s->dist, ref_pic->w[0], ref_pic->h[0],
-                           s->float_stride, s->float_stride,
-                           &score, &l_score, &c_score, &s_score, s->scale);
-    }
-    if (err) return err;
 
-    if (s->enable_db)
-        score = convert_to_db(score, s->max_db);
+        if (s->enable_db)
+            score = convert_to_db(score, s->max_db[p]);
 
-    err = vmaf_feature_collector_append(feature_collector, "float_ssim",
-                                        score, index);
-    if (s->enable_lcs) {
-        err |= vmaf_feature_collector_append(feature_collector, "float_ssim_l",
-                                            l_score, index);
-        err |= vmaf_feature_collector_append(feature_collector, "float_ssim_c",
-                                            c_score, index);
-        err |= vmaf_feature_collector_append(feature_collector, "float_ssim_s",
-                                            s_score, index);
+        err = vmaf_feature_collector_append(feature_collector, ssim_name[p],
+                                            score, index);
+        /* the terms of the luma, as before chroma was scored */
+        if (s->enable_lcs && p == 0) {
+            err |= vmaf_feature_collector_append(feature_collector, "float_ssim_l",
+                                                l_score, index);
+            err |= vmaf_feature_collector_append(feature_collector, "float_ssim_c",
+                                                c_score, index);
+            err |= vmaf_feature_collector_append(feature_collector, "float_ssim_s",
+                                                s_score, index);
+        }
+        if (err) return err;
     }
 
-    return err;
+    return 0;
 }
 
 static int close(VmafFeatureExtractor *fex)
@@ -173,12 +234,13 @@ static int close(VmafFeatureExtractor *fex)
     SsimState *s = fex->priv;
     if (s->ref) aligned_free(s->ref);
     if (s->dist) aligned_free(s->dist);
-    ssim_workspace_free(s->ws);
+    for (unsigned p = 0; p < SSIM_PLANES; p++)
+        ssim_workspace_free(s->ws[p]);
     return 0;
 }
 
 static const char *provided_features[] = {
-    "float_ssim",
+    "float_ssim", "float_ssim_cb", "float_ssim_cr",
     NULL
 };
 

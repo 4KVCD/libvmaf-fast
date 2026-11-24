@@ -55,6 +55,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -78,6 +79,7 @@ typedef struct _SECURITY_ATTRIBUTES SECURITY_ATTRIBUTES;
 #include "v1_host.h"
 #include "v1_speed.h"
 #include "cambi_lut.h"
+#include "../../libvmaf/include/libvmaf/picture_gpu_plan.h"
 
 #ifdef _WIN32
 #define VV_EXPORT extern "C" __declspec(dllexport)
@@ -232,7 +234,8 @@ enum {
     // are in the top k, and whether a value was not a whole number of units.
     kSlotCambi = kSlotCm + 2 * kScales * 3,
     kSlotCambiInvalid = kSlotCambi + V1_CAMBI_SCALES * 4,  // a sample above its bit depth's largest
-    kSlots = kSlotCambiInvalid + 1
+    kSlotCiede = kSlotCambiInvalid + 1,  // CIEDE2000 (vv_v1_ciede): the pixels' dE00 in units of 2^-20
+    kSlots = kSlotCiede + 1
 };
 
 // What vv_features returns per frame.
@@ -247,7 +250,7 @@ enum {
 };
 
 // What the API reads of a frame (vv_features, vv_features_v1,
-// vv_v1_cambi_scores), made from its sums when the GPU is done with it
+// vv_v1_cambi_scores, vv_v1_ciede_scores), made from its sums when the GPU is done with it
 // (collect), by the same functions on the same sums as when they were
 // read later, so the sums themselves (kSlots 64-bit values, about 750
 // bytes) need not be kept: only the first kRawFrames frames' are, for
@@ -259,6 +262,7 @@ struct FrameRecord {
     double adm[2] = {};          // ADM2, gain limit 100 and 1
     double v1Adm[3] = {};        // VMAF v1's adm3, aim and adm2 (v1_adm)
     double cambi = 0.0;          // VMAF v1's CAMBI
+    double ciede = 0.0;          // CIEDE2000 (vv_v1_ciede)
     uint8_t scored = 0;
     int8_t cambiError = 0;       // -5 or -6: vv_v1_cambi_scores fails at this frame
 };
@@ -572,6 +576,8 @@ struct Slot {
     bool planeFromHost[2] = { false, false };
     Buffer speedKeep;                 // and the filtered planes est_params reads (host-visible)
     std::vector<Pass> speedPasses;
+    Buffer ciedeChroma;               // CIEDE2000: the pair's chroma planes (host-visible)
+    std::vector<Pass> ciedePasses;
     // vv_pictures: the frame's pictures (indices of vv_context::pictureCache:
     // the reference, the distorted one, the reference before it for motion)
     // and their first samples' places (previous x, y, reference x, y,
@@ -737,6 +743,171 @@ private:
     std::vector<V1Speed *> states;
     size_t floats = 0, pending = 0;
     bool stopping = false;
+};
+
+// VMAF v1's CAMBI: spatial pooling of the scales whose top k the GPU cannot
+// sum exactly in a double (scale 0 of most 4K frames), on worker threads, a
+// frame a job, from a copy of those scales' c-values. It is cambi.c's
+// quick-select and serial double sum, about 18 ms a 4K frame, which the
+// thread that submits the frames would otherwise spend while the GPU waits.
+// The same code on the same values whichever thread runs it, so the scores
+// are identical. The threads start with the first job: contexts whose top k
+// is always exact (most below 4K) start none.
+class CambiPool {
+public:
+    // Pools a job's scales (bits `scales`; their c-values back to back in
+    // `values`, which it reorders) and works out the frame's score; returns
+    // vv_context::cambi_score's error code.
+    using Scorer = std::function<int(const uint64_t *sums, unsigned scales, float *values, double &out)>;
+
+    ~CambiPool() { stop(); }
+
+    void configure(Scorer scorer, int threadCount)
+    {
+        score = std::move(scorer);
+        workers = threadCount;
+    }
+
+    // A buffer for a job's c-values, once fewer than kMaxQueued jobs wait, so
+    // that at most kMaxQueued + workers buffers exist (each keeps its size).
+    std::vector<float> buffer()
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        done.wait(lock, [this] { return queue.size() < kMaxQueued; });
+        std::vector<float> values;
+        if (!spare.empty()) {
+            values = std::move(spare.back());
+            spare.pop_back();
+        }
+        values.clear();
+        return values;
+    }
+
+    // A scored frame's job: its sums (kSlots) and the c-values of `scales`.
+    void submit(unsigned index, const uint64_t *sums, unsigned scales, std::vector<float> values)
+    {
+        Job job{ index, scales, {}, std::move(values) };
+        memcpy(job.sums.data(), sums, sizeof job.sums);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!started)
+                start();
+            if (!threads.empty()) {
+                queue.push_back(std::move(job));
+                ++pending;
+                work.notify_one();
+                return;
+            }
+        }
+        run_job(job);  // no thread could be started: on this one
+    }
+
+    void wait()
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        done.wait(lock, [this] { return pending == 0; });
+    }
+
+    // The pooled frames' scores into their records (after wait()).
+    void merge(Blocks<FrameRecord> &records)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (size_t i = 0; i < results.size() && i < records.size(); ++i) {
+            if (results[i].done) {
+                records[i].cambi = results[i].cambi;
+                records[i].cambiError = results[i].error;
+            }
+        }
+    }
+
+    double busyNs = 0.0;  // the workers' time, summed (the profile)
+    uint64_t jobs = 0;
+
+private:
+    enum { kMaxQueued = 3 };  // a 4K job holds 33 MB
+    struct Job {
+        unsigned index, scales;
+        std::array<uint64_t, kSlots> sums;
+        std::vector<float> values;
+    };
+
+    void start()  // (under the mutex)
+    {
+        started = true;
+        try {
+            for (int i = 0; i < workers; ++i)
+                threads.emplace_back([this] { run(); });
+        } catch (...) {  // the threads started so far do the work
+        }
+    }
+
+    void run()
+    {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                work.wait(lock, [this] { return stopping || !queue.empty(); });
+                if (queue.empty())
+                    return;
+                job = std::move(queue.front());
+                queue.pop_front();
+            }
+            done.notify_all();  // room in the queue: a buffer() waiting goes on now, not after this job
+            run_job(job);
+            std::lock_guard<std::mutex> lock(mutex);
+            --pending;
+            done.notify_all();
+        }
+    }
+
+    void run_job(Job &job)
+    {
+        const auto begin = std::chrono::steady_clock::now();
+        double cambi = 0.0;
+        const int error = score(job.sums.data(), job.scales, job.values.data(), cambi);
+        const double ns = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin).count();
+        std::lock_guard<std::mutex> lock(mutex);
+        while (results.size() <= job.index)  // frames finish in any order
+            results.add();
+        Result &result = results[job.index];
+        result.cambi = cambi;
+        result.error = (int8_t)error;
+        result.done = true;
+        spare.push_back(std::move(job.values));
+        busyNs += ns;
+        ++jobs;
+    }
+
+    void stop()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+            queue.clear();
+        }
+        work.notify_all();
+        for (std::thread &thread : threads)
+            thread.join();
+        threads.clear();
+    }
+
+    Scorer score;
+    int workers = 1;
+    std::mutex mutex;
+    std::condition_variable work, done;
+    std::deque<Job> queue;
+    std::vector<std::vector<float>> spare;
+    struct Result {
+        double cambi;
+        int8_t error;
+        bool done;
+    };
+    Blocks<Result> results;  // by frame
+    std::vector<std::thread> threads;
+    size_t pending = 0;
+    bool started = false, stopping = false;
 };
 
 } // namespace
@@ -909,6 +1080,7 @@ struct vv_context {
     Buffer cambiFiltered[V1_CAMBI_SCALES], cambiMask[V1_CAMBI_SCALES],
         cambiC[V1_CAMBI_SCALES];
     int enable_cambi(const double *values);
+    CambiPool cambiPool;  // the scales the GPU's top k could not sum exactly (after cambiConst: destroyed first)
 
     // VMAF v1's SpEED chroma (vv_v1_speed): the GPU filters the four chroma
     // planes (shaders/speed.slang), v1_speed.c scores them when a frame is
@@ -921,6 +1093,59 @@ struct vv_context {
     Buffer speedFilterTaps, speedOperating, speedScaling;
     int enable_speed(const double *values);
 
+    // CIEDE2000 (vv_v1_ciede, shaders/ciede.slang): from the luma the
+    // features read and the 4:2:0 chroma in each slot's ciedeChroma, whole
+    // planes ((w + 1) / 2 x (h + 1) / 2, as libvmaf's pictures hold them;
+    // SpEED's chroma drops an odd last row and column).
+    bool ciede = false;
+    // Its pass reads the luma from the slots' staging, where that is the
+    // GPU's own memory (an integrated GPU, barFrames) and nothing else reads
+    // the pictures (flag bits 16 and 18): no copy into picRef and picDis for
+    // a pass that reads each sample once.
+    bool ciedeFromStaging = false;
+    uint32_t ciedeW = 0, ciedeH = 0, ciedeStrideBytes = 0, ciedePlaneBytes = 0;
+    int enable_ciede();
+    // VMAF v1's copy of the frames into picRef and picDis: whether a pass reads them
+    bool pictures_copied() const
+    {
+        return !(v1 && (skip & 5) == 5 && !cambi && !speed && (!ciede || ciedeFromStaging));
+    }
+
+    // The HDR models' picture conversion on the GPU (vv_v1_convert, shaders/
+    // convert.slang): the source pictures go in, and the context's size at 16
+    // bits comes out where the features read it -- the luma in picRef and
+    // picDis, the chroma in the slot's speedChroma (or convertChroma, which
+    // nothing reads, without SpEED). Per side (0 the reference, 1 the
+    // distorted): its plan (libvmaf's vmaf_picture_convert_gpu_plan) followed
+    // by where each of the plan's buffers is for each slot (convert.slang's
+    // places), the plan on the GPU, its scratch planes, and a pass per step.
+    struct ConvertSide {
+        std::vector<uint32_t> words;
+        uint32_t planeW[3] = {}, planeH[3] = {};
+        uint32_t planeOffset[3] = {};  // the source planes' bytes into a slot's part of convertSource
+        uint32_t placesAt = 0, placesWords = 0;  // slot k's places: words placesAt + k * placesWords on
+        Buffer tables, scratch;
+        std::vector<Pass> passes;
+    };
+    ConvertSide convertSides[2];
+    bool converting = false;
+    // The source pictures, both sides' planes, for each slot at k *
+    // convertSourceBytes (host-visible, written by vv_submit_v1). One buffer,
+    // not one a slot: a slot is picked by its places, so that a pass needs no
+    // descriptor set a slot.
+    Buffer convertSource;
+    uint32_t convertSourceBytes = 0;
+    Buffer convertChroma;
+    int enable_convert(const uint32_t *const plans[2], const size_t words[2]);
+    int load_convert_plan(int side, const uint32_t *plan, size_t words);
+    int add_convert_side(int side);
+    // The steps of the sides in `sides` (bit 0 the reference, 1 the distorted),
+    // a barrier after each step of both; `stamp(shader)` after each when given.
+    void record_convert(VkCommandBuffer cb, size_t slotIndex, unsigned sides, const std::function<void(int)> &stamp);
+    void write_convert_source(size_t slotIndex, int side, const uint16_t *const planes[3], const ptrdiff_t strides[3]);
+    int test_convert(int side, const uint16_t *const planes[3], const ptrdiff_t strides[3], uint16_t *const out[3],
+                     const ptrdiff_t outStrides[3]);
+
     // Profiling (vv_profile, for the speed work): the GPU's time per pass,
     // summed by shader, from timestamps around each, and the CPU's per step.
     bool profile = false;
@@ -930,7 +1155,7 @@ struct vv_context {
     std::vector<std::vector<int>> slotLabels;  // per slot: what each interval between its timestamps was
     double gpuNs[kProfileLabels] = {};
     uint64_t gpuCount[kProfileLabels] = {};
-    enum { kCpuCopy, kCpuRecord, kCpuWait, kCpuSpeed, kCpuCambiPool, kCpuSteps };
+    enum { kCpuCopy, kCpuRecord, kCpuWait, kCpuSpeed, kCpuCambiCopy, kCpuCambiPool, kCpuSteps };
     double cpuNs[kCpuSteps] = {};
     uint64_t cpuCount[kCpuSteps] = {};
     double now_ns() const;
@@ -962,6 +1187,8 @@ struct vv_context {
     // `upload`: host memory the CPU only writes and the GPU reads (frames' planes).
     int create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported = false, bool upload = false);
     void destroy_last_buffer(Buffer &buffer);
+    // A buffer made again at another size, before any pass binds it.
+    int remake_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool upload);
     VkPipeline find_pipeline(int shader, const std::vector<uint32_t> &words) const;
     VkResult compile_pipeline(int shader, const std::vector<uint32_t> &words, VkPipeline *out) const;
     int compile_pipelines();
@@ -1036,7 +1263,7 @@ struct vv_context {
         uint32_t rows;
     };
     struct {
-        CopyPlane planes[6];
+        CopyPlane planes[10];  // two luma planes, SpEED's four chroma planes and CIEDE2000's
         int count;
     } copyJob = {};
     void copy_part(unsigned part);
@@ -1227,6 +1454,18 @@ void vv_context::destroy_last_buffer(Buffer &buffer)
     buffers.pop_back();
 }
 
+int vv_context::remake_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool upload)
+{
+    if (buffer.buffer)
+        vk.vkDestroyBuffer(device, buffer.buffer, nullptr);
+    if (buffer.memory)
+        vk.vkFreeMemory(device, buffer.memory, nullptr);
+    buffer = Buffer();
+    const int error = create_buffer(buffer, size, hostVisible, false, upload);
+    buffers.pop_back();  // listed once already, from when it was first made
+    return error;
+}
+
 // The pipeline made for `shader` and these push constants (a specialized
 // shader's for exactly these; another's for any), or none yet.
 VkPipeline vv_context::find_pipeline(int shader, const std::vector<uint32_t> &words) const
@@ -1282,11 +1521,12 @@ int vv_context::compile_pipelines()
     struct Job { int shader; std::vector<uint32_t> words; VkPipeline made = VK_NULL_HANDLE; VkResult result = VK_SUCCESS; };
     std::vector<Job> jobs;
     std::vector<Pass *> passes;
-    for (std::vector<Pass> *list : { &motion[0], &motion[1], &scored })
+    for (std::vector<Pass> *list : { &motion[0], &motion[1], &scored, &convertSides[0].passes, &convertSides[1].passes })
         for (Pass &pass : *list)
             passes.push_back(&pass);
-    for (Slot &slot : slots)  // VMAF v1's per slot (CAMBI's kept c-values, SpEED)
-        for (std::vector<Pass> *list : { &slot.cambiKeepPasses, &slot.speedPasses, &slot.speedPassesHost })
+    for (Slot &slot : slots)  // VMAF v1's per slot (CAMBI's kept c-values, SpEED, CIEDE2000)
+        for (std::vector<Pass> *list : { &slot.cambiKeepPasses, &slot.speedPasses, &slot.speedPassesHost,
+                                         &slot.ciedePasses })
             for (Pass &pass : *list)
                 passes.push_back(&pass);
     auto words_of = [&](const Pass &pass) {
@@ -1936,7 +2176,7 @@ int vv_context::build_passes_v1()
     // motion_score_pipeline_8 / _16: against the previous reference frame,
     // or the one before it (the five-frame window). Frame i's reference is
     // kept in picPrev[i % 2] once the frame is done.
-    for (int parity = 0; parity < 2 && !error; ++parity) {
+    for (int parity = 0; parity < 2 && !error && !(skip & 1); ++parity) {
         int32_t constants[kPushBytes / 4] = { w, h, strideWords, bpc, 1 << (bpc - 1), kSlotSad };
         Buffer *previous = &picPrev[options.fiveFrameWindow ? parity : 1 - parity];
         if (pictures) {  // the two pictures' textures, each frame
@@ -1961,6 +2201,10 @@ int vv_context::build_passes_v1()
             });
     }
 
+    if (skip & 4) {  // no ADM (vv_create's flag bit 18: a context for CIEDE2000 or CAMBI alone)
+        v1AdmEnd = 0;
+        return error;
+    }
     const float cos_1deg_sq = cos(1.0 * M_PI / 180.0) * cos(1.0 * M_PI / 180.0);
     uint32_t cosBits;
     memcpy(&cosBits, &cos_1deg_sq, sizeof cosBits);
@@ -2661,6 +2905,10 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // ADM's decoupled images: only the separate decouple and masking passes
     // write them -- adm_dcm keeps them in group memory (190 MB at 4K).
     const VkDeviceSize decoupled = admFused ? 0 : 1;
+    // VMAF v1 without motion or ADM (flag bits 16 and 18): the previous
+    // reference and ADM's band images are not made (at 4K 16-bit, 33 and
+    // about 30 MB).
+    const VkDeviceSize prevUsed = v1 && (skip & 1) ? 0 : 1, bandsUsed = v1 && (skip & 4) ? 0 : 1;
     struct { Buffer *buffer; VkDeviceSize bytes; } sized[] = {
         { &picRef, direct ? 4 : planeBytes }, { &picDis, direct ? 4 : planeBytes },
         // Motion's blur, 16-bit: two pixels a word.
@@ -2670,15 +2918,16 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
         { &rdRef[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 }, { &rdDis[0], (VkDeviceSize)w1 * h1 * 4 * v0 * twoPass + 4 },
         { &rdRef[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 + 4 }, { &rdDis[1], (VkDeviceSize)rw1 * rh1 * 4 * v0 * twoPass + 4 },
         // VMAF v1's previous reference, unless read from its slot (direct).
-        { &picPrev[0], planeBytes * only1 * (direct ? 0 : 1) + 4 },
-        { &picPrev[1], planeBytes * only1 * (direct ? 0 : 1) + 4 },
+        { &picPrev[0], planeBytes * only1 * (direct ? 0 : 1) * prevUsed + 4 },
+        { &picPrev[1], planeBytes * only1 * (direct ? 0 : 1) * prevUsed + 4 },
         { &logTable, 16384 * 4 }, { &divTable, 65536 * 4 },
         // VMAF v0.6.1's: scales 0 and 2 two words a position at scale 0, 1 and 3
         // three. VMAF v1's ADM (adm_fused.slang): scale 2's bands at [0], as
         // wide as they are, and scale 1's or 3's at [1], four words a position.
-        { &bandsRef[0], v1 ? (VkDeviceSize)((w2 + 1) / 2) * ((h2 + 1) / 2) * 16 : (VkDeviceSize)w1 * h1 * 8 },
-        { &bandsDis[0], v1 ? (VkDeviceSize)((w2 + 1) / 2) * ((h2 + 1) / 2) * 16 : (VkDeviceSize)w1 * h1 * 8 },
-        { &bandsRef[1], (VkDeviceSize)w2 * h2 * (v1 ? 16 : 12) }, { &bandsDis[1], (VkDeviceSize)w2 * h2 * (v1 ? 16 : 12) },
+        { &bandsRef[0], (v1 ? (VkDeviceSize)((w2 + 1) / 2) * ((h2 + 1) / 2) * 16 : (VkDeviceSize)w1 * h1 * 8) * bandsUsed + 4 },
+        { &bandsDis[0], (v1 ? (VkDeviceSize)((w2 + 1) / 2) * ((h2 + 1) / 2) * 16 : (VkDeviceSize)w1 * h1 * 8) * bandsUsed + 4 },
+        { &bandsRef[1], (VkDeviceSize)w2 * h2 * (v1 ? 16 : 12) * bandsUsed + 4 },
+        { &bandsDis[1], (VkDeviceSize)w2 * h2 * (v1 ? 16 : 12) * bandsUsed + 4 },
         { &bandsARef[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 }, { &bandsADis[0], (VkDeviceSize)w1 * h1 * 4 * v0 + 4 },
         { &bandsARef[1], (VkDeviceSize)w2 * h2 * 4 * v0 + 4 }, { &bandsADis[1], (VkDeviceSize)w2 * h2 * 4 * v0 + 4 },
         // VMAF v1 passes nothing between ADM's passes (adm_fused.slang).
@@ -2985,6 +3234,18 @@ int vv_context::enable_cambi(const double *values)
         return error;
     if (int compiled = compile_pipelines())  // the passes added here
         return compiled;
+    // The pool's scorer reads only what is fixed from here on (cambiConst, cambiOptions).
+    cambiPool.configure([this](const uint64_t *sums, unsigned scales, float *values, double &out) {
+        double pooled[V1_CAMBI_SCALES] = {};
+        for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
+            if (!(scales & (1u << scale)))
+                continue;
+            const unsigned sw = (unsigned)cambiConst.scale_w[scale], sh = (unsigned)cambiConst.scale_h[scale];
+            pooled[scale] = v1_cambi_pool(values, cambiOptions.topk, sw, sh);
+            values += (size_t)sw * sh;
+        }
+        return cambi_score(sums, pooled, scales, out);
+    }, (int)std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u));  // as SpEED's
     cambi = true;
     return 0;
 }
@@ -2998,6 +3259,8 @@ int vv_context::enable_speed(const double *values)
         return fail(-3, "SpEED is calculated in a VMAF v1 context only");
     if (frames || speed)
         return fail(-3, "SpEED is started before the first frame");
+    if (converting)  // whose passes write the chroma where SpEED would not read it
+        return fail(-3, "SpEED is started before the conversion (vv_v1_convert)");
     V1SpeedOptions &o = speedOptions;
     o.kernelscale = values[0];
     o.prescale = values[1];
@@ -3105,6 +3368,369 @@ int vv_context::enable_speed(const double *values)
         return fail(-2, "SpEED: its threads could not be started");
     speed = true;
     return 0;
+}
+
+// CIEDE2000's pass (shaders/ciede.slang): a thread per 2x2 luma block, the
+// pair's chroma copied into the slot's ciedeChroma by submit_v1.
+int vv_context::enable_ciede()
+{
+    if (!v1)
+        return fail(-3, "CIEDE2000 is calculated in a VMAF v1 context only");
+    if (frames || ciede)
+        return fail(-3, "CIEDE2000 is started before the first frame");
+    // A decoder's frames (their chroma is not copied where the pass reads
+    // it) and converted ones (the conversion writes SpEED's chroma only):
+    // the caller scores those on the CPU.
+    if (shared || converting)
+        return fail(-4, "CIEDE2000 on the GPU takes its frames from host memory (vv_submit_v1)");
+    ciedeW = (uint32_t)(w + 1) / 2;
+    ciedeH = (uint32_t)(h + 1) / 2;
+    ciedeStrideBytes = (ciedeW * (bpc > 8 ? 2 : 1) + 3) & ~3u;
+    ciedePlaneBytes = ciedeStrideBytes * ciedeH;
+    const uint32_t constants[] = { (uint32_t)w, (uint32_t)h, strideBytes / 4, ciedeW, ciedeH, ciedeStrideBytes / 4,
+                                   (uint32_t)bpc, kSlotCiede };
+    const int shader = bpc > 8 ? kShader_ciede_16 : kShader_ciede_8;
+    ciedeFromStaging = !direct && (skip & 5) == 5 && (integratedGpu || barFrames);
+    for (Slot &slot : slots) {
+        if (int error = create_buffer(slot.ciedeChroma, (VkDeviceSize)ciedePlaneBytes * 4, true, false, true))
+            return error;
+        // The luma where the other features read it: the slot's own (direct)
+        // or the copies -- or, read by this pass alone, the slot's staging.
+        const bool fromSlot = direct || ciedeFromStaging;
+        const Bound ref = fromSlot ? slot_ref(slot) : Bound(&picRef);
+        const Bound dis = fromSlot ? slot_dis(slot) : Bound(&picDis);
+        if (int error = add_pass(slot.ciedePasses, shader, { ref, dis, &slot.ciedeChroma, &acc }, constants,
+                                 sizeof constants, groups(ciedeW, 16), groups(ciedeH, 16)))
+            return error;
+    }
+    if (int compiled = compile_pipelines())  // the passes added here
+        return compiled;
+    ciede = true;
+    return 0;
+}
+
+// ------------------------------------------------- the HDR picture conversion
+
+// Every plan buffer of `kind` this engine lays out: a source plane (Y, U or
+// V of the 4:2:0 source), a target plane (this context's size: the features'
+// luma, SpEED's chroma) or scratch.
+static bool plan_buffer_fits(uint32_t kind, uint32_t plane, uint64_t elements, const uint32_t sourceW[3],
+                             const uint32_t sourceH[3], int w, int h)
+{
+    if (kind == VMAF_GPU_PLAN_SCRATCH)
+        return elements > 0 && elements < (1ull << 30);
+    if (plane > 2)
+        return false;
+    if (kind == VMAF_GPU_PLAN_SOURCE)
+        return elements == (uint64_t)sourceW[plane] * sourceH[plane];
+    const uint64_t targetW = plane ? (uint64_t)(w >> 1) : (uint64_t)w, targetH = plane ? (uint64_t)(h >> 1) : (uint64_t)h;
+    return kind == VMAF_GPU_PLAN_TARGET && elements == targetW * targetH;
+}
+
+// A side's plan checked, step by step, so that the shaders read and write
+// only inside their buffers whatever the words (a read past a buffer's end
+// can reset the GPU), and kept.
+int vv_context::load_convert_plan(int side, const uint32_t *plan, size_t words)
+{
+    if (!plan || words < VMAF_GPU_PLAN_HEADER_WORDS || words > (1u << 26)
+        || plan[VMAF_GPU_PLAN_H_MAGIC] != VMAF_GPU_PLAN_MAGIC || plan[VMAF_GPU_PLAN_H_VERSION] != VMAF_GPU_PLAN_VERSION
+        || plan[VMAF_GPU_PLAN_H_WORDS] != words)
+        return fail(-3, "not a picture conversion plan of this version");
+    if (plan[VMAF_GPU_PLAN_H_DST_W] != (uint32_t)w || plan[VMAF_GPU_PLAN_H_DST_H] != (uint32_t)h
+        || plan[VMAF_GPU_PLAN_H_DST_BPC] != 16)
+        return fail(-3, "the conversion plan's target is not this context's size at 16 bits");
+    const uint32_t buffers = plan[VMAF_GPU_PLAN_H_BUFFER_COUNT], steps = plan[VMAF_GPU_PLAN_H_STEP_COUNT];
+    if (buffers > 64 || steps > 64 || (uint64_t)plan[VMAF_GPU_PLAN_H_BUFFERS] + (uint64_t)buffers * VMAF_GPU_PLAN_BUFFER_WORDS > words
+        || (uint64_t)plan[VMAF_GPU_PLAN_H_STEPS] + (uint64_t)steps * VMAF_GPU_PLAN_STEP_WORDS > words)
+        return fail(-3, "the conversion plan's buffers or steps run past its end");
+    ConvertSide &c = convertSides[side];
+    const uint32_t srcW = plan[VMAF_GPU_PLAN_H_SRC_W], srcH = plan[VMAF_GPU_PLAN_H_SRC_H];
+    if (srcW < 2 || srcH < 2 || srcW > 16384 || srcH > 16384)
+        return fail(-3, "the conversion plan's source size is not taken");
+    if (plan[VMAF_GPU_PLAN_H_SRC_BPC] <= 8 || plan[VMAF_GPU_PLAN_H_SRC_BPC] > 16)  // (the shaders read 16-bit samples)
+        return fail(-4, "the conversion runs on the GPU for sources of 9 to 16 bits");
+    const uint32_t planeW[3] = { srcW, srcW >> 1, srcW >> 1 }, planeH[3] = { srcH, srcH >> 1, srcH >> 1 };
+    std::vector<uint64_t> elements(buffers);
+    std::vector<uint32_t> kinds(buffers);
+    for (uint32_t b = 0; b < buffers; ++b) {
+        const uint32_t *record = plan + plan[VMAF_GPU_PLAN_H_BUFFERS] + b * VMAF_GPU_PLAN_BUFFER_WORDS;
+        kinds[b] = record[VMAF_GPU_PLAN_B_KIND];
+        elements[b] = record[VMAF_GPU_PLAN_B_ELEMENTS];
+        if (!plan_buffer_fits(kinds[b], record[VMAF_GPU_PLAN_B_PLANE], elements[b], planeW, planeH, w, h))
+            return fail(-3, "a conversion plan buffer is not a plane this engine lays out");
+    }
+    auto table_fits = [&](uint64_t at, uint64_t count) { return at + count <= words; };
+    for (uint32_t i = 0; i < steps; ++i) {
+        const uint32_t *s = plan + plan[VMAF_GPU_PLAN_H_STEPS] + i * VMAF_GPU_PLAN_STEP_WORDS;
+        const uint32_t kind = s[VMAF_GPU_PLAN_S_KIND], planes = s[VMAF_GPU_PLAN_S_PLANES];
+        const uint32_t inW = s[VMAF_GPU_PLAN_S_IN_W], inH = s[VMAF_GPU_PLAN_S_IN_H];
+        const uint32_t outW = s[VMAF_GPU_PLAN_S_OUT_W], outH = s[VMAF_GPU_PLAN_S_OUT_H];
+        const bool resize = kind >= VMAF_GPU_PLAN_RESIZE_FLOAT_H && kind <= VMAF_GPU_PLAN_RESIZE_INT16_V;
+        if ((!resize && kind != VMAF_GPU_PLAN_COLOUR && kind != VMAF_GPU_PLAN_CONVERT)
+            || planes != (kind == VMAF_GPU_PLAN_COLOUR ? 3u : 1u) || !inW || !inH || !outW || !outH
+            || inW > 16384 || inH > 16384 || outW > 16384 || outH > 16384 || (!resize && (inW != outW || inH != outH)))
+            return fail(-3, "a conversion plan step is not one this engine runs");
+        for (uint32_t p = 0; p < planes; ++p) {
+            const uint32_t in = s[VMAF_GPU_PLAN_S_IN + p], out = s[VMAF_GPU_PLAN_S_OUT + p];
+            const uint32_t read = s[VMAF_GPU_PLAN_S_READ + 4 * p], write = s[VMAF_GPU_PLAN_S_WRITE + 4 * p];
+            if (in >= buffers || out >= buffers || kinds[in] == VMAF_GPU_PLAN_TARGET || kinds[out] == VMAF_GPU_PLAN_SOURCE
+                || elements[in] < (uint64_t)inW * inH || elements[out] < (uint64_t)outW * outH
+                || read > VMAF_GPU_PLAN_READ_W2F || write > VMAF_GPU_PLAN_WRITE_F2W || (resize && in == out))
+                return fail(-3, "a conversion plan step reads or writes outside its buffers");
+            // A target plane is written row by row at the engine's stride: the step makes all of it.
+            if (kinds[out] == VMAF_GPU_PLAN_TARGET && elements[out] != (uint64_t)outW * outH)
+                return fail(-3, "a conversion plan step writes part of a target plane");
+        }
+        const uint32_t table = s[VMAF_GPU_PLAN_S_TABLE], width = s[VMAF_GPU_PLAN_S_FILTER_WIDTH];
+        if (resize) {
+            const bool vertical = kind == VMAF_GPU_PLAN_RESIZE_FLOAT_V || kind == VMAF_GPU_PLAN_RESIZE_INT16_V;
+            const uint32_t dim = vertical ? outH : outW, inDim = vertical ? inH : inW;
+            if ((vertical ? outW != inW : outH != inH) || width < 1 || width > 64
+                || !table_fits(table, (uint64_t)dim * (1 + width)))
+                return fail(-3, "a conversion plan resize's filter runs past the plan or its picture");
+            for (uint32_t k = 0; k < dim; ++k)
+                if ((uint64_t)plan[table + k] + width > inDim)
+                    return fail(-3, "a conversion plan resize's filter runs past the plan or its picture");
+        } else if (kind == VMAF_GPU_PLAN_COLOUR) {
+            if (width > 8 || !table_fits(table, 2ull * width))
+                return fail(-3, "a conversion plan's colour operations run past its end");
+            for (uint32_t k = 0; k < width; ++k) {
+                const uint32_t op = plan[table + 2 * k], at = plan[table + 2 * k + 1];
+                const uint32_t size = op == VMAF_GPU_PLAN_OP_MATRIX ? 9 : op == VMAF_GPU_PLAN_OP_TO_LINEAR ? 65537
+                                    : op == VMAF_GPU_PLAN_OP_TO_GAMMA ? 65536 : 0;
+                if (!size || !table_fits(at, size))
+                    return fail(-3, "a conversion plan's colour operations run past its end");
+            }
+        }
+    }
+    c.words.assign(plan, plan + words);
+    memcpy(c.planeW, planeW, sizeof planeW);
+    memcpy(c.planeH, planeH, sizeof planeH);
+    return 0;
+}
+
+// The chroma target's row and plane bytes: SpEED's chroma upload buffer's,
+// or convertChroma's in the same layout.
+static uint32_t chroma_stride_bytes(int w) { return ((uint32_t)(w / 2) * 2 + 3) & ~3u; }
+
+// A side's places (convert.slang: where each plan buffer is, for each slot),
+// its plan and places on the GPU, its scratch, and a pass per step.
+int vv_context::add_convert_side(int side)
+{
+    ConvertSide &c = convertSides[side];
+    const uint32_t buffers = c.words[VMAF_GPU_PLAN_H_BUFFER_COUNT];
+    const uint32_t chromaStride = chroma_stride_bytes(w), chromaPlane = chromaStride * (uint32_t)(h / 2);
+    std::vector<uint32_t> places;
+    uint64_t scratchWords = 0;
+    for (size_t k = 0; k < slots.size(); ++k) {
+        scratchWords = 0;
+        for (uint32_t b = 0; b < buffers; ++b) {
+            const uint32_t *record = c.words.data() + c.words[VMAF_GPU_PLAN_H_BUFFERS] + b * VMAF_GPU_PLAN_BUFFER_WORDS;
+            const uint32_t plane = record[VMAF_GPU_PLAN_B_PLANE];
+            switch (record[VMAF_GPU_PLAN_B_KIND]) {
+            case VMAF_GPU_PLAN_SOURCE:  // in slot k's part of convertSource (16-bit samples)
+                places.insert(places.end(), { 0u, (uint32_t)((k * convertSourceBytes + c.planeOffset[plane]) / 2), 0u });
+                break;
+            case VMAF_GPU_PLAN_SCRATCH:  // the side's own, the same for every slot: commit's first two barriers
+                                         // (compute -> transfer -> compute) order it after the last frame's passes
+                places.insert(places.end(), { 1u, (uint32_t)scratchWords, 0u });
+                scratchWords += record[VMAF_GPU_PLAN_B_ELEMENTS];
+                break;
+            default:  // the target's: luma at the features' stride, chroma in SpEED's layout (ref U, ref V, dis U, dis V)
+                if (plane == 0)
+                    places.insert(places.end(), { 2u, 0u, strideBytes / 2 });
+                else
+                    places.insert(places.end(),
+                                  { 3u, ((uint32_t)side * 2 + plane - 1) * chromaPlane / 2, chromaStride / 2 });
+                break;
+            }
+        }
+    }
+    if (scratchWords >= (1ull << 30) || (uint64_t)slots.size() * convertSourceBytes >= (1ull << 32))
+        return fail(-3, "the conversion's pictures are too large");
+    c.placesAt = (uint32_t)c.words.size();
+    c.placesWords = 3 * buffers;
+    c.words.insert(c.words.end(), places.begin(), places.end());
+    const uint32_t *plan = c.words.data();
+    const uint32_t placesAt = c.placesAt;
+    if (int error = create_buffer(c.tables, c.words.size() * 4, false))
+        return error;
+    if (int error = upload(c.tables, c.words.data(), c.words.size() * 4))
+        return error;
+    if (int error = create_buffer(c.scratch, std::max<uint64_t>(scratchWords, 1) * 4, false))
+        return error;
+    Buffer *luma = side ? &picDis : &picRef;
+    for (uint32_t i = 0; i < plan[VMAF_GPU_PLAN_H_STEP_COUNT]; ++i) {
+        const uint32_t at = plan[VMAF_GPU_PLAN_H_STEPS] + i * VMAF_GPU_PLAN_STEP_WORDS;
+        const uint32_t kind = plan[at + VMAF_GPU_PLAN_S_KIND];
+        const int shader = kind == VMAF_GPU_PLAN_COLOUR ? kShader_convert_colour
+                           : kind == VMAF_GPU_PLAN_CONVERT ? kShader_convert_samples
+                           : kind <= VMAF_GPU_PLAN_RESIZE_FLOAT_V ? kShader_convert_resize_float
+                                                                  : kShader_convert_resize_int16;
+        const uint32_t vertical = kind == VMAF_GPU_PLAN_RESIZE_FLOAT_V || kind == VMAF_GPU_PLAN_RESIZE_INT16_V;
+        // (the places' offset is slot 0's here: record_convert pushes the frame's slot's)
+        const uint32_t constants[4] = { at, placesAt, vertical, 0 };  // (the last: 0.0f)
+        const uint32_t outW = plan[at + VMAF_GPU_PLAN_S_OUT_W], outH = plan[at + VMAF_GPU_PLAN_S_OUT_H];
+        // A thread makes two samples of a row (convert.slang's 16 x 8 groups).
+        if (int error = add_pass(c.passes, shader, { &c.tables, &convertSource, &c.scratch, luma,
+                                 speed ? &slots[0].speedChroma : &convertChroma }, constants, sizeof constants,
+                                 groups((int)(outW + 1) / 2, 16), groups((int)outH, 8)))
+            return error;
+        // SpEED's chroma is the slot's own: a set a slot for a step that writes it.
+        bool writesChroma = false;
+        for (uint32_t p = 0; p < plan[at + VMAF_GPU_PLAN_S_PLANES]; ++p) {
+            const uint32_t *out = plan + plan[VMAF_GPU_PLAN_H_BUFFERS]
+                                  + plan[at + VMAF_GPU_PLAN_S_OUT + p] * VMAF_GPU_PLAN_BUFFER_WORDS;
+            writesChroma = writesChroma || (out[VMAF_GPU_PLAN_B_KIND] == VMAF_GPU_PLAN_TARGET && out[VMAF_GPU_PLAN_B_PLANE]);
+        }
+        if (speed && writesChroma) {
+            if (int error = per_slot(c.passes, [&](Slot &slot) {
+                    return std::vector<Bound>{ &c.tables, &convertSource, &c.scratch, luma, &slot.speedChroma };
+                }))
+                return error;
+        }
+    }
+    return 0;
+}
+
+// The HDR models' picture conversion on the GPU (vv_v1_convert).
+int vv_context::enable_convert(const uint32_t *const plans[2], const size_t words[2])
+{
+    if (!v1 || shared || pictures || direct || bpc != 16)
+        return fail(-3, "the conversion runs in a VMAF v1 context of 16 bits whose frames come through vv_submit_v1");
+    if (frames || converting)
+        return fail(-3, "the conversion is set once, before the first frame");
+    if (ciede)  // whose pass reads the slots' planes, which the conversion leaves unused
+        return fail(-3, "the conversion is set before CIEDE2000 (which then runs on the CPU)");
+    for (int side = 0; side < 2; ++side) {
+        if (int error = load_convert_plan(side, plans[side], words[side]))
+            return error;
+    }
+    // Both sides' source planes in each slot's part of convertSource, rows
+    // packed, each plane starting on a word.
+    convertSourceBytes = 0;
+    for (ConvertSide &c : convertSides) {
+        for (int p = 0; p < 3; ++p) {
+            c.planeOffset[p] = convertSourceBytes;
+            convertSourceBytes += (c.planeW[p] * c.planeH[p] * 2 + 3) & ~3u;
+        }
+    }
+    if (int error = create_buffer(convertSource, (VkDeviceSize)slots.size() * convertSourceBytes, true, false, true))
+        return error;
+    // The staging buffers the conversion leaves unused (VMAF v1 copies them
+    // into picRef and picDis, which the conversion writes instead): 4K, two
+    // 16-bit planes, 31.6 MB a slot.
+    for (Slot &slot : slots) {
+        if (int error = remake_buffer(slot.staging, 4, true, true))
+            return error;
+    }
+    if (!speed) {  // the chroma's target, which only SpEED reads
+        const VkDeviceSize chromaPlane = (VkDeviceSize)chroma_stride_bytes(w) * (uint32_t)(h / 2);
+        if (int error = create_buffer(convertChroma, 4 * chromaPlane, false))
+            return error;
+    }
+    for (int side = 0; side < 2; ++side) {
+        if (int error = add_convert_side(side))
+            return error;
+    }
+    if (int error = compile_pipelines())
+        return error;
+    converting = true;
+    return 0;
+}
+
+void vv_context::record_convert(VkCommandBuffer cb, size_t slotIndex, unsigned sides,
+                                const std::function<void(int)> &stamp)
+{
+    size_t steps = 0;
+    for (int side = 0; side < 2; ++side)
+        if ((sides >> side) & 1)
+            steps = std::max(steps, convertSides[side].passes.size());
+    for (size_t i = 0; i < steps; ++i) {
+        int shader = -1;
+        for (int side = 0; side < 2; ++side) {
+            const std::vector<Pass> &passes = convertSides[side].passes;
+            if (!((sides >> side) & 1) || i >= passes.size())
+                continue;
+            const Pass &pass = passes[i];
+            const VkPipelineLayout layout = pipelines[pass.shader].layout;
+            const VkDescriptorSet set = pass.slotSets.empty() ? pass.set : pass.slotSets[slotIndex];
+            uint32_t constants[4];
+            memcpy(constants, pass.constants, sizeof constants);
+            constants[1] += (uint32_t)slotIndex * convertSides[side].placesWords;  // the slot's places
+            vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pass.pipeline);
+            vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+            vk.vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof constants, constants);
+            vk.vkCmdDispatch(cb, pass.groups[0], pass.groups[1], 1);
+            shader = pass.shader;
+        }
+        barrier(vk, cb, kCompute, kCompute);
+        if (stamp)
+            stamp(shader);
+    }
+}
+
+// A side's source picture into slot `slotIndex`'s part of convertSource,
+// rows packed.
+void vv_context::write_convert_source(size_t slotIndex, int side, const uint16_t *const planes[3],
+                                      const ptrdiff_t strides[3])
+{
+    const ConvertSide &c = convertSides[side];
+    uint8_t *base = (uint8_t *)convertSource.mapped + slotIndex * convertSourceBytes;
+    for (int p = 0; p < 3; ++p) {
+        const size_t rowBytes = (size_t)c.planeW[p] * 2;
+        for (uint32_t y = 0; y < c.planeH[p]; ++y)
+            memcpy(base + c.planeOffset[p] + y * rowBytes, (const uint8_t *)planes[p] + y * strides[p], rowBytes);
+    }
+}
+
+// One picture through a side's conversion, read back (vv_test_convert).
+int vv_context::test_convert(int side, const uint16_t *const planes[3], const ptrdiff_t strides[3],
+                             uint16_t *const out[3], const ptrdiff_t outStrides[3])
+{
+    if (!converting || side < 0 || side > 1)
+        return fail(-3, "no conversion on this side (vv_v1_convert)");
+    if (pending)
+        return fail(-3, "a frame was started and not committed");
+    for (Slot &slot : slots) {  // the frames in flight read picRef and picDis, which the conversion writes
+        if (int error = collect(slot))
+            return error;
+    }
+    write_convert_source(0, side, planes, strides);
+    const uint32_t chromaStride = chroma_stride_bytes(w), chromaPlane = chromaStride * (uint32_t)(h / 2);
+    Buffer back;
+    if (int error = create_buffer(back, (VkDeviceSize)planeBytes + 2ull * chromaPlane, true)) {
+        destroy_last_buffer(back);
+        return error;
+    }
+    VkCommandBuffer cb = slots[0].commands;
+    VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vk.vkBeginCommandBuffer(cb, &begin);
+    record_convert(cb, 0, 1u << side, nullptr);
+    barrier(vk, cb, kCompute, kTransfer);
+    const VkBufferCopy luma = { 0, 0, planeBytes };
+    vk.vkCmdCopyBuffer(cb, (side ? picDis : picRef).buffer, back.buffer, 1, &luma);
+    const VkBufferCopy chroma = { (VkDeviceSize)side * 2 * chromaPlane, planeBytes, 2ull * chromaPlane };
+    vk.vkCmdCopyBuffer(cb, (speed ? slots[0].speedChroma : convertChroma).buffer, back.buffer, 1, &chroma);
+    VkMemoryBarrier toHost = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vk.vkCmdPipelineBarrier(cb, kTransfer, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, nullptr, 0, nullptr);
+    vk.vkEndCommandBuffer(cb);
+    const VkResult result = run_now(cb);
+    if (result == VK_SUCCESS) {
+        const uint8_t *from = (const uint8_t *)back.mapped;
+        for (int p = 0; p < 3; ++p) {
+            const uint32_t rowBytes = (p ? (uint32_t)w / 2 : (uint32_t)w) * 2, rows = p ? (uint32_t)h / 2 : (uint32_t)h;
+            const uint8_t *plane = p ? from + planeBytes + (size_t)(p - 1) * chromaPlane : from;
+            const uint32_t stride = p ? chromaStride : strideBytes;
+            for (uint32_t y = 0; y < rows; ++y)
+                memcpy((uint8_t *)out[p] + y * outStrides[p], plane + (size_t)y * stride, rowBytes);
+        }
+    }
+    destroy_last_buffer(back);
+    return result == VK_SUCCESS ? 0 : fail(-5, "the conversion on the GPU failed (" + std::to_string(result) + ")");
 }
 
 double vv_context::now_ns() const
@@ -3295,23 +3921,31 @@ int vv_context::collect(Slot &slot)
         sums[i] = (uint64_t)words[2 * i] | ((uint64_t)words[2 * i + 1] << 32);
     if (slot.index < rawSums.size())
         memcpy(rawSums[slot.index].data(), sums, sizeof sums);
-    const double tailStart = profile ? now_ns() : 0.0;
-    double cambiPooled[V1_CAMBI_SCALES] = {};  // spatial_pooling on the CPU, where the GPU's top k was not exact
-    unsigned cambiPooledScales = 0;           // which scales those are (bits)
+    // The scales whose top k the GPU could not sum exactly (bits): spatial_pooling
+    // on the CPU, on cambiPool's threads, from a copy of their c-values; the pool
+    // works out the frame's score, which flush() puts into its record.
+    unsigned cambiPooledScales = 0;
     if (cambi && slot.scored) {
-        const float *kept = (const float *)slot.cambiKeep.mapped;
         for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
-            if (!(sums[kSlotCambi + scale * 4 + 3] & 2))
-                continue;
-            const int sw = cambiConst.scale_w[scale], sh = cambiConst.scale_h[scale];
-            std::vector<float> values(kept + cambiKeepOffset[scale], kept + cambiKeepOffset[scale] + (size_t)sw * sh);
-            cambiPooled[scale] = v1_cambi_pool(values.data(), cambiOptions.topk, (unsigned)sw, (unsigned)sh);
-            cambiPooledScales |= 1u << scale;
+            if (sums[kSlotCambi + scale * 4 + 3] & 2)
+                cambiPooledScales |= 1u << scale;
         }
     }
-    if (profile) {
-        cpuNs[kCpuCambiPool] += now_ns() - tailStart;
-        ++cpuCount[kCpuCambiPool];
+    if (cambiPooledScales) {
+        const double copyStart = profile ? now_ns() : 0.0;
+        std::vector<float> values = cambiPool.buffer();
+        const float *kept = (const float *)slot.cambiKeep.mapped;
+        for (int scale = 0; scale < V1_CAMBI_SCALES; ++scale) {
+            if (cambiPooledScales & (1u << scale)) {
+                const float *c = kept + cambiKeepOffset[scale];
+                values.insert(values.end(), c, c + (size_t)cambiConst.scale_w[scale] * cambiConst.scale_h[scale]);
+            }
+        }
+        cambiPool.submit(slot.index, sums, cambiPooledScales, std::move(values));
+        if (profile) {
+            cpuNs[kCpuCambiCopy] += now_ns() - copyStart;
+            ++cpuCount[kCpuCambiCopy];
+        }
     }
     FrameRecord &frame = records[slot.index];
     frame.sad = sums[kSlotSad];
@@ -3324,9 +3958,12 @@ int vv_context::collect(Slot &slot)
                 frame.vif[limit][scale] = (float)vif[scale];  // exact: each is a float quotient
             frame.adm[limit] = adm_score(sums, limit, (unsigned)w, (unsigned)h);
         }
-        v1_adm(*this, sums, frame.v1Adm);
-        if (cambi)
-            frame.cambiError = (int8_t)cambi_score(sums, cambiPooled, cambiPooledScales, frame.cambi);
+        if (!(v1 && (skip & 4)))  // (VMAF v1 without ADM: no ADM passes, v1AdmEnd 0)
+            v1_adm(*this, sums, frame.v1Adm);
+        if (cambi && !cambiPooledScales)
+            frame.cambiError = (int8_t)cambi_score(sums, nullptr, 0, frame.cambi);
+        if (ciede)  // ciede.c's: 45 - 20 log10 of the mean dE00 (+inf for identical pictures, as there)
+            frame.ciede = 45.0 - 20.0 * log10((double)sums[kSlotCiede] * (1.0 / 1048576.0) / ((double)w * h));
     }
     if (speed && slot.scored)  // est_params on the pool's threads, from a copy of the planes
         speedPool.submit(slot.index, (const float *)slot.speedKeep.mapped);
@@ -3435,6 +4072,8 @@ int vv_context::submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *d
     uint8_t *targets[2];
     if (shared)
         return fail(-3, "this context takes its frames from GPU memory");
+    if (converting)
+        return fail(-3, "this context converts its pictures: they go in with vv_submit_v1");
     if (int error = staging(&targets[0], &targets[1]))
         return error;
     const double copyBegun = profile ? now_ns() : 0.0;
@@ -3459,10 +4098,16 @@ int vv_context::submit_v1(const uint8_t *const planes[6], const ptrdiff_t stride
         return fail(-3, "this context takes its frames from GPU memory");
     if (!planes[0] || (score && !planes[3]))
         return fail(-3, "a frame needs its reference picture, a scored one its distorted one too");
-    if (speed && score) {
+    if ((speed || ciede) && score) {
         for (int plane : { 1, 2, 4, 5 }) {
             if (!planes[plane])
-                return fail(-3, "SpEED needs the chroma planes");
+                return fail(-3, speed ? "SpEED needs the chroma planes" : "CIEDE2000 needs the chroma planes");
+        }
+    }
+    if (converting) {
+        for (int plane : { 1, 2, 4, 5 }) {
+            if (!planes[plane] && (plane < 3 || score))
+                return fail(-3, "the conversion needs the chroma planes");
         }
     }
     uint8_t *targets[2];
@@ -3474,18 +4119,39 @@ int vv_context::submit_v1(const uint8_t *const planes[6], const ptrdiff_t stride
     // 4K 10-bit, about 420 frame pairs a second).
     const size_t sampleBytes = bpc > 8 ? 2 : 1;
     copyJob.count = 0;
-    copyJob.planes[copyJob.count++] = { targets[0], strideBytes, planes[0], strides[0], (size_t)w * sampleBytes,
-                                        (uint32_t)h };
-    if (score)
-        copyJob.planes[copyJob.count++] = { targets[1], strideBytes, planes[3], strides[3], (size_t)w * sampleBytes,
+    if (converting) {
+        // The source pictures into the slot's part of convertSource, rows
+        // packed: commit converts them into picRef, picDis and the chroma.
+        const size_t slotIndex = (size_t)(pending - slots.data());
+        uint8_t *base = (uint8_t *)convertSource.mapped + slotIndex * convertSourceBytes;
+        for (int side = 0; side < (score ? 2 : 1); ++side) {
+            const ConvertSide &c = convertSides[side];
+            for (int p = 0; p < 3; ++p)
+                copyJob.planes[copyJob.count++] = { base + c.planeOffset[p], (uint32_t)c.planeW[p] * 2,
+                                                    planes[3 * side + p], strides[3 * side + p],
+                                                    (size_t)c.planeW[p] * 2, c.planeH[p] };
+        }
+    } else {
+        copyJob.planes[copyJob.count++] = { targets[0], strideBytes, planes[0], strides[0], (size_t)w * sampleBytes,
                                             (uint32_t)h };
-    if (speed && score) {
+        if (score)
+            copyJob.planes[copyJob.count++] = { targets[1], strideBytes, planes[3], strides[3],
+                                                (size_t)w * sampleBytes, (uint32_t)h };
+    }
+    if (speed && score && !converting) {
         uint8_t *chroma = (uint8_t *)pending->speedChroma.mapped;
         const int order[4] = { 1, 2, 4, 5 };  // ref U, ref V, dis U, dis V
         for (int i = 0; i < 4; ++i)
             copyJob.planes[copyJob.count++] = { chroma + (size_t)i * chromaPlaneBytes, chromaStrideBytes,
                                                 planes[order[i]], strides[order[i]], chromaW * sampleBytes,
                                                 chromaH };
+    }
+    if (ciede && score) {
+        uint8_t *chroma = (uint8_t *)pending->ciedeChroma.mapped;
+        const int order[4] = { 1, 2, 4, 5 };  // ref U, ref V, dis U, dis V
+        for (int i = 0; i < 4; ++i)
+            copyJob.planes[copyJob.count++] = { chroma + (size_t)i * ciedePlaneBytes, ciedeStrideBytes,
+                                                planes[order[i]], strides[order[i]], ciedeW * sampleBytes, ciedeH };
     }
     copy_planes();
     if (profile) {
@@ -3577,7 +4243,7 @@ int vv_context::commit(bool score)
             vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
                                     nullptr, 0, nullptr, 1, &give);
         }
-    } else if (!direct) {
+    } else if (!direct && !converting && pictures_copied()) {  // (converting: the conversion writes them, after the barrier below)
         VkBufferCopy copy = { 0, 0, planeBytes };
         vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
         if (score) {
@@ -3605,11 +4271,14 @@ int vv_context::commit(bool score)
     if (pictures)
         picture_barriers(cb, slot, true);
     stamp(kProfileUpload);
+    if (converting)  // the frame's pictures converted on the GPU, ending with a barrier
+        record_convert(cb, slotIndex, score ? 3u : 1u, stamp);
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
-    const std::vector<Pass> *lists[4] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
+    const std::vector<Pass> *lists[5] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
                                           score && cambi ? &slot.cambiKeepPasses : nullptr,
                                           score && speed ? (slot.chromaFromHost ? &slot.speedPassesHost
-                                                                                : &slot.speedPasses) : nullptr };
+                                                                                : &slot.speedPasses) : nullptr,
+                                          score && ciede ? &slot.ciedePasses : nullptr };
     if (shared)
         slot.chromaFromHost = false;  // the next frame's: from staging unless vv_chroma_staging says
     auto record = [&](const Pass &pass) {
@@ -3638,12 +4307,12 @@ int vv_context::commit(bool score)
     const bool inTurns = !profile && !passLimit;
     if (v1 && inTurns) {
         // VMAF v1's features, independent of each other -- motion, ADM, CAMBI
-        // (and its kept c-values), SpEED -- each a chain of passes that wait
+        // (and its kept c-values), SpEED, CIEDE2000 -- each a chain of passes that wait
         // for the one before, recorded in turns: a pass (or passes that
         // overlap) of each chain, then one barrier, so that each waits for
         // its own chain's and the others' passes run beside it (the small
         // ones left the GPU idle between barriers, at 1080p most).
-        std::vector<std::vector<const Pass *>> chains(4);
+        std::vector<std::vector<const Pass *>> chains(5);
         if (moves)
             for (const Pass &pass : motion[index % 2]) chains[0].push_back(&pass);
         if (score) {
@@ -3652,12 +4321,14 @@ int vv_context::commit(bool score)
             if (cambi)
                 for (const Pass &pass : slot.cambiKeepPasses) chains[2].push_back(&pass);
         }
-        if (lists[3])
-            for (const Pass &pass : *lists[3]) chains[3].push_back(&pass);
-        size_t at[4] = {};
+        for (int c = 3; c < 5; ++c)
+            if (lists[c])
+                for (const Pass &pass : *lists[c]) chains[(size_t)c].push_back(&pass);
+        size_t at[5] = {};
         // The stage each chain starts at: CAMBI's first (CLEAR's), the rest after
-        // it (the best of the orders tried on a Radeon 780M, by a few percent).
-        const int offsets[4] = { 1, 1, 0, 2 };
+        // it (the best of the orders tried on a Radeon 780M, by a few percent);
+        // CIEDE2000's single pass with CAMBI's first.
+        const int offsets[5] = { 1, 1, 0, 2, 0 };
         int stage = 0;
         for (bool waiting = true; waiting; ++stage) {
             waiting = false;
@@ -3711,7 +4382,7 @@ int vv_context::commit(bool score)
             }
         }
     }
-    if (v1 && !direct) {  // read from its slot otherwise (staging())
+    if (v1 && !direct && !(skip & 1)) {  // read from its slot otherwise (staging()); only motion reads it
         barrier(vk, cb, kCompute, kTransfer);
         VkBufferCopy keep = { 0, 0, planeBytes };
         vk.vkCmdCopyBuffer(cb, picRef.buffer, picPrev[index % 2].buffer, 1, &keep);
@@ -4024,6 +4695,10 @@ int vv_context::flush()
     }
     if (speed)
         speedPool.wait();
+    if (cambi) {
+        cambiPool.wait();
+        cambiPool.merge(records);
+    }
     return error;
 }
 
@@ -4104,6 +4779,8 @@ VV_EXPORT int vv_staging(vv_context *context, uint8_t **reference, uint8_t **dis
     *stride = context->strideBytes;
     if (context->shared)
         return fail(-3, "this context takes its frames from GPU memory");
+    if (context->converting)
+        return fail(-3, "this context converts its pictures: they go in with vv_submit_v1");
     return context->staging(reference, distorted);
 }
 
@@ -4386,6 +5063,30 @@ VV_EXPORT int vv_submit_v1(vv_context *context, const uint8_t *const *planes, co
     return context->submit_v1(planes, strides, score != 0);
 }
 
+// The HDR models' picture conversion (libvmaf's vmaf_picture_convert) on the
+// GPU, for a context made by vv_create_v1 at the conversion's target size
+// and 16 bits, after vv_v1_speed if SpEED is wanted and before the first
+// frame: plans[0] the reference's, plans[1] the distorted's, as
+// vmaf_picture_convert_gpu_plan gives them (words[i] 32-bit words each).
+// Its frames then go in with vv_submit_v1 as the source pictures (4:2:0,
+// more than 8 bits). -4 for a plan it does not run (the caller then
+// converts on the CPU).
+VV_EXPORT int vv_v1_convert(vv_context *context, const uint32_t *const *plans, const size_t *words)
+{
+    return context->enable_convert(plans, words);
+}
+
+// To check the conversion against libvmaf's (VideoMetricsLab does on a run's
+// first frame): a source picture (`side` 0 the reference, 1 the distorted)
+// through the context's conversion and read back -- the luma at out[0], the
+// chroma at out[1] and out[2], rows outStrides[i] bytes apart. Waits for the
+// frames in flight first.
+VV_EXPORT int vv_test_convert(vv_context *context, int side, const uint16_t *const *planes, const ptrdiff_t *strides,
+                              uint16_t *const *out, const ptrdiff_t *outStrides)
+{
+    return context->test_convert(side, planes, strides, out, outStrides);
+}
+
 // For a frame begun with vv_staging or vv_shared_next, in a context with
 // SpEED: where its four chroma planes go before vv_commit -- the reference's
 // U and V, then the distorted's, at planes[0..3], rows *stride bytes apart
@@ -4398,6 +5099,8 @@ VV_EXPORT int vv_chroma_staging(vv_context *context, uint8_t **planes, uint32_t 
         return fail(-3, "no frame was started");
     if (context->pictures)
         return fail(-3, "this context reads the pictures where a decoder left them (vv_pictures)");
+    if (context->converting)
+        return fail(-3, "this context converts its pictures: they go in with vv_submit_v1");
     uint8_t *chroma = (uint8_t *)context->pending->speedChroma.mapped;
     for (int i = 0; i < 4; ++i)
         planes[i] = chroma + (size_t)i * context->chromaPlaneBytes;
@@ -4470,6 +5173,29 @@ VV_EXPORT int vv_v1_speed_scores(vv_context *context, double *out, unsigned fram
     return (int)count;
 }
 
+// CIEDE2000 (libvmaf's ciede.c) of the frame pairs on the GPU, for a context
+// made by vv_create_v1, before its first frame; its frames then go in with
+// vv_submit_v1, 4:2:0 (the chroma (w + 1) / 2 x (h + 1) / 2, as libvmaf's
+// pictures). For CIEDE2000 alone, make the context with flag bits 16 and 18
+// (no motion, no ADM). The score is ciede.c's within about 1e-5 (float
+// arithmetic, shaders/ciede.slang). -4 for a context whose frames come from
+// a decoder or are converted (the caller scores those on the CPU).
+VV_EXPORT int vv_v1_ciede(vv_context *context) { return context->enable_ciede(); }
+
+// Every frame's CIEDE2000 score, after vv_flush; NaN for a frame that was
+// not scored, +inf for identical pictures (as ciede.c). Returns the number
+// of frames.
+VV_EXPORT int vv_v1_ciede_scores(vv_context *context, double *out, unsigned frames)
+{
+    if (!context->ciede)
+        return fail(-3, "CIEDE2000 is not calculated in this context");
+    const Blocks<FrameRecord> &records = context->records;
+    const unsigned n = (unsigned)std::min<size_t>(frames, records.size());
+    for (unsigned i = 0; i < n; ++i)
+        out[i] = records[i].scored ? records[i].ciede : NAN;
+    return (int)records.size();
+}
+
 // Profiling, for the speed work: started before the first frame, it times
 // every pass on the GPU (timestamps; the passes run one after the other) and
 // the CPU's steps. vv_profile_text writes what was summed so far, a line
@@ -4491,7 +5217,10 @@ VV_EXPORT int vv_profile_text(vv_context *context, char *out, int bytes)
     }
     context->cpuNs[vv_context::kCpuSpeed] = context->speedPool.busyNs;  // on its threads
     context->cpuCount[vv_context::kCpuSpeed] = context->speedPool.jobs;
-    static const char *const steps[vv_context::kCpuSteps] = { "copy", "record", "wait", "speed_threads", "cambi_pool" };
+    context->cpuNs[vv_context::kCpuCambiPool] = context->cambiPool.busyNs;  // on its threads
+    context->cpuCount[vv_context::kCpuCambiPool] = context->cambiPool.jobs;
+    static const char *const steps[vv_context::kCpuSteps] = { "copy", "record", "wait", "speed_threads", "cambi_copy",
+                                                              "cambi_threads" };
     for (int i = 0; i < vv_context::kCpuSteps; ++i) {
         snprintf(line, sizeof line, "cpu %s %.3f %llu\n", steps[i], context->cpuNs[i] / 1e6,
                  (unsigned long long)context->cpuCount[i]);

@@ -30,19 +30,28 @@ int ssim_scale(int w, int h, int scale_override);
  * The buffers and tables compute_ssim_decimated() needs for w x h pictures
  * of bpc bits at a scale, kept from frame to frame by its caller (one
  * thread at a time). NULL for a scale of 1, a bit depth it does not take,
- * or no memory.
+ * or no memory. floats_from: NULL, or a workspace whose decimated float
+ * buffers (the bulk of the memory) this one uses too, for planes scored
+ * one after the other; it must hold at least as many decimated samples
+ * (else NULL) and stay allocated while this one is used (freeing this one
+ * leaves the borrowed buffers alone).
  */
 typedef struct SsimWorkspace SsimWorkspace;
-SsimWorkspace *ssim_workspace_alloc(int w, int h, int scale, unsigned bpc);
+SsimWorkspace *ssim_workspace_alloc(int w, int h, int scale, unsigned bpc,
+                                    SsimWorkspace *floats_from);
 void ssim_workspace_free(SsimWorkspace *ws);
 
+/* The samples of a w x h picture decimated by scale. */
+size_t ssim_decimated_samples(int w, int h, int scale);
+
 /*
- * compute_ssim() of two pictures' luma planes as float_ssim converts them
- * (picture_copy), for a scale above 1: the same score, to the last bit,
- * without the full-size float images. ws: a workspace for this size, bit
- * depth and scale, or NULL (or another's) to allocate one for the call.
- * -EINVAL for a scale of 1 or a bit depth picture_copy does not take.
+ * compute_ssim() of one plane of two pictures (0: Y, 1: Cb, 2: Cr) as
+ * float_ssim converts it (picture_copy), for a scale above 1: the same
+ * score, to the last bit, without the full-size float images. ws: a
+ * workspace for this plane's size, the bit depth and scale, or NULL (or
+ * another's) to allocate one for the call. -EINVAL for a scale of 1, a bit
+ * depth picture_copy does not take, or a plane the pictures do not have.
  */
-int compute_ssim_decimated(VmafPicture *ref, VmafPicture *cmp, int scale,
+int compute_ssim_decimated(VmafPicture *ref, VmafPicture *cmp, int plane, int scale,
                            SsimWorkspace *ws, double *score, double *l_score,
                            double *c_score, double *s_score);
