@@ -18,11 +18,11 @@
 
 /*
  * libvmaf-fast: MS-SSIM calculates each scale's SSIM in stripes, downscales
- * row by row with AVX2, reads scale 0 from the picture and scores the chroma
- * planes on request (enable_chroma). The stripes must give one pass's sums,
- * the row downscaling _iqa_filter_pixel's values, the AVX2 code the C code's
- * and the picture the float picture's, to the last bit, and a chroma plane
- * the score it gets as a picture's luma.
+ * row by row with AVX2 or NEON, reads scale 0 from the picture and scores the
+ * chroma planes on request (enable_chroma). The stripes must give one pass's
+ * sums, the row downscaling _iqa_filter_pixel's values, the SIMD code the C
+ * code's and the picture the float picture's, to the last bit, and a chroma
+ * plane the score it gets as a picture's luma.
  */
 
 #include <errno.h>
@@ -90,7 +90,7 @@ static char *test_stripes_are_one_ssim_pass()
         mu_assert("alloc", ref_f && dis_f);
         luma_floats(&ref, &dis, ref_f, dis_f);
         const int stride = w * sizeof(float);
-        /* with the C code and, where the CPU has it, the AVX2 code */
+        /* with the C code and, where the CPU has it, the SIMD code */
         static const unsigned masks[] = { 0, ~0u };
         for (int m = 0; m < 2; m++) {
             vmaf_set_cpu_flags_mask(masks[m]);
@@ -111,9 +111,9 @@ static char *test_stripes_are_one_ssim_pass()
     return NULL;
 }
 
-static char *test_avx2_ms_ssim_is_the_c_ms_ssim()
+static char *test_simd_ms_ssim_is_the_c_ms_ssim()
 {
-    /* the smallest size, odd sizes at every scale, and AVX2 row ends */
+    /* the smallest size, odd sizes at every scale, and SIMD row ends */
     static const unsigned sizes[][2] = { { 176, 176 }, { 177, 181 }, { 203, 199 }, { 357, 241 } };
     vmaf_init_cpu();
     for (size_t i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
@@ -135,7 +135,7 @@ static char *test_avx2_ms_ssim_is_the_c_ms_ssim()
         vmaf_picture_unref(&ref);
         vmaf_picture_unref(&dis);
         mu_assert("compute_ms_ssim failed", !err);
-        mu_assert("the AVX2 MS-SSIM is not the C code's", !memcmp(got, want, sizeof got));
+        mu_assert("the SIMD MS-SSIM is not the C code's", !memcmp(got, want, sizeof got));
     }
     return NULL;
 }
@@ -156,7 +156,7 @@ static const float *test_row(void *ctx, int r, float *scratch)
 
 static char *test_row_decimation_is_the_scalar_decimation()
 {
-    /* the smallest pictures each kernel takes, odd and even sides, AVX2
+    /* the smallest pictures each kernel takes, odd and even sides, SIMD
      * groups of 16 and 8 with and without a remainder */
     static const int sizes[][2] = { { 9, 9 }, { 10, 11 }, { 15, 15 }, { 40, 23 }, { 61, 38 }, { 177, 9 } };
     static const int sides[] = { 3, 9, 15 };
@@ -209,7 +209,7 @@ static char *test_row_decimation_is_the_scalar_decimation()
 static char *test_picture_path_is_the_float_path()
 {
     /* the smallest size, odd sizes at every scale, a width that is not a
-     * multiple of the AVX2 groups; every bit depth picture_copy converts */
+     * multiple of the SIMD groups; every bit depth picture_copy converts */
     static const unsigned sizes[][2] = { { 176, 176 }, { 177, 181 }, { 357, 241 } };
     static const unsigned depths[] = { 8, 10, 12, 16 };
     vmaf_init_cpu();
@@ -335,7 +335,7 @@ static char *test_chroma_scores_are_their_planes_as_luma()
 char *run_tests()
 {
     mu_run_test(test_stripes_are_one_ssim_pass);
-    mu_run_test(test_avx2_ms_ssim_is_the_c_ms_ssim);
+    mu_run_test(test_simd_ms_ssim_is_the_c_ms_ssim);
     mu_run_test(test_row_decimation_is_the_scalar_decimation);
     mu_run_test(test_picture_path_is_the_float_path);
     mu_run_test(test_chroma_scores_are_their_planes_as_luma);

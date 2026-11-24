@@ -81,15 +81,17 @@ static unsigned next_random(unsigned *seed)
     return *seed >> 8;
 }
 
-/* libvmaf-fast: the SIMD dE00 (x86/ciede_avx2.c, where the CPU has AVX2) is
- * the scalar one but for rare last-bit differences of its own atan2, sin,
- * cos, exp and powers: colours near each other (a lossy video's error), far
- * apart, greys and identical pairs, 10-bit. */
+/* libvmaf-fast: the SIMD dE00 (x86/ciede_avx2.c or arm64/ciede_neon.c, where
+ * the CPU has AVX2 or NEON) is the scalar one but for rare last-bit
+ * differences of its own atan2, sin, cos, exp and powers: colours near each
+ * other (a lossy video's error), far apart, greys and identical pairs,
+ * 10-bit. */
 static char *test_simd_matches_scalar()
 {
     CiedeState s = { 0 };
     VmafFeatureExtractor fex = { .priv = &s };
     enum { N = 20000 };
+    vmaf_init_cpu();
     mu_assert("init failed", !init(&fex, VMAF_PIX_FMT_YUV444P, 10, N, 1));
     if (!s.ciede2000_simd) {  // no SIMD on this CPU
         close(&fex);

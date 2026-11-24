@@ -675,7 +675,8 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
 
 // For bitdepths <= 8.
 /* libvmaf-fast: the preprocessing below works row by row, with the AVX2
- * rows (x86/cambi_avx2.c) where the CPU has AVX2: the same values. */
+ * rows (x86/cambi_avx2.c) or the NEON rows (arm64/cambi_neon.c) where the
+ * CPU has them: the same values. */
 typedef struct PreprocessRows {
     void (*u8_to_10b)(const uint8_t *src, uint16_t *dst, int width, int shift);
     void (*u16_shl)(const uint16_t *src, uint16_t *dst, int width, int shift);
@@ -721,6 +722,12 @@ static PreprocessRows preprocess_rows(void) {
         rows = (PreprocessRows){ cambi_u8_to_10b_row_avx2, cambi_u16_shl_row_avx2,
                                  cambi_u16_round_shr_row_avx2, cambi_max_row_avx2,
                                  cambi_anti_dither_row_avx2 };
+    }
+#elif ARCH_AARCH64
+    if (vmaf_get_cpu_flags() & VMAF_ARM_CPU_FLAG_NEON) {
+        rows = (PreprocessRows){ cambi_u8_to_10b_row_neon, cambi_u16_shl_row_neon,
+                                 cambi_u16_round_shr_row_neon, cambi_max_row_neon,
+                                 cambi_anti_dither_row_neon };
     }
 #endif
     return rows;
@@ -1287,9 +1294,13 @@ static void calculate_c_values_neon(VmafPicture *pic, const VmafPicture *mask_pi
 
 static double average_topk_elements(const float *arr, int topk_elements) {
 #if ARCH_X86
-    /* libvmaf-fast: the same sum, skipping the 0s (x86/cambi_avx2.c) */
+    /* libvmaf-fast: the same sum, skipping the 0s (x86/cambi_avx2.c,
+     * arm64/cambi_neon.c) */
     if (vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2)
         return cambi_sum_nonzero_avx2(arr, topk_elements) / topk_elements;
+#elif ARCH_AARCH64
+    if (vmaf_get_cpu_flags() & VMAF_ARM_CPU_FLAG_NEON)
+        return cambi_sum_nonzero_neon(arr, topk_elements) / topk_elements;
 #endif
     double sum = 0;
     for (int i = 0; i < topk_elements; i++)

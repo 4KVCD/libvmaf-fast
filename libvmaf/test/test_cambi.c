@@ -768,7 +768,7 @@ static int random_picture(VmafPicture *pic, unsigned bpc, unsigned w, unsigned h
     return 0;
 }
 
-/* cambi_preprocessing with the AVX2 rows and with the scalar ones (CPU flags
+/* cambi_preprocessing with the SIMD rows and with the scalar ones (CPU flags
  * masked): the same 10-bit picture or the same error. */
 static int preprocessing_matches(VmafPicture *in, unsigned out_w, unsigned out_h, int enc_bitdepth)
 {
@@ -786,7 +786,7 @@ static int preprocessing_matches(VmafPicture *in, unsigned out_w, unsigned out_h
     return same;
 }
 
-static char *test_avx2_preprocessing_is_the_scalar_preprocessing()
+static char *test_simd_preprocessing_is_the_scalar_preprocessing()
 {
     /* every same-size conversion (8-, 9-, 10-bit, rounded 12- and 16-bit),
      * the anti-dithering filter after each (enc_bitdepth 8), an odd width
@@ -821,13 +821,14 @@ static char *test_avx2_preprocessing_is_the_scalar_preprocessing()
     return NULL;
 }
 
-static char *test_avx2_topk_sum_is_the_scalar_sum()
+static char *test_simd_topk_sum_is_the_scalar_sum()
 {
     /* mostly 0 (as c-values are) and dense, with a length that leaves
      * values after the groups of 8 */
     enum { N = 1003 };
     static float arr[N];
     uint32_t state = 7;
+    vmaf_init_cpu();
     for (int dense = 0; dense < 2; dense++) {
         for (int i = 0; i < N; i++) {
             state = state * 1664525u + 1013904223u;
@@ -838,12 +839,12 @@ static char *test_avx2_topk_sum_is_the_scalar_sum()
         vmaf_set_cpu_flags_mask(0);
         double want = average_topk_elements(arr, N);
         vmaf_set_cpu_flags_mask(~0u);
-        mu_assert("the AVX2 top-k sum differs", !memcmp(&got, &want, sizeof got));
+        mu_assert("the SIMD top-k sum differs", !memcmp(&got, &want, sizeof got));
         got = average_topk_elements(arr, 5);
         vmaf_set_cpu_flags_mask(0);
         want = average_topk_elements(arr, 5);
         vmaf_set_cpu_flags_mask(~0u);
-        mu_assert("the AVX2 top-k sum of 5 differs", !memcmp(&got, &want, sizeof got));
+        mu_assert("the SIMD top-k sum of 5 differs", !memcmp(&got, &want, sizeof got));
     }
     return NULL;
 }
@@ -868,8 +869,8 @@ char *run_tests()
     mu_run_test(test_spatial_pooling);
     mu_run_test(test_quick_select);
     mu_run_test(test_average_topk_elements);
-    mu_run_test(test_avx2_topk_sum_is_the_scalar_sum);
-    mu_run_test(test_avx2_preprocessing_is_the_scalar_preprocessing);
+    mu_run_test(test_simd_topk_sum_is_the_scalar_sum);
+    mu_run_test(test_simd_preprocessing_is_the_scalar_preprocessing);
 
     mu_run_test(test_get_pixels_in_window);
     mu_run_test(test_weight_scores_per_scale);
