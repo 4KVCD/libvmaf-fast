@@ -926,6 +926,10 @@ struct vv_context {
     // in place of host memory. Vulkan imports them only on the same GPU and
     // driver (vv_shared_device).
     bool shared = false;
+    // Flag bit 1, with shared: VMAF v1's pictures to be converted
+    // (vv_v1_convert), which a decoder writes for that into the shared
+    // buffers (vv_convert_source); see enable_convert.
+    bool convertsShared = false;
     // Flag bit 3, with shared: each slot's planes in two such buffers, the
     // reference's (staging) and the distorted's (stagingDis), for two
     // decoders that each import one (vv_export_part). A driver may import an
@@ -1083,11 +1087,22 @@ struct vv_context {
     ConvertSide convertSides[2];
     bool converting = false;
     // The source pictures, both sides' planes, for each slot at k *
-    // convertSourceBytes (host-visible, written by vv_submit_v1). One buffer,
+    // convertSourceBytes (host-visible, written by vv_submit_v1; in a shared
+    // context the GPU's own, copied from the shared buffers). One buffer,
     // not one a slot: a slot is picked by its places, so that a pass needs no
     // descriptor set a slot.
     Buffer convertSource;
     uint32_t convertSourceBytes = 0;
+    // A side's planes' bytes in a slot's part of convertSource (they follow
+    // one another: the reference's, then the distorted's).
+    uint32_t convert_side_bytes(int side) const
+    {
+        return side ? convertSourceBytes - convertSides[1].planeOffset[0] : convertSides[1].planeOffset[0];
+    }
+    // In a shared context, where a side's planes start in its shared buffer
+    // (dis_buffer's for the distorted), laid out as in convertSource: in
+    // split mode each side's own buffer from 0, else both in the one.
+    uint32_t shared_source_offset(int side) const { return split ? 0 : convertSides[side].planeOffset[0]; }
     Buffer convertChroma;
     int enable_convert(const uint32_t *const plans[2], const size_t words[2]);
     int load_convert_plan(int side, const uint32_t *plan, size_t words);
@@ -1095,7 +1110,7 @@ struct vv_context {
     // The steps of the sides in `sides` (bit 0 the reference, 1 the distorted),
     // a barrier after each step of both; `stamp(shader)` after each when given.
     void record_convert(VkCommandBuffer cb, size_t slotIndex, unsigned sides, const std::function<void(int)> &stamp);
-    void write_convert_source(size_t slotIndex, int side, const uint16_t *const planes[3], const ptrdiff_t strides[3]);
+    void write_convert_source(uint8_t *base, int side, const uint16_t *const planes[3], const ptrdiff_t strides[3]);
     int test_convert(int side, const uint16_t *const planes[3], const ptrdiff_t strides[3], uint16_t *const out[3],
                      const ptrdiff_t outStrides[3]);
 
@@ -2500,7 +2515,10 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     skip = (flags >> 16) & 7;
     passLimit = (flags >> 20) & 0xFF;
     shared = (flags >> 19) & 1;
-    pictures = shared && (flags >> 2) & 1;  // (VMAF v1 only: decided below, once the device is made)
+    // A decoder's pictures to be converted (vv_v1_convert): copied out of the
+    // slots for the conversion, never read where they are.
+    convertsShared = shared && (flags >> 1) & 1;
+    pictures = shared && !convertsShared && (flags >> 2) & 1;  // (VMAF v1 only: decided below, once the device is made)
     uint32_t listedCount = 0;
     api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &listedCount, nullptr);
     std::vector<VkExtensionProperties> listed(listedCount);
@@ -2622,7 +2640,7 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // GPU's own memory (an RTX 5090's 4K 10-bit pair: the frames' copy 0.67
     // -> 0.07 ms of GPU time, SpEED's pass reading the chroma 0.24 -> 0.01).
     if (v1) {
-        direct = shared;
+        direct = shared && !convertsShared;
     } else {
         direct = direct && (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || barFrames || shared);
         barFrames = barFrames && direct;
@@ -3266,8 +3284,13 @@ int vv_context::enable_speed(const double *values)
     uint32_t inverseBits;
     memcpy(&inverseBits, &inverse, sizeof inverseBits);
     for (Slot &slot : slots) {
-        // (the planes from host memory, vv_chroma_staging: not with the pictures read where they are)
-        if (int error = create_buffer(slot.speedChroma, pictures ? 4 : (VkDeviceSize)chromaPlaneBytes * 4, true, false, true))
+        // (the planes from host memory, vv_chroma_staging: not with the pictures read where they are.
+        // Converted ones: the conversion's, written and read on the GPU, so in its own memory. A shared
+        // context has no Resizable BAR uploads, and the planes would cross PCIe twice: an RTX 5090's 4K
+        // HDR pair, convert_resize_float 0.4 -> 6.7 ms, speed_dec 0.02 -> 0.30.)
+        const VkDeviceSize chromaBytes = pictures ? 4 : (VkDeviceSize)chromaPlaneBytes * 4;
+        if (int error = convertsShared ? create_buffer(slot.speedChroma, chromaBytes, false)
+                                       : create_buffer(slot.speedChroma, chromaBytes, true, false, true))
             return error;
         if (int error = create_buffer(slot.speedKeep, operating * 4 * sizeof(float), true))
             return error;
@@ -3545,8 +3568,9 @@ int vv_context::add_convert_side(int side)
 // The HDR models' picture conversion on the GPU (vv_v1_convert).
 int vv_context::enable_convert(const uint32_t *const plans[2], const size_t words[2])
 {
-    if (!v1 || shared || pictures || direct || bpc != 16)
-        return fail(-3, "the conversion runs in a VMAF v1 context of 16 bits whose frames come through vv_submit_v1");
+    if (!v1 || pictures || direct || bpc != 16)
+        return fail(-3, "the conversion runs in a VMAF v1 context of 16 bits whose frames come through vv_submit_v1 "
+                        "or, made with flag bit 1, a decoder's copies into its shared buffers");
     if (frames || converting)
         return fail(-3, "the conversion is set once, before the first frame");
     if (ciede)  // whose pass reads the slots' planes, which the conversion leaves unused
@@ -3564,14 +3588,28 @@ int vv_context::enable_convert(const uint32_t *const plans[2], const size_t word
             convertSourceBytes += (c.planeW[p] * c.planeH[p] * 2 + 3) & ~3u;
         }
     }
-    if (int error = create_buffer(convertSource, (VkDeviceSize)slots.size() * convertSourceBytes, true, false, true))
-        return error;
-    // The staging buffers the conversion leaves unused (VMAF v1 copies them
-    // into picRef and picDis, which the conversion writes instead): 4K, two
-    // 16-bit planes, 31.6 MB a slot.
-    for (Slot &slot : slots) {
-        if (int error = remake_buffer(slot.staging, 4, true, true))
+    if (shared) {
+        // A decoder writes the source planes into the slots' shared buffers
+        // (vv_convert_source), which it imported when the context was made:
+        // they must hold them, and stay as they are. commit copies them into
+        // convertSource on the GPU (4K, both sides: 37 MB, tens of
+        // microseconds), which stays in the GPU's memory.
+        for (int side = 0; side < 2; ++side) {
+            if (shared_source_offset(side) + convert_side_bytes(side) > slots[0].staging.size)
+                return fail(-3, "the conversion's source pictures do not fit the shared buffers");
+        }
+        if (int error = create_buffer(convertSource, (VkDeviceSize)slots.size() * convertSourceBytes, false))
             return error;
+    } else {
+        if (int error = create_buffer(convertSource, (VkDeviceSize)slots.size() * convertSourceBytes, true, false, true))
+            return error;
+        // The staging buffers the conversion leaves unused (VMAF v1 copies
+        // them into picRef and picDis, which the conversion writes instead):
+        // 4K, two 16-bit planes, 31.6 MB a slot.
+        for (Slot &slot : slots) {
+            if (int error = remake_buffer(slot.staging, 4, true, true))
+                return error;
+        }
     }
     if (!speed) {  // the chroma's target, which only SpEED reads
         const VkDeviceSize chromaPlane = (VkDeviceSize)chroma_stride_bytes(w) * (uint32_t)(h / 2);
@@ -3619,13 +3657,12 @@ void vv_context::record_convert(VkCommandBuffer cb, size_t slotIndex, unsigned s
     }
 }
 
-// A side's source picture into slot `slotIndex`'s part of convertSource,
-// rows packed.
-void vv_context::write_convert_source(size_t slotIndex, int side, const uint16_t *const planes[3],
+// A side's source picture into a slot's part of convertSource (or memory laid
+// out as one) at `base`, rows packed.
+void vv_context::write_convert_source(uint8_t *base, int side, const uint16_t *const planes[3],
                                       const ptrdiff_t strides[3])
 {
     const ConvertSide &c = convertSides[side];
-    uint8_t *base = (uint8_t *)convertSource.mapped + slotIndex * convertSourceBytes;
     for (int p = 0; p < 3; ++p) {
         const size_t rowBytes = (size_t)c.planeW[p] * 2;
         for (uint32_t y = 0; y < c.planeH[p]; ++y)
@@ -3645,17 +3682,34 @@ int vv_context::test_convert(int side, const uint16_t *const planes[3], const pt
         if (int error = collect(slot))
             return error;
     }
-    write_convert_source(0, side, planes, strides);
+    // In a shared context convertSource is the GPU's own: the picture goes
+    // through host memory of its own, copied into slot 0's part.
+    Buffer upload;
+    if (!convertSource.mapped) {
+        if (int error = create_buffer(upload, convertSourceBytes, true, false, true)) {
+            destroy_last_buffer(upload);
+            return error;
+        }
+    }
+    write_convert_source(upload.mapped ? (uint8_t *)upload.mapped : (uint8_t *)convertSource.mapped, side, planes,
+                         strides);
     const uint32_t chromaStride = chroma_stride_bytes(w), chromaPlane = chromaStride * (uint32_t)(h / 2);
     Buffer back;
     if (int error = create_buffer(back, (VkDeviceSize)planeBytes + 2ull * chromaPlane, true)) {
         destroy_last_buffer(back);
+        if (upload.mapped)
+            destroy_last_buffer(upload);
         return error;
     }
     VkCommandBuffer cb = slots[0].commands;
     VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk.vkBeginCommandBuffer(cb, &begin);
+    if (upload.mapped) {
+        const VkBufferCopy whole = { 0, 0, convertSourceBytes };
+        vk.vkCmdCopyBuffer(cb, upload.buffer, convertSource.buffer, 1, &whole);
+        barrier(vk, cb, kTransfer, kCompute);
+    }
     record_convert(cb, 0, 1u << side, nullptr);
     barrier(vk, cb, kCompute, kTransfer);
     const VkBufferCopy luma = { 0, 0, planeBytes };
@@ -3679,6 +3733,8 @@ int vv_context::test_convert(int side, const uint16_t *const planes[3], const pt
         }
     }
     destroy_last_buffer(back);
+    if (upload.mapped)
+        destroy_last_buffer(upload);
     return result == VK_SUCCESS ? 0 : fail(-5, "the conversion on the GPU failed (" + std::to_string(result) + ")");
 }
 
@@ -4194,6 +4250,15 @@ int vv_context::commit(bool score)
             copy.srcOffset = disOffset;
             vk.vkCmdCopyBuffer(cb, dis_buffer(slot).buffer, picDis.buffer, 1, &copy);
         }
+    } else if (shared && converting) {
+        // The source pictures the decoder wrote into the shared buffers
+        // (vv_convert_source), into the slot's part of convertSource.
+        for (int side = 0; side < (score ? 2 : 1); ++side) {
+            const VkBufferCopy copy = { shared_source_offset(side),
+                                        slotIndex * convertSourceBytes + convertSides[side].planeOffset[0],
+                                        convert_side_bytes(side) };
+            vk.vkCmdCopyBuffer(cb, (side ? dis_buffer(slot) : slot.staging).buffer, convertSource.buffer, 1, &copy);
+        }
     } else if (shared) {
         // A plane the CPU wrote (vv_shared_host_plane) goes where the decoder
         // writes the other: the reference's at 0, the distorted's at disOffset.
@@ -4220,8 +4285,12 @@ int vv_context::commit(bool score)
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
     const std::vector<Pass> *lists[5] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
                                           score && cambi ? &slot.cambiKeepPasses : nullptr,
-                                          score && speed ? (slot.chromaFromHost ? &slot.speedPassesHost
-                                                                                : &slot.speedPasses) : nullptr,
+                                          // (shared and converting: from speedChroma, which the conversion
+                                          // writes; without shared, speedPasses read it)
+                                          score && speed ? (slot.chromaFromHost || (shared && converting)
+                                                                ? &slot.speedPassesHost
+                                                                : &slot.speedPasses)
+                                                         : nullptr,
                                           score && ciede ? &slot.ciedePasses : nullptr };
     if (shared)
         slot.chromaFromHost = false;  // the next frame's: from staging unless vv_chroma_staging says
@@ -4679,7 +4748,10 @@ VV_EXPORT int vv_device(int index, char *name, int nameBytes, uint32_t *vendor, 
 // N passes of VIF and ADM, to time the others. Bit 19: the frames come from
 // GPU memory a decoder shares (vv_shared_next, vv_export); with it, bit 2:
 // VMAF v1's pictures read where the decoder left them (vv_pictures, where
-// the context can: vv_pictures_mode). Bits 28-30: the scale-0 decouple
+// the context can: vv_pictures_mode), bit 3: each slot's planes in two
+// buffers, one for each decoder (vv_export_part), and bit 1: VMAF v1's
+// pictures to be converted (vv_v1_convert, vv_convert_source), copied out
+// of the slots rather than read there. Bits 28-30: the scale-0 decouple
 // shader's VARIANT, for the diagnosis.
 VV_EXPORT int vv_create(vv_context **out, int device, int width, int height, int bitDepth, int flags)
 {
@@ -5013,8 +5085,9 @@ VV_EXPORT int vv_submit_v1(vv_context *context, const uint8_t *const *planes, co
 // frame: plans[0] the reference's, plans[1] the distorted's, as
 // vmaf_picture_convert_gpu_plan gives them (words[i] 32-bit words each).
 // Its frames then go in with vv_submit_v1 as the source pictures (4:2:0,
-// more than 8 bits). -4 for a plan it does not run (the caller then
-// converts on the CPU).
+// more than 8 bits), or, in a context made with flag bits 19 and 1, a
+// decoder copies them into the shared buffers (vv_convert_source). -4 for a plan it
+// does not run (the caller then converts on the CPU).
 VV_EXPORT int vv_v1_convert(vv_context *context, const uint32_t *const *plans, const size_t *words)
 {
     return context->enable_convert(plans, words);
@@ -5031,6 +5104,28 @@ VV_EXPORT int vv_test_convert(vv_context *context, int side, const uint16_t *con
     return context->test_convert(side, planes, strides, out, outStrides);
 }
 
+// For a context made with flag bit 19 (frames from GPU memory) that converts
+// its pictures (vv_v1_convert): where in each slot's shared buffer a decoder
+// writes a side's source plane (`side` 0 the reference, 1 the distorted;
+// `plane` 0 Y, 1 U, 2 V) -- from *offset, *width x *height 16-bit samples,
+// rows packed (*width * 2 bytes apart). In split mode (flag bit 3) in the
+// side's own buffer (vv_export_part's part `side`), else in the one. Its
+// frames are then begun with vv_shared_next and committed with vv_commit or
+// vv_commit_after, as a context that does not convert.
+VV_EXPORT int vv_convert_source(vv_context *context, int side, int plane, uint64_t *offset, uint32_t *width,
+                                uint32_t *height)
+{
+    if (!context->shared || !context->converting)
+        return fail(-3, "no converted pictures in the shared buffers");
+    if (side < 0 || side > 1 || plane < 0 || plane > 2)
+        return fail(-3, "no such plane");
+    const vv_context::ConvertSide &c = context->convertSides[side];
+    *offset = context->shared_source_offset(side) + c.planeOffset[plane] - c.planeOffset[0];
+    *width = c.planeW[plane];
+    *height = c.planeH[plane];
+    return 0;
+}
+
 // For a frame begun with vv_staging or vv_shared_next, in a context with
 // SpEED: where its four chroma planes go before vv_commit -- the reference's
 // U and V, then the distorted's, at planes[0..3], rows *stride bytes apart
@@ -5043,8 +5138,8 @@ VV_EXPORT int vv_chroma_staging(vv_context *context, uint8_t **planes, uint32_t 
         return fail(-3, "no frame was started");
     if (context->pictures)
         return fail(-3, "this context reads the pictures where a decoder left them (vv_pictures)");
-    if (context->converting)
-        return fail(-3, "this context converts its pictures: they go in with vv_submit_v1");
+    if (context->converting || context->convertsShared)
+        return fail(-3, "this context converts its pictures: their chroma is the conversion's");
     uint8_t *chroma = (uint8_t *)context->pending->speedChroma.mapped;
     for (int i = 0; i < 4; ++i)
         planes[i] = chroma + (size_t)i * context->chromaPlaneBytes;
@@ -5070,6 +5165,8 @@ VV_EXPORT int vv_shared_host_plane(vv_context *context, int which, uint8_t **pla
         return fail(-3, "no frame was started");
     if (context->pictures)
         return fail(-3, "this context reads the pictures where a decoder left them (vv_pictures)");
+    if (context->converting)
+        return fail(-3, "this context converts its pictures: a decoder writes them (vv_convert_source)");
     Slot &slot = *context->pending;
     if (!slot.hostPlane[which].mapped) {  // made at its first use: most pairs never need it
         if (int error = context->create_buffer(slot.hostPlane[which], context->planeBytes, true, false, true))
