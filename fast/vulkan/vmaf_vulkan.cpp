@@ -806,6 +806,7 @@ private:
                 job = std::move(queue.front());
                 queue.pop_front();
             }
+            done.notify_all();  // room in the queue: a buffer() waiting goes on now, not after this job
             run_job(job);
             std::lock_guard<std::mutex> lock(mutex);
             --pending;
