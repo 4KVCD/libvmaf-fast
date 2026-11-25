@@ -17,8 +17,8 @@
  */
 
 /*
- * libvmaf-fast: psnr_hvs scores 8 blocks at a time with AVX2. Its scores
- * must be the scalar code's to the last bit.
+ * libvmaf-fast: psnr_hvs scores 8 blocks at a time with AVX2, 4 with NEON.
+ * Its scores must be the scalar code's to the last bit.
  */
 
 #include <stdint.h>
@@ -89,7 +89,7 @@ static int run_psnr_hvs(VmafPicture *ref, VmafPicture *dis, double scores[4])
     return err;
 }
 
-static char *test_avx2_psnr_hvs_is_the_scalar_psnr_hvs()
+static char *test_simd_psnr_hvs_is_the_scalar_psnr_hvs()
 {
     /* groups of 8 blocks with blocks left over in every plane; a chroma
      * plane too narrow for one group; every bit depth psnr_hvs takes; mild
@@ -113,7 +113,7 @@ static char *test_avx2_psnr_hvs_is_the_scalar_psnr_hvs()
             vmaf_picture_unref(&ref);
             vmaf_picture_unref(&dis);
             mu_assert("psnr_hvs failed", !err);
-            mu_assert("the AVX2 psnr_hvs is not the scalar code's", !memcmp(got, want, sizeof got));
+            mu_assert("the SIMD psnr_hvs is not the scalar code's", !memcmp(got, want, sizeof got));
         }
     }
     return NULL;
@@ -121,6 +121,6 @@ static char *test_avx2_psnr_hvs_is_the_scalar_psnr_hvs()
 
 char *run_tests()
 {
-    mu_run_test(test_avx2_psnr_hvs_is_the_scalar_psnr_hvs);
+    mu_run_test(test_simd_psnr_hvs_is_the_scalar_psnr_hvs);
     return NULL;
 }

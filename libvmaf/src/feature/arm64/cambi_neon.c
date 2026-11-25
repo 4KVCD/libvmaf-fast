@@ -329,3 +329,113 @@ void calculate_c_values_row_neon(
                              v_band_size)
             : 0.0f;
 }
+
+/* cambi.c's preprocessing rows (the same-size conversions to 10 bits, the
+ * validation's maximum, the anti-dithering filter) and the top-k sum, 8
+ * samples at a time with the scalar code's values (x86/cambi_avx2.c's rows). */
+
+/* src << shift, 8-bit samples to 16. */
+void cambi_u8_to_10b_row_neon(const uint8_t *src, uint16_t *dst, int width, int shift)
+{
+    const int16x8_t count = vdupq_n_s16((int16_t)shift);
+    int j = 0;
+    for (; j + 8 <= width; j += 8) {
+        const uint8x8_t v = vld1_u8(src + j);
+        vst1q_u16(dst + j, vshlq_u16(vmovl_u8(v), count));
+    }
+    for (; j < width; j++)
+        dst[j] = src[j] << shift;
+}
+
+/* src << shift (9-bit samples, below 2^15). */
+void cambi_u16_shl_row_neon(const uint16_t *src, uint16_t *dst, int width, int shift)
+{
+    const int16x8_t count = vdupq_n_s16((int16_t)shift);
+    int j = 0;
+    for (; j + 8 <= width; j += 8) {
+        const uint16x8_t v = vld1q_u16(src + j);
+        vst1q_u16(dst + j, vshlq_u16(v, count));
+    }
+    for (; j < width; j++)
+        dst[j] = src[j] << shift;
+}
+
+/* (src + (1 << (shift - 1))) >> shift for shift >= 1: the rounding shift
+ * right (a negative count), which adds the offset without the 16-bit
+ * overflow a 16-bit sample plus the offset would have, as the scalar int. */
+void cambi_u16_round_shr_row_neon(const uint16_t *src, uint16_t *dst, int width, int shift)
+{
+    const int16x8_t count = vdupq_n_s16((int16_t)-shift);
+    int j = 0;
+    for (; j + 8 <= width; j += 8) {
+        const uint16x8_t v = vld1q_u16(src + j);
+        vst1q_u16(dst + j, vrshlq_u16(v, count));
+    }
+    for (; j < width; j++)
+        dst[j] = (src[j] + (1 << (shift - 1))) >> shift;
+}
+
+/* The largest sample of a row, two running maxima for 16 samples a step. */
+uint16_t cambi_max_row_neon(const uint16_t *row, int width)
+{
+    uint16x8_t max0 = vdupq_n_u16(0);
+    uint16x8_t max1 = vdupq_n_u16(0);
+    int j = 0;
+    for (; j + 16 <= width; j += 16) {
+        const uint16x8_t v0 = vld1q_u16(row + j);
+        const uint16x8_t v1 = vld1q_u16(row + j + 8);
+        max0 = vmaxq_u16(max0, v0);
+        max1 = vmaxq_u16(max1, v1);
+    }
+    uint16_t best = vmaxvq_u16(vmaxq_u16(max0, max1));
+    for (; j < width; j++)
+        best = row[j] > best ? row[j] : best;
+    return best;
+}
+
+/* The anti-dithering filter's outputs [0, width - 1) of a row, in place:
+ * each is the mean of a 2x2 square, which reads row[j], row[j + 1] and the
+ * row below, none of them written yet (the outputs before j wrote only
+ * row[0..j)), so 8 at a time give the scalar loop's values. The samples are
+ * 10-bit (at most 1023), so the 16-bit sums do not overflow. */
+void cambi_anti_dither_row_neon(uint16_t *row, const uint16_t *below, int width)
+{
+    int j = 0;
+    for (; j + 8 < width; j += 8) {  /* reads up to row[j + 8] */
+        const uint16x8_t a = vld1q_u16(row + j);
+        const uint16x8_t b = vld1q_u16(row + j + 1);
+        const uint16x8_t c = vld1q_u16(below + j);
+        const uint16x8_t d = vld1q_u16(below + j + 1);
+        const uint16x8_t sum = vaddq_u16(vaddq_u16(a, b), vaddq_u16(c, d));
+        vst1q_u16(row + j, vshrq_n_u16(sum, 2));
+    }
+    for (; j < width - 1; j++)
+        row[j] = (row[j] + row[j + 1] + below[j] + below[j + 1]) >> 2;
+}
+
+/* The double sum of arr[0..n) in order, as the scalar loop adds it, skipping
+ * runs of 16 values that are all +0 or -0 (most c-values are 0): sum + 0.0
+ * is sum for every sum this loop can hold (it starts at +0 and never becomes
+ * -0, as only -0 terms could make it), so the other runs are added whole. A
+ * float is +-0 exactly when its bits without the sign are 0; NaN is not. */
+double cambi_sum_nonzero_neon(const float *arr, int n)
+{
+    double sum = 0;
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const float32x4_t v0 = vld1q_f32(arr + i);
+        const float32x4_t v1 = vld1q_f32(arr + i + 4);
+        const float32x4_t v2 = vld1q_f32(arr + i + 8);
+        const float32x4_t v3 = vld1q_f32(arr + i + 12);
+        const uint32x4_t bits01 = vorrq_u32(vreinterpretq_u32_f32(v0), vreinterpretq_u32_f32(v1));
+        const uint32x4_t bits23 = vorrq_u32(vreinterpretq_u32_f32(v2), vreinterpretq_u32_f32(v3));
+        const uint32x4_t bits = vorrq_u32(bits01, bits23);
+        if (vmaxvq_u32(vshlq_n_u32(bits, 1)) == 0)
+            continue;
+        for (int k = i; k < i + 16; k++)
+            sum += arr[k];
+    }
+    for (; i < n; i++)
+        sum += arr[i];
+    return sum;
+}

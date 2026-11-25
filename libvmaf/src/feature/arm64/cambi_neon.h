@@ -49,4 +49,12 @@ void calculate_c_values_row_neon(
     const int *diff_weights, const int *all_diffs,
     const float *reciprocal_lut);
 
+/* cambi.c's preprocessing rows and the top-k sum. */
+void cambi_u8_to_10b_row_neon(const uint8_t *src, uint16_t *dst, int width, int shift);
+void cambi_u16_shl_row_neon(const uint16_t *src, uint16_t *dst, int width, int shift);
+void cambi_u16_round_shr_row_neon(const uint16_t *src, uint16_t *dst, int width, int shift);
+uint16_t cambi_max_row_neon(const uint16_t *row, int width);
+void cambi_anti_dither_row_neon(uint16_t *row, const uint16_t *below, int width);
+double cambi_sum_nonzero_neon(const float *arr, int n);
+
 #endif /* ARM64_NEON_CAMBI_H_ */

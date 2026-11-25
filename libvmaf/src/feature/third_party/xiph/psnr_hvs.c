@@ -37,6 +37,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "log.h"
 #if ARCH_X86
 #include "../../x86/psnr_hvs_avx2.h"
+#elif ARCH_AARCH64
+#include "../../arm64/psnr_hvs_neon.h"
 #endif
 
 typedef int32_t od_coeff;
@@ -243,15 +245,22 @@ static double calc_psnrhvs(const unsigned char *_src, int _systride,
                          (_csf[x][y] * 0.3885746225901003);
 
 #if ARCH_X86
-    const int avx2 = !!(vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2);
+    const int simd = !!(vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2);
+#elif ARCH_AARCH64
+    const int simd = !!(vmaf_get_cpu_flags() & VMAF_ARM_CPU_FLAG_NEON);
 #endif
     for (y = 0; y < _h - 7; y += _step) {
         x = 0;
 #if ARCH_X86
-        /* libvmaf-fast: the row's blocks 8 at a time (x86/psnr_hvs_avx2.c),
-         * the same values; the last few here */
-        if (avx2)
+        /* libvmaf-fast: the row's blocks 8 at a time (x86/psnr_hvs_avx2.c)
+         * or 4 at a time (arm64/psnr_hvs_neon.c), the same values; the last
+         * few here */
+        if (simd)
             x = psnr_hvs_blocks_avx2(_src, _systride, _dst, _dystride, depth, y, _w, _step,
+                                     &mask[0][0], &_csf[0][0], &ret, &pixels);
+#elif ARCH_AARCH64
+        if (simd)
+            x = psnr_hvs_blocks_neon(_src, _systride, _dst, _dystride, depth, y, _w, _step,
                                      &mask[0][0], &_csf[0][0], &ret, &pixels);
 #endif
         for (; x < _w - 7; x += _step) {

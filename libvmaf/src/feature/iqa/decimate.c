@@ -36,6 +36,8 @@
 #include "cpu.h"
 #if ARCH_X86
 #include "../x86/decimate_avx2.h"
+#elif ARCH_AARCH64
+#include "../arm64/decimate_neon.h"
 #endif
 
 /* The largest kernel side the row decimation takes (MS-SSIM's is 9). */
@@ -50,16 +52,33 @@
  * (KBND_SYMMETRIC), which for rows means reading another real row of the
  * ring. */
 
-/* Splits a row of w floats into its even and odd samples. */
-static void deinterleave(const float *row, int w, float *even, float *odd, int avx2)
+/* Whether the CPU runs the SIMD rows below (AVX2 or NEON). */
+static int simd_rows(void)
 {
 #if ARCH_X86
-    if (avx2) {
+    return !!(vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2);
+#elif ARCH_AARCH64
+    return !!(vmaf_get_cpu_flags() & VMAF_ARM_CPU_FLAG_NEON);
+#else
+    return 0;
+#endif
+}
+
+/* Splits a row of w floats into its even and odd samples. */
+static void deinterleave(const float *row, int w, float *even, float *odd, int simd)
+{
+#if ARCH_X86
+    if (simd) {
         iqa_deinterleave_avx2(row, w, even, odd);
         return;
     }
+#elif ARCH_AARCH64
+    if (simd) {
+        iqa_deinterleave_neon(row, w, even, odd);
+        return;
+    }
 #endif
-    (void)avx2;
+    (void)simd;
     for (int i = 0; i < w; ++i) {
         if (i & 1)
             odd[i / 2] = row[i];
@@ -141,11 +160,7 @@ int _iqa_decimate2_rows(iqa_row_fn row_fn, void *ctx, int w, int h,
     int ring_row[MAX_KH];  /* the input row each ring slot holds */
     for (int i = 0; i < kh; ++i)
         ring_row[i] = -1;
-#if ARCH_X86
-    const int avx2 = !!(vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2);
-#else
-    const int avx2 = 0;
-#endif
+    const int simd = simd_rows();
 
     const int x_lo = (uc + 1) / 2;  /* the first x with 2x - uc >= 0 */
     /* the end of the x with 2x + uc <= w - 1 */
@@ -161,7 +176,7 @@ int _iqa_decimate2_rows(iqa_row_fn row_fn, void *ctx, int w, int h,
             const int slot = r % kh;
             float *e = ring + (size_t)slot * 2 * half;
             if (ring_row[slot] != r) {
-                deinterleave(row_fn(ctx, r, scratch), w, e, e + half, avx2);
+                deinterleave(row_fn(ctx, r, scratch), w, e, e + half, simd);
                 ring_row[slot] = r;
             }
             even[v] = e;
@@ -172,8 +187,11 @@ int _iqa_decimate2_rows(iqa_row_fn row_fn, void *ctx, int w, int h,
         for (; x < x_lo; ++x)
             out[x] = edge_pixel(even, odd, k, w, x);
 #if ARCH_X86
-        if (avx2)
+        if (simd)
             x = iqa_decimate2_row_avx2(even, odd, k->kernel, k->w, kh, x, x_hi, out);
+#elif ARCH_AARCH64
+        if (simd)
+            x = iqa_decimate2_row_neon(even, odd, k->kernel, k->w, kh, x, x_hi, out);
 #endif
         inner_pixels(even, odd, k, x, x_hi, out);
         for (x = x_hi; x < sw; ++x)
@@ -209,16 +227,14 @@ int _iqa_decimate(float *img, int w, int h, int factor, const struct _kernel *k,
     if (result)
         dst = result;
 
-#if ARCH_X86
     /* libvmaf-fast: MS-SSIM's factor-2 decimation into another buffer, with
-     * AVX2 (x86/decimate_avx2.c). In place, a pixel's taps can read outputs
-     * already written, which only the scalar loop reproduces. */
+     * AVX2 or NEON (x86/decimate_avx2.c, arm64/decimate_neon.c). In place, a
+     * pixel's taps can read outputs already written, which only the scalar
+     * loop reproduces. */
     struct float_rows rows = { img, w };
-    if (factor == 2 && result && result != img &&
-        (vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2) &&
+    if (factor == 2 && result && result != img && simd_rows() &&
         !_iqa_decimate2_rows(float_row, &rows, w, h, k, dst, rw, rh))
         return 0;
-#endif
 
     /* Downsample */
     for (y=0; y<sh; ++y) {

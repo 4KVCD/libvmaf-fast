@@ -56,6 +56,8 @@ SOFTWARE.
 #include "opt.h"
 #if ARCH_X86
 #include "x86/ciede_avx2.h"
+#elif ARCH_AARCH64
+#include "arm64/ciede_neon.h"
 #endif
 
 // The Lab colours of recently seen (y, u, v) triplets, direct-mapped: on
@@ -82,7 +84,8 @@ typedef struct CiedeState {
     float *row_lab[6];
     float *row_de00;
     // dE00 of a row's whole fours of pixels where the CPU has SIMD
-    // (x86/ciede_avx2.c), else NULL; the scalar ciede2000 does the rest.
+    // (x86/ciede_avx2.c, arm64/ciede_neon.c), else NULL; the scalar
+    // ciede2000 does the rest.
     void (*ciede2000_simd)(const float *const lab[6], unsigned n, float k25_7, float *de00);
 } CiedeState;
 
@@ -164,6 +167,9 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
 #if ARCH_X86
     if (vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2)
         s->ciede2000_simd = ciede2000_avx2;
+#elif ARCH_AARCH64
+    if (vmaf_get_cpu_flags() & VMAF_ARM_CPU_FLAG_NEON)
+        s->ciede2000_simd = ciede2000_neon;
 #endif
 
     if (pix_fmt != VMAF_PIX_FMT_YUV422P)
