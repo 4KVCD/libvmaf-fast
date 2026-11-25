@@ -51,11 +51,13 @@
  */
 
 /*
- * libvmaf-fast: copied unchanged from VMAFx (github.com/VMAFx/vmafx, commit
+ * libvmaf-fast: copied from VMAFx (github.com/VMAFx/vmafx, commit
  * 1ed4affa, core/src/feature/x86/convolve_avx2.c) but for VMAF_ASSERT_DEBUG,
- * which is assert() here, and for pictures smaller than the kernel, which
- * have no output here as in the scalar filter (VMAFx asserted). The ADR and research notes named above are in
- * that repository. Called from iqa/convolve.c's _iqa_convolve.
+ * which is assert() here, for pictures smaller than the kernel, which
+ * have no output here as in the scalar filter (VMAFx asserted), and for
+ * taps16_avx2, which makes 16 outputs at a time with the same operations.
+ * The ADR and research notes named above are in that repository. Called
+ * from iqa/convolve.c's _iqa_convolve.
  */
 
 #include <assert.h>
@@ -119,13 +121,48 @@ static inline __m256d h_tap4_masked_avx2(const float *img_row, int kx, int uc, i
 }
 
 /*
- * One row of the horizontal pass: SIMD inner loop (4 output pixels per
- * iteration) plus a masked 4-lane tail covering 1..3 remaining columns.
+ * libvmaf-fast: 16 outputs at once, dst[0..15]: output i is the sum over the
+ * taps t of first[t * step + i] * k[t], made as h_tap4_avx2 and v_tap4_avx2
+ * make it (the float product, widened, added to a double in tap order,
+ * rounded to float at the store). With their one accumulator, each double
+ * add waits for the one before it; four independent accumulators keep the
+ * adder busy, as decimate_avx2.c does (about 1.5x the outputs a second).
+ * Each output's operations and their order are unchanged, so every output
+ * is the same. step is 1 for the horizontal pass, a row for the vertical.
+ */
+static inline void taps16_avx2(const float *first, ptrdiff_t step, int taps, const float *k,
+                               float *dst)
+{
+    __m256d a0 = _mm256_setzero_pd(), a1 = a0, a2 = a0, a3 = a0;
+    for (int t = 0; t < taps; ++t) {
+        const float *in = first + t * step;
+        const __m128 coeff_f = _mm_set1_ps(k[t]);
+        a0 = _mm256_add_pd(_mm256_cvtps_pd(_mm_mul_ps(_mm_loadu_ps(in), coeff_f)), a0);
+        a1 = _mm256_add_pd(_mm256_cvtps_pd(_mm_mul_ps(_mm_loadu_ps(in + 4), coeff_f)), a1);
+        a2 = _mm256_add_pd(_mm256_cvtps_pd(_mm_mul_ps(_mm_loadu_ps(in + 8), coeff_f)), a2);
+        a3 = _mm256_add_pd(_mm256_cvtps_pd(_mm_mul_ps(_mm_loadu_ps(in + 12), coeff_f)), a3);
+    }
+    _mm_storeu_ps(dst, _mm256_cvtpd_ps(a0));
+    _mm_storeu_ps(dst + 4, _mm256_cvtpd_ps(a1));
+    _mm_storeu_ps(dst + 8, _mm256_cvtpd_ps(a2));
+    _mm_storeu_ps(dst + 12, _mm256_cvtpd_ps(a3));
+}
+
+/*
+ * One row of the horizontal pass: SIMD inner loops (16, then 4 output
+ * pixels per iteration) plus a masked 4-lane tail covering 1..3 remaining
+ * columns.
  */
 static void h_row_avx2(const float *img_row, float *cache_row, int uc, int kw_even, int dst_w,
                        int dst_w_simd, const float *kh)
 {
-    for (int x = 0; x < dst_w_simd; x += 4) {
+    const int taps = 2 * uc + 1 - kw_even; /* u = -uc .. uc - kw_even */
+    int x = 0;
+    for (; x + 16 <= dst_w_simd; x += 16) {
+        const int kx = x + uc;
+        taps16_avx2(img_row + kx - uc, 1, taps, kh, cache_row + kx);
+    }
+    for (; x < dst_w_simd; x += 4) {
         const int kx = x + uc;
         const __m256d acc = h_tap4_avx2(img_row, kx, uc, kw_even, kh);
         _mm_storeu_ps(cache_row + kx, _mm256_cvtpd_ps(acc));
@@ -208,12 +245,19 @@ static inline __m256d v_tap4_masked_avx2(const float *img_cache, int w, int ky, 
 }
 
 /*
- * One row of the vertical pass: SIMD inner loop plus masked 4-lane tail.
+ * One row of the vertical pass: SIMD inner loops (16, then 4 output pixels
+ * per iteration) plus masked 4-lane tail.
  */
 static void v_row_avx2(const float *img_cache, float *dst_row, int w, int ky, int uc, int vc,
                        int kh_even, int dst_w, int dst_w_simd, const float *kv)
 {
-    for (int x = 0; x < dst_w_simd; x += 4) {
+    const int taps = 2 * vc + 1 - kh_even; /* v = -vc .. vc - kh_even */
+    const float *first_row = img_cache + (ptrdiff_t)(ky - vc) * (ptrdiff_t)w;
+    int x = 0;
+    for (; x + 16 <= dst_w_simd; x += 16) {
+        taps16_avx2(first_row + x + uc, w, taps, kv, dst_row + x);
+    }
+    for (; x < dst_w_simd; x += 4) {
         const int kx = x + uc;
         const __m256d acc = v_tap4_avx2(img_cache, w, ky, kx, vc, kh_even, kv);
         _mm_storeu_ps(dst_row + x, _mm256_cvtpd_ps(acc));
