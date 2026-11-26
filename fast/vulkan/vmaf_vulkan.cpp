@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -73,7 +74,8 @@
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) \
     X(vkGetPhysicalDeviceFeatures) X(vkGetPhysicalDeviceMemoryProperties) \
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) \
-    X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceProperties2)
+    X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceProperties2) \
+    X(vkGetPhysicalDeviceMemoryProperties2)
 
 #define VK_DEVICE_FUNCTIONS(X) \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) \
@@ -108,6 +110,10 @@ struct DeviceApi {
 };
 
 thread_local std::string g_error;
+
+// The bytes of buffers meant for a GPU's own memory that went in other memory, that being full (create_buffer's last
+// choice), in every context of the process (vv_memory).
+std::atomic<uint64_t> g_spilled{0};
 
 int fail(int code, const std::string &message)
 {
@@ -457,6 +463,8 @@ struct Buffer {
     VkDeviceSize allocation = 0;  // of its memory, which another API imports by that size
     uint32_t memoryType = 0;      // which another API on Vulkan imports it as
     void *mapped = nullptr;
+    // A buffer meant for the GPU's own memory that went in other memory, the GPU's being full (vv_memory).
+    bool spilled = false;
 };
 
 struct Pipeline {
@@ -1185,6 +1193,7 @@ struct vv_context {
     // `upload`: host memory the CPU only writes and the GPU reads (frames' planes).
     int create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool exported = false, bool upload = false);
     void destroy_last_buffer(Buffer &buffer);
+    void free_buffer(Buffer &buffer);
     // A buffer made again at another size, before any pass binds it.
     int remake_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool upload);
     VkPipeline find_pipeline(int shader, const std::vector<uint32_t> &words) const;
@@ -1334,12 +1343,8 @@ vv_context::~vv_context()
         if (picture.image) vk.vkDestroyImage(device, picture.image, nullptr);
         if (picture.memory) vk.vkFreeMemory(device, picture.memory, nullptr);
     }
-    for (Buffer *buffer : buffers) {
-        if (buffer->buffer)
-            vk.vkDestroyBuffer(device, buffer->buffer, nullptr);
-        if (buffer->memory)
-            vk.vkFreeMemory(device, buffer->memory, nullptr);
-    }
+    for (Buffer *buffer : buffers)
+        free_buffer(*buffer);
     for (Imported &texture : imported) {
         if (texture.image) vk.vkDestroyImage(device, texture.image, nullptr);
         if (texture.memory) vk.vkFreeMemory(device, texture.memory, nullptr);
@@ -1432,6 +1437,11 @@ int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisibl
     }
     buffer.allocation = requirements.size;
     buffer.memoryType = (uint32_t)type;
+    // A device buffer outside the GPU's own memory: that was full (staging is host memory by design).
+    buffer.spilled = !upload && !hostVisible
+                     && !(memoryProperties.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (buffer.spilled)
+        g_spilled += buffer.allocation;
     if (vk.vkBindBufferMemory(device, buffer.buffer, buffer.memory, 0) != VK_SUCCESS)
         return fail(-1, "vkBindBufferMemory failed");
     if (hostVisible && vk.vkMapMemory(device, buffer.memory, 0, VK_WHOLE_SIZE, 0, &buffer.mapped) != VK_SUCCESS)
@@ -1444,20 +1454,25 @@ int vv_context::create_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisibl
 // it makes, for its destructor, and such a buffer is the caller's local.
 void vv_context::destroy_last_buffer(Buffer &buffer)
 {
-    if (buffer.buffer)
-        vk.vkDestroyBuffer(device, buffer.buffer, nullptr);
-    if (buffer.memory)
-        vk.vkFreeMemory(device, buffer.memory, nullptr);
+    free_buffer(buffer);
     buffer = Buffer();
     buffers.pop_back();
 }
 
-int vv_context::remake_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool upload)
+// Destroys a buffer and frees its memory, which it no longer counts as spilled.
+void vv_context::free_buffer(Buffer &buffer)
 {
     if (buffer.buffer)
         vk.vkDestroyBuffer(device, buffer.buffer, nullptr);
     if (buffer.memory)
         vk.vkFreeMemory(device, buffer.memory, nullptr);
+    if (buffer.spilled)
+        g_spilled -= buffer.allocation;
+}
+
+int vv_context::remake_buffer(Buffer &buffer, VkDeviceSize size, bool hostVisible, bool upload)
+{
+    free_buffer(buffer);
     buffer = Buffer();
     const int error = create_buffer(buffer, size, hostVisible, false, upload);
     buffers.pop_back();  // listed once already, from when it was first made
@@ -4972,6 +4987,44 @@ VV_EXPORT const char *vv_error() { return g_error.c_str(); }
 #define VV_COMMIT "unknown"
 #endif
 VV_EXPORT const char *vv_version() { return VV_COMMIT; }
+
+// GPU `device`'s memory (vv_device's index) that this process uses and may use, summed over its own heaps
+// (VK_EXT_memory_budget: the process's use, and the driver's budget, which the OS lowers as other programs need the
+// memory), and the bytes of the process's buffers that had to go in other memory, the GPU's being full. Windows
+// rarely refuses the GPU's own memory (it pages it out instead), so `used` above `budget` is the usual sign of work
+// too big for the GPU. Returns 0, or -1 where the driver reports no budget. Any thread may call it.
+VV_EXPORT int vv_memory(int device, uint64_t *used, uint64_t *budget, uint64_t *spilled)
+{
+    InstanceApi *api = instance_api();
+    if (!api || !api->vkGetPhysicalDeviceMemoryProperties2)
+        return -1;
+    const std::vector<VkPhysicalDevice> devices = physical_devices(api);
+    if (device < 0 || device >= (int)devices.size())
+        return -1;
+    const VkPhysicalDevice physical = devices[(size_t)device];
+    uint32_t count = 0;
+    api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> listed(count);
+    api->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, listed.data());
+    const bool reported = std::any_of(listed.begin(), listed.begin() + count, [](const VkExtensionProperties &e) {
+        return strcmp(e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0;
+    });
+    if (!reported)
+        return -1;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT heaps = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+    VkPhysicalDeviceMemoryProperties2 properties = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2 };
+    properties.pNext = &heaps;
+    api->vkGetPhysicalDeviceMemoryProperties2(physical, &properties);
+    *used = *budget = 0;
+    for (uint32_t heap = 0; heap < properties.memoryProperties.memoryHeapCount; ++heap) {
+        if (properties.memoryProperties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            *used += heaps.heapUsage[heap];
+            *budget += heaps.heapBudget[heap];
+        }
+    }
+    *spilled = g_spilled;
+    return 0;
+}
 
 // The next frame pair's luma planes (16-bit little-endian samples above 8
 // bits). `score` 0: only motion is calculated for the frame (libvmaf's
