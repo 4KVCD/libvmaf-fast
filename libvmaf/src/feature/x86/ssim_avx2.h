@@ -32,4 +32,15 @@ void ssim_accumulate_avx2(const float *ref_mu, const float *cmp_mu, const float 
                           float C2, float C3, double *ssim_sum, double *l_sum, double *c_sum,
                           double *s_sum);
 
+/* libvmaf-fast: ssim_accumulate_avx2 in two steps, the same sums. The terms
+ * of each pixel (l and c in double, s as the float it is) can be made on
+ * any thread; adding them, in pixel order, is the only part that has to
+ * follow the pixels before. */
+void ssim_terms_avx2(const float *ref_mu, const float *cmp_mu, const float *ref_sigma_sqd,
+                     const float *cmp_sigma_sqd, const float *sigma_both, int n, float C1,
+                     float C2, float C3, double *l, double *c, float *s);
+
+void ssim_add_terms_avx2(const double *l, const double *c, const float *s, int n,
+                         double *ssim_sum, double *l_sum, double *c_sum, double *s_sum);
+
 #endif /* X86_AVX2_SSIM_H_ */

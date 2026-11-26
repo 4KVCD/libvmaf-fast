@@ -44,6 +44,7 @@
 #include "log.h"
 #include "model.h"
 #include "output.h"
+#include "parallel.h"
 #include "picture.h"
 #include "predict.h"
 #include "thread_pool.h"
@@ -1540,6 +1541,11 @@ int vmaf_score_pooled_model_collection(VmafContext *vmaf,
 const char *vmaf_version(void)
 {
     return VMAF_VERSION;
+}
+
+int vmaf_set_helper_threads(unsigned helpers)
+{
+    return vmaf_parallel_set_helpers(helpers);
 }
 
 int vmaf_write_output(VmafContext *vmaf, const char *output_path,

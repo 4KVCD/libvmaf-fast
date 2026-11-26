@@ -33,12 +33,9 @@
  * sigma_ref_sigma_cmp, l_den and c_den the denominators of l and c, sv_f =
  * s): l and c in double, as the scalar code's 2.0 makes them, and the four
  * sums in the scalar code's order. */
-static inline void ssim_accumulate_lane(float rm, float cm, float srsc, float l_den, float c_den,
-                                        float sv_f, float C1, float C2, double *local_ssim,
+static inline void ssim_accumulate_lane(double l, double c, float sv_f, double *local_ssim,
                                         double *local_l, double *local_c, double *local_s)
 {
-    const double l = (2.0 * rm * cm + C1) / l_den;
-    const double c = (2.0 * srsc + C2) / c_den;
     const double s = sv_f;
     *local_ssim += l * c * s;
     *local_l += l;
@@ -47,19 +44,29 @@ static inline void ssim_accumulate_lane(float rm, float cm, float srsc, float l_
 }
 
 /* _iqa_ssim's default case for one pixel, all in scalar code (the columns
- * after the last whole vector). sqrtf of a float is the float of sqrt of
- * it in double, as the scalar code takes it. */
-static inline void ssim_accumulate_scalar_step(float rm, float cm, float rs, float cs, float sb,
-                                               float C1, float C2, float C3, double *local_ssim,
-                                               double *local_l, double *local_c, double *local_s)
+ * after the last whole vector): l and c in double, s as the float sv_f.
+ * sqrtf of a float is the float of sqrt of it in double, as the scalar code
+ * takes it. */
+static inline void ssim_scalar_terms(float rm, float cm, float rs, float cs, float sb, float C1,
+                                     float C2, float C3, double *l, double *c, float *sv_f)
 {
     const float srsc = sqrtf(rs * cs);
     const float l_den = rm * rm + cm * cm + C1;
     const float c_den = rs + cs + C2;
     const float csb = (sb < 0.0f && srsc <= 0.0f) ? 0.0f : sb;
-    const float sv_f = (csb + C3) / (srsc + C3);
-    ssim_accumulate_lane(rm, cm, srsc, l_den, c_den, sv_f, C1, C2, local_ssim, local_l, local_c,
-                         local_s);
+    *sv_f = (csb + C3) / (srsc + C3);
+    *l = (2.0 * rm * cm + C1) / l_den;
+    *c = (2.0 * srsc + C2) / c_den;
+}
+
+static inline void ssim_accumulate_scalar_step(float rm, float cm, float rs, float cs, float sb,
+                                               float C1, float C2, float C3, double *local_ssim,
+                                               double *local_l, double *local_c, double *local_s)
+{
+    double l, c;
+    float sv_f;
+    ssim_scalar_terms(rm, cm, rs, cs, sb, C1, C2, C3, &l, &c, &sv_f);
+    ssim_accumulate_lane(l, c, sv_f, local_ssim, local_l, local_c, local_s);
 }
 
 /*
@@ -145,19 +152,31 @@ static inline double add_lanes_in_order(double sum, __m256d v)
  * (2.0 * rm) * cm + C1 over l_den, (2.0 * srsc + C2) over c_den, and
  * (l * c) * s (every float converted to double exactly), then the four sums
  * in pixel order. */
-static inline void ssim_accumulate_half(__m128 rm, __m128 cm, __m128 srsc, __m128 l_den,
-                                        __m128 c_den, __m128 sv_f, float C1, float C2,
-                                        double *local_ssim, double *local_l, double *local_c,
-                                        double *local_s)
+/* l and c of 4 pixels in double, as ssim_scalar_terms makes them:
+ * (2.0 * rm) * cm + C1 over l_den and (2.0 * srsc + C2) over c_den, every
+ * float converted to double exactly. */
+static inline void ssim_lc_half(__m128 rm, __m128 cm, __m128 srsc, __m128 l_den, __m128 c_den,
+                                float C1, float C2, __m256d *l, __m256d *c)
 {
     const __m256d two = _mm256_set1_pd(2.0);
     const __m256d l_num = _mm256_add_pd(
         _mm256_mul_pd(_mm256_mul_pd(two, _mm256_cvtps_pd(rm)), _mm256_cvtps_pd(cm)),
         _mm256_set1_pd(C1));
-    const __m256d l = _mm256_div_pd(l_num, _mm256_cvtps_pd(l_den));
+    *l = _mm256_div_pd(l_num, _mm256_cvtps_pd(l_den));
     const __m256d c_num = _mm256_add_pd(_mm256_mul_pd(two, _mm256_cvtps_pd(srsc)),
                                         _mm256_set1_pd(C2));
-    const __m256d c = _mm256_div_pd(c_num, _mm256_cvtps_pd(c_den));
+    *c = _mm256_div_pd(c_num, _mm256_cvtps_pd(c_den));
+}
+
+/* ssim_accumulate_lane for 4 pixels: l and c (ssim_lc_half), l * c * s as
+ * (l * c) * s, then the four sums in pixel order. */
+static inline void ssim_accumulate_half(__m128 rm, __m128 cm, __m128 srsc, __m128 l_den,
+                                        __m128 c_den, __m128 sv_f, float C1, float C2,
+                                        double *local_ssim, double *local_l, double *local_c,
+                                        double *local_s)
+{
+    __m256d l, c;
+    ssim_lc_half(rm, cm, srsc, l_den, c_den, C1, C2, &l, &c);
     const __m256d s = _mm256_cvtps_pd(sv_f);
     const __m256d lcs = _mm256_mul_pd(_mm256_mul_pd(l, c), s);
     *local_ssim = add_lanes_in_order(*local_ssim, lcs);
@@ -166,42 +185,106 @@ static inline void ssim_accumulate_half(__m128 rm, __m128 cm, __m128 srsc, __m12
     *local_s = add_lanes_in_order(*local_s, s);
 }
 
+/* The float intermediates of 8 pixels at i, as ssim_scalar_terms makes
+ * them. */
+typedef struct SsimFloatTerms {
+    __m256 rm, cm, srsc, l_den, c_den, sv_f;
+} SsimFloatTerms;
+
+static inline SsimFloatTerms ssim_float_terms_avx2(const float *ref_mu, const float *cmp_mu,
+                                                   const float *ref_sigma_sqd,
+                                                   const float *cmp_sigma_sqd,
+                                                   const float *sigma_both, int i, __m256 vC1,
+                                                   __m256 vC2, __m256 vC3)
+{
+    const __m256 vzero = _mm256_setzero_ps();
+    SsimFloatTerms t;
+    t.rm = _mm256_loadu_ps(ref_mu + i);
+    t.cm = _mm256_loadu_ps(cmp_mu + i);
+    const __m256 rs = _mm256_loadu_ps(ref_sigma_sqd + i);
+    const __m256 cs = _mm256_loadu_ps(cmp_sigma_sqd + i);
+    const __m256 sb = _mm256_loadu_ps(sigma_both + i);
+    t.srsc = _mm256_sqrt_ps(_mm256_mul_ps(rs, cs));
+    t.l_den =
+        _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(t.rm, t.rm), _mm256_mul_ps(t.cm, t.cm)), vC1);
+    t.c_den = _mm256_add_ps(_mm256_add_ps(rs, cs), vC2);
+    const __m256 sb_neg = _mm256_cmp_ps(sb, vzero, _CMP_LT_OQ);
+    const __m256 srsc_le0 = _mm256_cmp_ps(t.srsc, vzero, _CMP_LE_OQ);
+    const __m256 clamped_sb = _mm256_blendv_ps(sb, vzero, _mm256_and_ps(sb_neg, srsc_le0));
+    t.sv_f = _mm256_div_ps(_mm256_add_ps(clamped_sb, vC3), _mm256_add_ps(t.srsc, vC3));
+    return t;
+}
+
 /* 8-wide SIMD block: the float intermediates in 8 lanes, then the double
  * part in two halves of 4 (ssim_accumulate_half). */
 static inline void ssim_accumulate_block_avx2(const float *ref_mu, const float *cmp_mu,
                                               const float *ref_sigma_sqd,
                                               const float *cmp_sigma_sqd, const float *sigma_both,
                                               int i, __m256 vC1, __m256 vC2, __m256 vC3,
-                                              __m256 vzero, float C1, float C2, double *local_ssim,
+                                              float C1, float C2, double *local_ssim,
                                               double *local_l, double *local_c, double *local_s)
 {
-    const __m256 rm = _mm256_loadu_ps(ref_mu + i);
-    const __m256 cm = _mm256_loadu_ps(cmp_mu + i);
-    const __m256 rs = _mm256_loadu_ps(ref_sigma_sqd + i);
-    const __m256 cs = _mm256_loadu_ps(cmp_sigma_sqd + i);
-    const __m256 sb = _mm256_loadu_ps(sigma_both + i);
-    const __m256 srsc = _mm256_sqrt_ps(_mm256_mul_ps(rs, cs));
-    const __m256 l_den =
-        _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(rm, rm), _mm256_mul_ps(cm, cm)), vC1);
-    const __m256 c_den = _mm256_add_ps(_mm256_add_ps(rs, cs), vC2);
-    const __m256 sb_neg = _mm256_cmp_ps(sb, vzero, _CMP_LT_OQ);
-    const __m256 srsc_le0 = _mm256_cmp_ps(srsc, vzero, _CMP_LE_OQ);
-    const __m256 clamped_sb = _mm256_blendv_ps(sb, vzero, _mm256_and_ps(sb_neg, srsc_le0));
-    const __m256 sv_f = _mm256_div_ps(_mm256_add_ps(clamped_sb, vC3), _mm256_add_ps(srsc, vC3));
+    const SsimFloatTerms t = ssim_float_terms_avx2(ref_mu, cmp_mu, ref_sigma_sqd, cmp_sigma_sqd,
+                                                   sigma_both, i, vC1, vC2, vC3);
 
     /* libvmaf-fast: the double part in vectors too, 4 pixels at a time
      * (was ssim_accumulate_lane per pixel): each lane does
      * ssim_accumulate_lane's operations in its order, every one a single
      * IEEE double operation, so the same values; the four sums then take
      * them pixel by pixel, in the scalar loop's order. */
-    ssim_accumulate_half(_mm256_castps256_ps128(rm), _mm256_castps256_ps128(cm),
-                         _mm256_castps256_ps128(srsc), _mm256_castps256_ps128(l_den),
-                         _mm256_castps256_ps128(c_den), _mm256_castps256_ps128(sv_f), C1, C2,
+    ssim_accumulate_half(_mm256_castps256_ps128(t.rm), _mm256_castps256_ps128(t.cm),
+                         _mm256_castps256_ps128(t.srsc), _mm256_castps256_ps128(t.l_den),
+                         _mm256_castps256_ps128(t.c_den), _mm256_castps256_ps128(t.sv_f), C1, C2,
                          local_ssim, local_l, local_c, local_s);
-    ssim_accumulate_half(_mm256_extractf128_ps(rm, 1), _mm256_extractf128_ps(cm, 1),
-                         _mm256_extractf128_ps(srsc, 1), _mm256_extractf128_ps(l_den, 1),
-                         _mm256_extractf128_ps(c_den, 1), _mm256_extractf128_ps(sv_f, 1), C1, C2,
-                         local_ssim, local_l, local_c, local_s);
+    ssim_accumulate_half(_mm256_extractf128_ps(t.rm, 1), _mm256_extractf128_ps(t.cm, 1),
+                         _mm256_extractf128_ps(t.srsc, 1), _mm256_extractf128_ps(t.l_den, 1),
+                         _mm256_extractf128_ps(t.c_den, 1), _mm256_extractf128_ps(t.sv_f, 1), C1,
+                         C2, local_ssim, local_l, local_c, local_s);
+}
+
+void ssim_terms_avx2(const float *ref_mu, const float *cmp_mu, const float *ref_sigma_sqd,
+                     const float *cmp_sigma_sqd, const float *sigma_both, int n, float C1,
+                     float C2, float C3, double *l, double *c, float *s)
+{
+    const __m256 vC1 = _mm256_set1_ps(C1);
+    const __m256 vC2 = _mm256_set1_ps(C2);
+    const __m256 vC3 = _mm256_set1_ps(C3);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const SsimFloatTerms t = ssim_float_terms_avx2(ref_mu, cmp_mu, ref_sigma_sqd,
+                                                       cmp_sigma_sqd, sigma_both, i, vC1, vC2,
+                                                       vC3);
+        __m256d lo_l, lo_c, hi_l, hi_c;
+        ssim_lc_half(_mm256_castps256_ps128(t.rm), _mm256_castps256_ps128(t.cm),
+                     _mm256_castps256_ps128(t.srsc), _mm256_castps256_ps128(t.l_den),
+                     _mm256_castps256_ps128(t.c_den), C1, C2, &lo_l, &lo_c);
+        ssim_lc_half(_mm256_extractf128_ps(t.rm, 1), _mm256_extractf128_ps(t.cm, 1),
+                     _mm256_extractf128_ps(t.srsc, 1), _mm256_extractf128_ps(t.l_den, 1),
+                     _mm256_extractf128_ps(t.c_den, 1), C1, C2, &hi_l, &hi_c);
+        _mm256_storeu_pd(l + i, lo_l);
+        _mm256_storeu_pd(l + i + 4, hi_l);
+        _mm256_storeu_pd(c + i, lo_c);
+        _mm256_storeu_pd(c + i + 4, hi_c);
+        _mm256_storeu_ps(s + i, t.sv_f);
+    }
+    for (; i < n; i++)
+        ssim_scalar_terms(ref_mu[i], cmp_mu[i], ref_sigma_sqd[i], cmp_sigma_sqd[i], sigma_both[i],
+                          C1, C2, C3, l + i, c + i, s + i);
+}
+
+void ssim_add_terms_avx2(const double *l, const double *c, const float *s, int n,
+                         double *ssim_sum, double *l_sum, double *c_sum, double *s_sum)
+{
+    double local_ssim = *ssim_sum;
+    double local_l = *l_sum;
+    double local_c = *c_sum;
+    double local_s = *s_sum;
+    for (int i = 0; i < n; i++)
+        ssim_accumulate_lane(l[i], c[i], s[i], &local_ssim, &local_l, &local_c, &local_s);
+    *ssim_sum = local_ssim;
+    *l_sum = local_l;
+    *c_sum = local_c;
+    *s_sum = local_s;
 }
 
 void ssim_accumulate_avx2(const float *ref_mu, const float *cmp_mu, const float *ref_sigma_sqd,
@@ -212,7 +295,6 @@ void ssim_accumulate_avx2(const float *ref_mu, const float *cmp_mu, const float 
     const __m256 vC1 = _mm256_set1_ps(C1);
     const __m256 vC2 = _mm256_set1_ps(C2);
     const __m256 vC3 = _mm256_set1_ps(C3);
-    const __m256 vzero = _mm256_setzero_ps();
     /* libvmaf-fast: from the running sums, so a picture added in parts gets
      * the sums of one call (from 0.0, the same as adding to 0.0 after) */
     double local_ssim = *ssim_sum;
@@ -223,8 +305,7 @@ void ssim_accumulate_avx2(const float *ref_mu, const float *cmp_mu, const float 
     int i = 0;
     for (; i + 8 <= n; i += 8) {
         ssim_accumulate_block_avx2(ref_mu, cmp_mu, ref_sigma_sqd, cmp_sigma_sqd, sigma_both, i, vC1,
-                                   vC2, vC3, vzero, C1, C2, &local_ssim, &local_l, &local_c,
-                                   &local_s);
+                                   vC2, vC3, C1, C2, &local_ssim, &local_l, &local_c, &local_s);
     }
     for (; i < n; i++) {
         ssim_accumulate_scalar_step(ref_mu[i], cmp_mu[i], ref_sigma_sqd[i], cmp_sigma_sqd[i],

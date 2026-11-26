@@ -41,6 +41,7 @@
 #include "feature/picture_copy.h"
 #include "feature/ssim.h"
 #include "libvmaf/picture.h"
+#include "parallel.h"
 
 /* Noise over smooth gradients, with hard edges, in every plane. */
 static int make_picture(VmafPicture *pic, enum VmafPixelFormat fmt, unsigned bpc, unsigned w,
@@ -101,6 +102,16 @@ static char *test_stripes_are_one_ssim_pass()
             mu_assert("compute_ssim failed",
                       !compute_ssim(ref_f, dis_f, w, h, stride, stride, &score, &l0, &c0, &s0, 1));
             mu_assert("scale 0's terms are not one pass's", l[0] == l0 && c[0] == c0 && s[0] == s0);
+            /* the stripes shared with helper threads: the same sums, in the
+             * same order */
+            double ms_h, l_h[5], c_h[5], s_h[5];
+            mu_assert("helpers", !vmaf_parallel_set_helpers(3));
+            const int err = compute_ms_ssim(ref_f, dis_f, w, h, stride, stride, &ms_h, l_h, c_h, s_h);
+            vmaf_parallel_set_helpers(0);
+            mu_assert("compute_ms_ssim with helpers failed", !err);
+            mu_assert("helpers change the score",
+                      ms_h == ms && !memcmp(l_h, l, sizeof l) && !memcmp(c_h, c, sizeof c) &&
+                      !memcmp(s_h, s, sizeof s));
         }
         vmaf_set_cpu_flags_mask(~0u);
         free(ref_f);
@@ -193,6 +204,16 @@ static char *test_row_decimation_is_the_scalar_decimation()
                 int rw = 0, rh = 0;
                 err |= _iqa_decimate2_rows(test_row, &rows, w, h, &k, got, &rw, &rh);
                 err |= rw != sw || rh != sh;
+                same &= !memcmp(got, want, sw * sh * sizeof(float));
+                /* in bands of 2 rows, last first, through one buffer: each
+                 * band reads its own rows */
+                memset(got, 0, sw * sh * sizeof(float));
+                float *buf = malloc(_iqa_decimate2_buffer_floats(w, &k) * sizeof(float));
+                mu_assert("alloc", buf);
+                for (int y0 = (sh - 1) / 2 * 2; y0 >= 0; y0 -= 2)
+                    err |= _iqa_decimate2_band(test_row, &rows, w, h, &k, got, y0,
+                                               y0 + 2 < sh ? y0 + 2 : sh, buf);
+                free(buf);
                 same &= !memcmp(got, want, sw * sh * sizeof(float));
             }
             vmaf_set_cpu_flags_mask(~0u);

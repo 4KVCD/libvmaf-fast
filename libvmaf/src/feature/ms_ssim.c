@@ -30,6 +30,7 @@
 #include "iqa/decimate.h"
 #include "iqa/ssim_tools.h"
 #include "ms_ssim.h"
+#include "parallel.h"
 #include "picture_copy.h"
 
 /* Low-pass filter for down-sampling (9/7 biorthogonal wavelet filter) */
@@ -60,9 +61,9 @@ static float g_betas[]  = { 0.0448f, 0.2856f, 0.3001f, 0.2363f, 0.1333f };
 static float g_gammas[] = { 0.0448f, 0.2856f, 0.3001f, 0.2363f, 0.1333f };
 
 /* libvmaf-fast: each scale's SSIM is calculated in stripes of this many
- * output rows, whose buffers stay in the CPU's caches: at 4K, 4.0 MB per
- * thread (the two input stripes and _iqa_ssim_add_sums' six buffers, 34 rows
- * each) instead of six full-size pictures per scale. The same sums in the
+ * output rows, whose buffers stay in the CPU's caches: at 4K, 4.2 MB per
+ * thread (stripe_scratch_floats) instead of six full-size pictures per
+ * scale. The same sums in the
  * same order as one pass over the picture, so the same score. 24 rows was
  * the fastest at 4K with 24 threads (64 rows: 20.6 ms a frame, 32: 13.6, 24:
  * 12.3, 16: 12.7; Core Ultra 9 285K); a stripe filters the 10 rows it shares
@@ -72,16 +73,41 @@ static float g_gammas[] = { 0.0448f, 0.2856f, 0.3001f, 0.2363f, 0.1333f };
 /* The input rows of one stripe. */
 #define STRIPE_IN_ROWS (STRIPE_ROWS + GAUSSIAN_LEN - 1)
 
+/* libvmaf-fast: the step down to the next scale is made in bands of this
+ * many output rows, on as many threads as there are (parallel.h): each
+ * output is written once, so the order does not matter. A band reads again
+ * the 7 input rows it shares with the one before (39 rows for 32 new ones);
+ * smaller bands would spread the last step (135 output rows at 4K, 9 bands
+ * per picture) over more threads but read more rows twice. */
+#define DECIMATE_BAND_ROWS 16
+
+/* A stripe's scratch, for a w-wide scale: _iqa_ssim_maps' six buffers of
+ * STRIPE_IN_ROWS rows, then the two input stripes (where the scale is not w
+ * floats per row). The maps' terms (_iqa_ssim_terms) are written from the
+ * sixth buffer on, which _iqa_ssim_maps uses only while it runs, over the
+ * input stripes it has read by then. */
+static size_t stripe_map_floats(int w)
+{
+    return (size_t)STRIPE_IN_ROWS * w;
+}
+
+static size_t stripe_scratch_floats(int w)
+{
+    const size_t inputs = 2 * stripe_map_floats(w);
+    const size_t terms = _iqa_ssim_terms_bytes(STRIPE_ROWS * w) / sizeof(float);
+    const size_t after_maps = stripe_map_floats(w) + inputs;
+    return 5 * stripe_map_floats(w) + (terms > after_maps ? terms : after_maps);
+}
+
 /* libvmaf-fast: compute_ms_ssim's buffers, kept from frame to frame:
  * scaled[0] holds the reference's scales 1 to 4, scaled[1] the distorted's;
- * scale 0 is read where it is (the caller's floats or picture), its stripes
- * copied or converted into in[0] and in[1] where it is not w floats per
- * row; stripe holds one stripe's _iqa_ssim_add_sums buffers. */
+ * scale 0 is read where it is (the caller's floats or picture). scratch is
+ * the calling thread's stripe scratch (stripe_scratch_floats); helper
+ * threads (parallel.h) use their own. */
 struct MsSsimWorkspace {
     int w, h;  /* the largest picture */
     float *scaled[2][SCALES];
-    float *in[2];
-    float *stripe;
+    float *scratch;
 };
 
 /* A side of the next scale, from this scale's. */
@@ -97,9 +123,8 @@ void ms_ssim_workspace_free(MsSsimWorkspace *ws)
     for (int i = 0; i < 2; ++i) {
         for (int idx = 1; idx < SCALES; ++idx)
             free(ws->scaled[i][idx]);
-        free(ws->in[i]);
     }
-    free(ws->stripe);
+    aligned_free(ws->scratch);
     free(ws);
 }
 
@@ -120,13 +145,8 @@ MsSsimWorkspace *ms_ssim_workspace_alloc(int w, int h)
                 goto fail;
         }
     }
-    for (int i = 0; i < 2; ++i) {
-        ws->in[i] = malloc((size_t)STRIPE_IN_ROWS * w * sizeof(float));
-        if (!ws->in[i])
-            goto fail;
-    }
-    ws->stripe = malloc(6 * (size_t)STRIPE_IN_ROWS * w * sizeof(float));
-    if (!ws->stripe)
+    ws->scratch = aligned_malloc(stripe_scratch_floats(w) * sizeof(float), 64);
+    if (!ws->scratch)
         goto fail;
     return ws;
 fail:
@@ -169,24 +189,125 @@ static float *stripe_input(const struct Scale *pic, int y, int rows, int w, floa
     return buf;
 }
 
+/* One scale's stripes as a parallel job (parallel.h): the scale, and the
+ * running sums the stripes add to in turn. */
+struct Stripes {
+    const struct Scale *pics;
+    int w, out_h;
+    const struct _kernel *window;
+    double ssim_sum, l_sum, c_sum, s_sum;
+};
+
+/* A stripe's addition, run in its turn: its terms into the scale's sums. */
+struct StripeSums {
+    struct Stripes *st;
+    const void *terms;
+    int pixels;
+};
+
+static void add_stripe(void *arg)
+{
+    const struct StripeSums *a = arg;
+    struct Stripes *st = a->st;
+    _iqa_ssim_add_pixel_terms(a->terms, a->pixels, &st->ssim_sum, &st->l_sum, &st->c_sum,
+                              &st->s_sum);
+}
+
+/* One stripe: its maps and their terms made in the thread's scratch while
+ * other stripes' are, then the terms added after every stripe above it has
+ * added its own, so the sums are added in the order of one pass down the
+ * picture. */
+static int ssim_stripe(void *ctx, unsigned chunk, void *scratch, VmafParallelJob *job)
+{
+    struct Stripes *st = ctx;
+    const int y = (int)chunk * STRIPE_ROWS;
+    const int rows = st->out_h - y < STRIPE_ROWS ? st->out_h - y : STRIPE_ROWS;
+    const int in_rows = rows + st->window->h - 1;
+    const size_t map_floats = stripe_map_floats(st->w);
+    float *maps = scratch;
+    float *terms = maps + 5 * map_floats;
+    float *in = maps + 6 * map_floats;
+    const int pixels = _iqa_ssim_maps(stripe_input(&st->pics[0], y, in_rows, st->w, in),
+                                      stripe_input(&st->pics[1], y, in_rows, st->w,
+                                                   in + map_floats),
+                                      st->w, in_rows, st->window, maps);
+    _iqa_ssim_terms(maps, st->w, in_rows, pixels, terms);
+    struct StripeSums sums = { st, terms, pixels };
+    vmaf_parallel_in_turn(job, chunk, add_stripe, &sums);
+    return 0;
+}
+
 /* One scale's l, c and s: _iqa_ssim's means over the w x h pictures,
- * calculated in stripes of STRIPE_ROWS output rows. */
-static void ssim_in_stripes(const struct Scale pics[2], int w, int h, const struct _kernel *window,
-                            MsSsimWorkspace *ws, float *l, float *c, float *s)
+ * calculated in stripes of STRIPE_ROWS output rows, shared with the helper
+ * threads. */
+static int ssim_in_stripes(const struct Scale pics[2], int w, int h, const struct _kernel *window,
+                           MsSsimWorkspace *ws, float *l, float *c, float *s)
 {
     const int out_w = w - window->w + 1;
     const int out_h = h - window->h + 1;
-    double ssim_sum = 0.0, l_sum = 0.0, c_sum = 0.0, s_sum = 0.0;
-    for (int y = 0; y < out_h; y += STRIPE_ROWS) {
-        const int rows = out_h - y < STRIPE_ROWS ? out_h - y : STRIPE_ROWS;
-        const int in_rows = rows + window->h - 1;
-        _iqa_ssim_add_sums(stripe_input(&pics[0], y, in_rows, w, ws->in[0]),
-                           stripe_input(&pics[1], y, in_rows, w, ws->in[1]), w, in_rows,
-                           window, ws->stripe, &ssim_sum, &l_sum, &c_sum, &s_sum);
-    }
-    *l = (float)(l_sum / (double)(out_w * out_h));
-    *c = (float)(c_sum / (double)(out_w * out_h));
-    *s = (float)(s_sum / (double)(out_w * out_h));
+    struct Stripes st = { .pics = pics, .w = w, .out_h = out_h, .window = window };
+    const unsigned n_stripes = (unsigned)((out_h + STRIPE_ROWS - 1) / STRIPE_ROWS);
+    const int err = vmaf_parallel_for(n_stripes, ssim_stripe, &st,
+                                      stripe_scratch_floats(w) * sizeof(float), ws->scratch,
+                                      true);
+    if (err)
+        return err;
+    *l = (float)(st.l_sum / (double)(out_w * out_h));
+    *c = (float)(st.c_sum / (double)(out_w * out_h));
+    *s = (float)(st.s_sum / (double)(out_w * out_h));
+    return 0;
+}
+
+/* A float picture's rows, read in place. */
+struct FloatRows {
+    const float *pic;
+    int stride;  /* in floats */
+};
+
+static const float *float_row(void *ctx, int r, float *scratch)
+{
+    const struct FloatRows *f = ctx;
+    (void)scratch;
+    return f->pic + (size_t)r * f->stride;
+}
+
+/* One step down to the next scale as a parallel job (parallel.h): both
+ * pictures of a w x h scale, `bands` bands of DECIMATE_BAND_ROWS output rows
+ * each. */
+struct Decimation {
+    const struct Scale *from;
+    float *to[2];
+    int w, h, bands;
+    const struct _kernel *lpf;
+};
+
+/* One band of one picture, its rows read through the scale's row function
+ * (thread-safe: it writes only into the scratch it is given) or in place. */
+static int decimate_band(void *ctx, unsigned chunk, void *scratch, VmafParallelJob *job)
+{
+    (void)job;
+    const struct Decimation *d = ctx;
+    const struct Scale *pic = &d->from[chunk / d->bands];
+    const int y0 = (int)(chunk % d->bands) * DECIMATE_BAND_ROWS;
+    const int out_h = next_scale(d->h);
+    const int y1 = out_h - y0 < DECIMATE_BAND_ROWS ? out_h : y0 + DECIMATE_BAND_ROWS;
+    struct FloatRows whole = { pic->whole, d->w };
+    const iqa_row_fn row_fn = pic->row_fn ? pic->row_fn : float_row;
+    void *rows = pic->row_fn ? pic->ctx : &whole;
+    return _iqa_decimate2_band(row_fn, rows, d->w, d->h, d->lpf, d->to[chunk / d->bands], y0, y1,
+                               scratch);
+}
+
+/* The next scale of both pictures into `to`. */
+static int decimate(const struct Scale pics[2], int w, int h, const struct _kernel *lpf,
+                    float *const to[2], MsSsimWorkspace *ws)
+{
+    struct Decimation d = { .from = pics, .to = { to[0], to[1] }, .w = w, .h = h, .lpf = lpf };
+    d.bands = (next_scale(h) + DECIMATE_BAND_ROWS - 1) / DECIMATE_BAND_ROWS;
+    /* the band buffer (about 10 rows) fits in a stripe's scratch (34 * 8) */
+    return vmaf_parallel_for(2 * (unsigned)d.bands, decimate_band, &d,
+                             _iqa_decimate2_buffer_floats(w, lpf) * sizeof(float), ws->scratch,
+                             false);
 }
 
 /* MS-SSIM (Wang) with libvmaf's defaults, a Gaussian window and 5 scales,
@@ -223,7 +344,12 @@ static int ms_ssim_of(const struct Scale pics[2], int w, int h, MsSsimWorkspace 
     double msssim = 1.0;
     for (int idx = 0; idx < SCALES; ++idx) {
         float l, c, s;
-        ssim_in_stripes(cur, cur_w, cur_h, &window, ws, &l, &c, &s);
+        /* fails only where a helper thread cannot get its stripe scratch */
+        if (ssim_in_stripes(cur, cur_w, cur_h, &window, ws, &l, &c, &s)) {
+            printf("error: unable to allocate the ms_ssim stripe buffers.\n");
+            fflush(stdout);
+            return 1;
+        }
 
         msssim *= pow(l, g_alphas[idx]) * pow(c, g_betas[idx]) * pow(s, g_gammas[idx]);
         l_scores[idx] = l;
@@ -240,37 +366,20 @@ static int ms_ssim_of(const struct Scale pics[2], int w, int h, MsSsimWorkspace 
 
         /* the next scale: scale 0 decimated as it is read, the others from
          * the workspace */
-        for (int i = 0; i < 2; ++i) {
-            float *next = ws->scaled[i][idx + 1];
-            const int err = idx == 0
-                ? _iqa_decimate2_rows(cur[i].row_fn, cur[i].ctx, cur_w, cur_h, &lpf, next, 0, 0)
-                : _iqa_decimate((float *)cur[i].whole, cur_w, cur_h, 2, &lpf, next, 0, 0);
-            if (err) {
-                printf("error: decimation fails on ref_imgs or cmp_imgs.\n");
-                fflush(stdout);
-                return 1;
-            }
-            cur[i] = (struct Scale){ .whole = next };
+        float *const next[2] = { ws->scaled[0][idx + 1], ws->scaled[1][idx + 1] };
+        if (decimate(cur, cur_w, cur_h, &lpf, next, ws)) {
+            printf("error: decimation fails on ref_imgs or cmp_imgs.\n");
+            fflush(stdout);
+            return 1;
         }
+        for (int i = 0; i < 2; ++i)
+            cur[i] = (struct Scale){ .whole = next[i] };
         cur_w = next_scale(cur_w);
         cur_h = next_scale(cur_h);
     }
 
     *score = msssim;
     return 0;
-}
-
-/* A float picture's rows, read in place. */
-struct FloatRows {
-    const float *pic;
-    int stride;  /* in floats */
-};
-
-static const float *float_row(void *ctx, int r, float *scratch)
-{
-    const struct FloatRows *f = ctx;
-    (void)scratch;
-    return f->pic + (size_t)r * f->stride;
 }
 
 int compute_ms_ssim_ws(const float *ref, const float *cmp, int w, int h,

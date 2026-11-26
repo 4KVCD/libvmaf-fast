@@ -51,12 +51,16 @@
 #define ssim_precompute_simd ssim_precompute_avx2
 #define ssim_variance_simd ssim_variance_avx2
 #define ssim_accumulate_simd ssim_accumulate_avx2
+#define ssim_terms_simd ssim_terms_avx2
+#define ssim_add_terms_simd ssim_add_terms_avx2
 #elif ARCH_AARCH64
 #include "../arm64/ssim_neon.h"
 #define SSIM_SIMD_FLAG VMAF_ARM_CPU_FLAG_NEON
 #define ssim_precompute_simd ssim_precompute_neon
 #define ssim_variance_simd ssim_variance_neon
 #define ssim_accumulate_simd ssim_accumulate_neon
+#define ssim_terms_simd ssim_terms_neon
+#define ssim_add_terms_simd ssim_add_terms_neon
 #endif
 
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
@@ -237,19 +241,71 @@ static void ssim_add_terms(const float *ref_mu, const float *cmp_mu, const float
     }
 }
 
-void _iqa_ssim_add_sums(float *ref, float *cmp, int w, int h, const struct _kernel *k,
-                        float *workspace, double *ssim_sum, double *l_sum, double *c_sum,
-                        double *s_sum)
+int _iqa_ssim_maps(float *ref, float *cmp, int w, int h, const struct _kernel *k,
+                   float *workspace)
 {
     const size_t n = (size_t)w * h;
+    ssim_maps(ref, cmp, &w, &h, k, workspace, workspace + n, workspace + 2 * n,
+              workspace + 3 * n, workspace + 4 * n, workspace + 5 * n, ssim_simd());
+    return ssim_pixels(w, h);
+}
+
+size_t _iqa_ssim_terms_bytes(int pixels)
+{
+    /* l and c in double, s in float: its value is a float division's */
+    return (size_t)pixels * (2 * sizeof(double) + sizeof(float));
+}
+
+void _iqa_ssim_terms(const float *workspace, int w, int h, int pixels, void *terms)
+{
+    /* the maps where _iqa_ssim_maps put them for its w x h input */
+    const size_t n = (size_t)w * h;
+    const float *ref_mu = workspace, *cmp_mu = workspace + n;
+    const float *ref_sigma_sqd = workspace + 2 * n, *cmp_sigma_sqd = workspace + 3 * n;
+    const float *sigma_both = workspace + 4 * n;
     float C1, C2, C3;
     ssim_default_constants(&C1, &C2, &C3);
-    const int simd = ssim_simd();
-    ssim_maps(ref, cmp, &w, &h, k, workspace, workspace + n, workspace + 2 * n,
-              workspace + 3 * n, workspace + 4 * n, workspace + 5 * n, simd);
-    ssim_add_terms(workspace, workspace + n, workspace + 2 * n, workspace + 3 * n,
-                   workspace + 4 * n, ssim_pixels(w, h), C1, C2, C3, simd, ssim_sum, l_sum,
-                   c_sum, s_sum);
+    double *l = terms;
+    double *c = l + pixels;
+    float *s = (float *)(c + pixels);
+#ifdef SSIM_SIMD_FLAG
+    if (ssim_simd()) {
+        ssim_terms_simd(ref_mu, cmp_mu, ref_sigma_sqd, cmp_sigma_sqd, sigma_both, pixels,
+                        C1, C2, C3, l, c, s);
+        return;
+    }
+#endif
+    /* ssim_add_terms' scalar terms, kept for the additions */
+    for (int i = 0; i < pixels; ++i) {
+        const float sigma_ref_sigma_cmp = sqrt(ref_sigma_sqd[i] * cmp_sigma_sqd[i]);
+        l[i] = (2.0 * ref_mu[i] * cmp_mu[i] + C1) / (ref_mu[i]*ref_mu[i] + cmp_mu[i]*cmp_mu[i] + C1);
+        c[i] = (2.0 * sigma_ref_sigma_cmp + C2) /  (ref_sigma_sqd[i] + cmp_sigma_sqd[i] + C2);
+        const float clamped_sigma_both = (sigma_both[i] < 0.0f &&
+                sigma_ref_sigma_cmp <= 0.0f) ? 0.0f : sigma_both[i];
+        s[i] = (clamped_sigma_both + C3) / (sigma_ref_sigma_cmp + C3);
+    }
+}
+
+void _iqa_ssim_add_pixel_terms(const void *terms, int pixels, double *ssim_sum, double *l_sum,
+                               double *c_sum, double *s_sum)
+{
+    const double *l = terms;
+    const double *c = l + pixels;
+    const float *s = (const float *)(c + pixels);
+#ifdef SSIM_SIMD_FLAG
+    if (ssim_simd()) {
+        ssim_add_terms_simd(l, c, s, pixels, ssim_sum, l_sum, c_sum, s_sum);
+        return;
+    }
+#endif
+    /* ssim_add_terms' scalar additions */
+    for (int i = 0; i < pixels; ++i) {
+        const double s_i = s[i];
+        *ssim_sum += l[i] * c[i] * s_i;
+        *l_sum += l[i];
+        *c_sum += c[i];
+        *s_sum += s_i;
+    }
 }
 
 /* _iqa_ssim */

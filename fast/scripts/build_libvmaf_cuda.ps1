@@ -39,7 +39,7 @@ $exports = @(
     'vmaf_model_collection_load_from_path', 'vmaf_model_collection_feature_overload',
     'vmaf_model_collection_destroy', 'vmaf_feature_dictionary_set', 'vmaf_feature_dictionary_free',
     'vmaf_cuda_state_init', 'vmaf_cuda_import_state', 'vmaf_cuda_preallocate_pictures',
-    'vmaf_cuda_fetch_preallocated_picture'
+    'vmaf_cuda_fetch_preallocated_picture', 'vmaf_set_helper_threads'
 )
 if ($NoCuda) { $exports = $exports | Where-Object { -not $_.StartsWith('vmaf_cuda_') } }
 $cuda = if ($NoCuda) { 'false' } else { 'true' }
