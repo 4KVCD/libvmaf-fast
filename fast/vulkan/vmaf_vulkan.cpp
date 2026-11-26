@@ -1067,6 +1067,15 @@ struct vv_context {
     {
         return !(v1 && (skip & 5) == 5 && !cambi && !speed && (!ciede || ciedeFromStaging));
     }
+    // Whether a pass reads the reference picture. VMAF v1 without motion and
+    // ADM (flag bits 16 and 18), SpEED and CIEDE2000 -- a context for CAMBI
+    // alone -- reads only the distorted one: submit leaves the reference's
+    // plane out of the staging buffer and commit out of picRef: half of what
+    // the CPU copied for each pair, and one of the GPU's two copies.
+    bool reference_read() const
+    {
+        return !(v1 && !direct && !shared && !converting && (skip & 5) == 5 && !speed && !ciede);
+    }
 
     // The HDR models' picture conversion on the GPU (vv_v1_convert, shaders/
     // convert.slang): the source pictures go in, and the context's size at 16
@@ -4086,7 +4095,8 @@ int vv_context::submit(const uint8_t *ref, ptrdiff_t refStride, const uint8_t *d
     const double copyBegun = profile ? now_ns() : 0.0;
     const size_t rowBytes = (size_t)w * (bpc > 8 ? 2 : 1);
     copyJob.count = 0;
-    copyJob.planes[copyJob.count++] = { targets[0], strideBytes, ref, refStride, rowBytes, (uint32_t)h };
+    if (reference_read())
+        copyJob.planes[copyJob.count++] = { targets[0], strideBytes, ref, refStride, rowBytes, (uint32_t)h };
     if (score)
         copyJob.planes[copyJob.count++] = { targets[1], strideBytes, dis, disStride, rowBytes, (uint32_t)h };
     copy_planes();
@@ -4252,7 +4262,8 @@ int vv_context::commit(bool score)
         }
     } else if (!direct && !converting && pictures_copied()) {  // (converting: the conversion writes them, after the barrier below)
         VkBufferCopy copy = { 0, 0, planeBytes };
-        vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
+        if (reference_read())
+            vk.vkCmdCopyBuffer(cb, slot.staging.buffer, picRef.buffer, 1, &copy);
         if (score) {
             copy.srcOffset = disOffset;
             vk.vkCmdCopyBuffer(cb, dis_buffer(slot).buffer, picDis.buffer, 1, &copy);
