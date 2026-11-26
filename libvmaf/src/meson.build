@@ -676,6 +676,7 @@ libvmaf_sources = [
     src_dir + 'output.c',
     src_dir + 'fex_ctx_vector.c',
     src_dir + 'thread_pool.c',
+    src_dir + 'parallel.c',
     src_dir + 'dict.c',
     src_dir + 'opt.c',
     src_dir + 'ref.c',

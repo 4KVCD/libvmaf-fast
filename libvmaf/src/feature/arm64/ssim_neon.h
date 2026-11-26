@@ -33,4 +33,13 @@ void ssim_accumulate_neon(const float *ref_mu, const float *cmp_mu, const float 
                           float C2, float C3, double *ssim_sum, double *l_sum, double *c_sum,
                           double *s_sum);
 
+/* ssim_accumulate_neon in two steps, as x86/ssim_avx2.h's ssim_terms_avx2
+ * and ssim_add_terms_avx2: the same sums. */
+void ssim_terms_neon(const float *ref_mu, const float *cmp_mu, const float *ref_sigma_sqd,
+                     const float *cmp_sigma_sqd, const float *sigma_both, int n, float C1,
+                     float C2, float C3, double *l, double *c, float *s);
+
+void ssim_add_terms_neon(const double *l, const double *c, const float *s, int n,
+                         double *ssim_sum, double *l_sum, double *c_sum, double *s_sum);
+
 #endif /* ARM64_SSIM_NEON_H_ */

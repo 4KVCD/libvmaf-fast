@@ -40,7 +40,7 @@
 static int default_release_picture(VmafPicture *pic, void *cookie)
 {
     (void) cookie;
-    aligned_free(pic->data[0]);
+    aligned_calloc_free(pic->data[0]);
     return 0;
 }
 
@@ -144,9 +144,10 @@ int vmaf_picture_alloc(VmafPicture *pic, enum VmafPixelFormat pix_fmt,
     const size_t uv_sz = pic->stride[1] * pic->h[1];
     const size_t pic_size = y_sz + 2 * uv_sz;
 
-    uint8_t *data = aligned_malloc(pic_size, DATA_ALIGN);
+    /* libvmaf-fast: zeroed by calloc, which spares a pool of large pictures
+     * a memset of every page when it is made (mem.h) */
+    uint8_t *data = aligned_calloc(pic_size, DATA_ALIGN);
     if (!data) goto fail;
-    memset(data, 0, pic_size);
     pic->data[0] = data;
     pic->data[1] = data + y_sz;
     pic->data[2] = data + y_sz + uv_sz;
@@ -165,7 +166,7 @@ int vmaf_picture_alloc(VmafPicture *pic, enum VmafPixelFormat pix_fmt,
 free_priv:
     free(pic->priv);
 free_data:
-    aligned_free(data);
+    aligned_calloc_free(data);
 fail:
     return -ENOMEM;
 }

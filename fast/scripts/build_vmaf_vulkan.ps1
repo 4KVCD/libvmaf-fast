@@ -140,6 +140,12 @@ $shaders = [ordered]@{
     # CIEDE2000 (shaders/ciede.slang), in float.
     'ciede_8'           = 'ciede', 'BPC16=0'
     'ciede_16'          = 'ciede', 'BPC16=1'
+    # MS-SSIM (shaders/ms_ssim.slang): a scale's SSIM terms (STAGE 1) and the
+    # next scale (STAGE 2), each multiply and add rounded (its two-sums need it).
+    'ms_ssim_8'         = 'ms_ssim', 'STAGE=1', 'BPC16=0', 'NO_CONTRACTION=1'
+    'ms_ssim_16'        = 'ms_ssim', 'STAGE=1', 'BPC16=1', 'NO_CONTRACTION=1'
+    'ms_ssim_next_8'    = 'ms_ssim', 'STAGE=2', 'BPC16=0', 'NO_CONTRACTION=1'
+    'ms_ssim_next_16'   = 'ms_ssim', 'STAGE=2', 'BPC16=1', 'NO_CONTRACTION=1'
 }
 
 # A SPIR-V module with every float multiply, add, subtract and negation

@@ -139,23 +139,49 @@ static int mirror_row(int r, int h)
     return r < 0 ? -1 - r : r >= h ? 2 * h - 1 - r : r;
 }
 
+/* Whether the row decimation takes kernel k and a w x h picture: the
+ * mirroring above reaches only rows and columns inside the picture when it
+ * is at least as large as the kernel. */
+static int decimate2_fits(int w, int h, const struct _kernel *k)
+{
+    return k && (k->w & 1) && (k->h & 1) && k->w <= MAX_KH && k->h <= MAX_KH &&
+           k->bnd_opt == KBND_SYMMETRIC && w >= k->w && h >= k->h;
+}
+
+size_t _iqa_decimate2_buffer_floats(int w, const struct _kernel *k)
+{
+    /* the ring of kh rows, each split into its sw even and w / 2 odd
+     * samples (2 * sw floats), and one row of scratch for row_fn */
+    return (size_t)k->h * 2 * (w / 2 + (w & 1)) + w;
+}
+
 int _iqa_decimate2_rows(iqa_row_fn row_fn, void *ctx, int w, int h,
                         const struct _kernel *k, float *result, int *rw, int *rh)
 {
-    /* the mirroring above reaches only rows and columns inside the picture
-     * when it is at least as large as the kernel */
-    if (!k || !(k->w & 1) || !(k->h & 1) || k->w > MAX_KH || k->h > MAX_KH ||
-        k->bnd_opt != KBND_SYMMETRIC || w < k->w || h < k->h)
+    if (!decimate2_fits(w, h, k))
+        return 1;
+    float *buf = malloc(_iqa_decimate2_buffer_floats(w, k) * sizeof(float));
+    if (!buf)
+        return 1;
+    const int sh = h / 2 + (h & 1);
+    _iqa_decimate2_band(row_fn, ctx, w, h, k, result, 0, sh, buf);
+    free(buf);
+    if (rw) *rw = w / 2 + (w & 1);
+    if (rh) *rh = sh;
+    return 0;
+}
+
+int _iqa_decimate2_band(iqa_row_fn row_fn, void *ctx, int w, int h,
+                        const struct _kernel *k, float *result, int y0, int y1, float *buf)
+{
+    if (!decimate2_fits(w, h, k))
         return 1;
     const int sw = w / 2 + (w & 1);
-    const int sh = h / 2 + (h & 1);
     const int uc = k->w / 2;
     const int vc = k->h / 2;
     const int kh = k->h;
     const int half = sw;  /* even samples in a row (odd ones: w / 2) */
-    float *ring = malloc(((size_t)kh * 2 * half + w) * sizeof(float));
-    if (!ring)
-        return 1;
+    float *ring = buf;
     float *scratch = ring + (size_t)kh * 2 * half;  /* for row_fn */
     int ring_row[MAX_KH];  /* the input row each ring slot holds */
     for (int i = 0; i < kh; ++i)
@@ -167,7 +193,7 @@ int _iqa_decimate2_rows(iqa_row_fn row_fn, void *ctx, int w, int h,
     int x_hi = (w - 1 - uc) / 2 + 1;
     if (x_hi > sw)
         x_hi = sw;
-    for (int y = 0; y < sh; ++y) {
+    for (int y = y0; y < y1; ++y) {
         /* an output row's rows (mirrored ones included) lie within kh
          * consecutive rows, so their slots row % kh are all different */
         const float *even[MAX_KH], *odd[MAX_KH];
@@ -197,9 +223,6 @@ int _iqa_decimate2_rows(iqa_row_fn row_fn, void *ctx, int w, int h,
         for (x = x_hi; x < sw; ++x)
             out[x] = edge_pixel(even, odd, k, w, x);
     }
-    free(ring);
-    if (rw) *rw = sw;
-    if (rh) *rh = sh;
     return 0;
 }
 

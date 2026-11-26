@@ -124,13 +124,23 @@ float _iqa_ssim_ws(float *ref, float *cmp, int w, int h, const struct _kernel *k
                    const struct _map_reduce *mr, const struct iqa_ssim_args *args,
                    float *l_mean, float *c_mean, float *s_mean, float *workspace);
 
-/* libvmaf-fast: _iqa_ssim's default case (args NULL) for w x h input pixels,
- * its (w - k->w + 1) x (h - k->h + 1) output pixels' l * c * s, l, c and s
- * added to the running sums in pixel order: a picture scored in row
- * stripes (each k->h - 1 rows taller than its output rows) gets the sums of
- * one _iqa_ssim over all of it. workspace: 6 * w * h floats. */
-void _iqa_ssim_add_sums(float *ref, float *cmp, int w, int h, const struct _kernel *k,
-                        float *workspace, double *ssim_sum, double *l_sum, double *c_sum,
-                        double *s_sum);
+/* libvmaf-fast: _iqa_ssim's default case (args NULL) in three steps, for a
+ * picture scored in row stripes, each k->h - 1 rows taller than its output
+ * rows, so that only the additions have to wait for the stripes above.
+ * _iqa_ssim_maps makes the local means and (co)variances of a stripe's
+ * w x h input pixels in workspace (6 * w * h floats) and returns the number
+ * of output pixels, (w - k->w + 1) x (h - k->h + 1). _iqa_ssim_terms writes
+ * each output pixel's l, c and s into terms (_iqa_ssim_terms_bytes of them,
+ * 8-byte aligned). _iqa_ssim_add_pixel_terms then adds each pixel's
+ * l * c * s, l, c and s to the running sums in pixel order. Stripes whose
+ * terms are added one after the other, top to bottom, get the sums of one
+ * _iqa_ssim over the picture, wherever and in whatever order their maps and
+ * terms were made. */
+int _iqa_ssim_maps(float *ref, float *cmp, int w, int h, const struct _kernel *k,
+                   float *workspace);
+size_t _iqa_ssim_terms_bytes(int pixels);
+void _iqa_ssim_terms(const float *workspace, int w, int h, int pixels, void *terms);
+void _iqa_ssim_add_pixel_terms(const void *terms, int pixels, double *ssim_sum, double *l_sum,
+                               double *c_sum, double *s_sum);
 
 #endif /* _SSIM_TOOLS_H_ */

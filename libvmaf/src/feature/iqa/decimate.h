@@ -34,6 +34,8 @@
 #ifndef _DECIMATE_H_
 #define _DECIMATE_H_
 
+#include <stddef.h>
+
 #include "convolve.h"
 
 /**
@@ -63,5 +65,17 @@ typedef const float *(*iqa_row_fn)(void *ctx, int r, float *scratch);
  * KBND_SYMMETRIC, a picture smaller than the kernel, no memory. */
 int _iqa_decimate2_rows(iqa_row_fn row_fn, void *ctx, int w, int h,
                         const struct _kernel *k, float *result, int *rw, int *rh);
+
+/* libvmaf-fast: the floats of the buffer _iqa_decimate2_band takes for a
+ * w-wide picture and kernel k. */
+size_t _iqa_decimate2_buffer_floats(int w, const struct _kernel *k);
+
+/* libvmaf-fast: output rows [y0, y1) of _iqa_decimate2_rows, the same
+ * values, using buf (_iqa_decimate2_buffer_floats of them) for the rows it
+ * reads. Bands of one picture may run on different threads at once, each
+ * with its own buf, when row_fn may. Returns nonzero, having written
+ * nothing, where _iqa_decimate2_rows would for the kernel or size. */
+int _iqa_decimate2_band(iqa_row_fn row_fn, void *ctx, int w, int h,
+                        const struct _kernel *k, float *result, int y0, int y1, float *buf);
 
 #endif /*_DECIMATE_H_*/
