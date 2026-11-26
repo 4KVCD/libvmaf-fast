@@ -188,8 +188,12 @@ enum {
     kSlotCambi = kSlotCm + 2 * kScales * 3,
     kSlotCambiInvalid = kSlotCambi + V1_CAMBI_SCALES * 4,  // a sample above its bit depth's largest
     kSlotCiede = kSlotCambiInvalid + 1,  // CIEDE2000 (vv_v1_ciede): the pixels' dE00 in units of 2^-20
-    kSlots = kSlotCiede + 1
+    // MS-SSIM (vv_v1_ms_ssim), [plane][scale][l, c, s]: the places' terms in
+    // units of 2^-32, signed (s may be negative: two's complement)
+    kSlotMsSsim = kSlotCiede + 1,
+    kSlots = kSlotMsSsim + 3 * 5 * 3
 };
+enum { kMsSsimScales = 5 };
 
 // What vv_features returns per frame.
 enum {
@@ -203,10 +207,10 @@ enum {
 };
 
 // What the API reads of a frame (vv_features, vv_features_v1,
-// vv_v1_cambi_scores, vv_v1_ciede_scores), made from its sums when the GPU is done with it
-// (collect), by the same functions on the same sums as when they were
-// read later, so the sums themselves (kSlots 64-bit values, about 750
-// bytes) need not be kept: only the first kRawFrames frames' are, for
+// vv_v1_cambi_scores, vv_v1_ciede_scores, vv_v1_ms_ssim_scores), made from its sums when the GPU is
+// done with it (collect), by the same functions on the same sums as when they
+// were read later, so the sums themselves (kSlots 64-bit values, about 1.1
+// KB) need not be kept: only the first kRawFrames frames' are, for
 // vv_sums. Motion stays as its SAD sum: a frame's motion2 needs the next
 // frame's.
 struct FrameRecord {
@@ -216,6 +220,7 @@ struct FrameRecord {
     double v1Adm[3] = {};        // VMAF v1's adm3, aim and adm2 (v1_adm)
     double cambi = 0.0;          // VMAF v1's CAMBI
     double ciede = 0.0;          // CIEDE2000 (vv_v1_ciede)
+    double msSsim[3] = {};       // MS-SSIM of Y, Cb, Cr (vv_v1_ms_ssim)
     uint8_t scored = 0;
     int8_t cambiError = 0;       // -5 or -6: vv_v1_cambi_scores fails at this frame
 };
@@ -529,8 +534,10 @@ struct Slot {
     bool planeFromHost[2] = { false, false };
     Buffer speedKeep;                 // and the filtered planes est_params reads (host-visible)
     std::vector<Pass> speedPasses;
-    Buffer ciedeChroma;               // CIEDE2000: the pair's chroma planes (host-visible)
+    Buffer ciedeChroma;               // CIEDE2000 and MS-SSIM YUV: the pair's chroma planes (host-visible)
     std::vector<Pass> ciedePasses;
+    Buffer msSsimScales;              // MS-SSIM: scales 1 to 4 of the pair's planes (msSsimScaleAt)
+    std::vector<Pass> msSsimPasses;
     // vv_pictures: the frame's pictures (indices of vv_context::pictureCache:
     // the reference, the distorted one, the reference before it for motion)
     // and their first samples' places (previous x, y, reference x, y,
@@ -1055,26 +1062,40 @@ struct vv_context {
     // planes ((w + 1) / 2 x (h + 1) / 2, as libvmaf's pictures hold them;
     // SpEED's chroma drops an odd last row and column).
     bool ciede = false;
-    // Its pass reads the luma from the slots' staging, where that is the
-    // GPU's own memory (an integrated GPU, barFrames) and nothing else reads
-    // the pictures (flag bits 16 and 18): no copy into picRef and picDis for
-    // a pass that reads each sample once.
-    bool ciedeFromStaging = false;
     uint32_t ciedeW = 0, ciedeH = 0, ciedeStrideBytes = 0, ciedePlaneBytes = 0;
     int enable_ciede();
+    // The slots' ciedeChroma, made by the first of CIEDE2000 and MS-SSIM YUV
+    // to need it; submit_v1 copies the chroma into it while chroma_copied.
+    int make_chroma_copies();
+    bool chroma_copied() const { return ciede || msSsimPlanes == 3; }
+    // CIEDE2000's and MS-SSIM's passes read the luma from the slots' staging
+    // where that is the GPU's own memory (an integrated GPU, barFrames) and
+    // nothing else reads the pictures (flag bits 16 and 18): no copy into
+    // picRef and picDis for passes that read each sample a few times.
+    bool luma_from_staging() const { return !direct && (skip & 5) == 5 && (integratedGpu || barFrames); }
+
+    // MS-SSIM (vv_v1_ms_ssim, shaders/ms_ssim.slang) of the luma (msSsimPlanes
+    // 1) or of Y, Cb and Cr (3: the chroma from ciedeChroma), five scales a
+    // plane. A slot's msSsimScales holds scales 1 to 4 of each plane's two
+    // pictures, the reference's at msSsimScaleAt[plane][scale - 1][0] (floats),
+    // the distorted's at [1].
+    int msSsimPlanes = 0;
+    uint32_t msSsimScaleAt[3][kMsSsimScales - 1][2] = {};
+    uint32_t msSsimSize[3][kMsSsimScales][2] = {};  // each plane's scales' w and h
+    int enable_ms_ssim(int planes);
     // VMAF v1's copy of the frames into picRef and picDis: whether a pass reads them
     bool pictures_copied() const
     {
-        return !(v1 && (skip & 5) == 5 && !cambi && !speed && (!ciede || ciedeFromStaging));
+        return !(v1 && (skip & 5) == 5 && !cambi && !speed && (!(ciede || msSsimPlanes) || luma_from_staging()));
     }
     // Whether a pass reads the reference picture. VMAF v1 without motion and
-    // ADM (flag bits 16 and 18), SpEED and CIEDE2000 -- a context for CAMBI
-    // alone -- reads only the distorted one: submit leaves the reference's
+    // ADM (flag bits 16 and 18), SpEED, CIEDE2000 and MS-SSIM -- a context for
+    // CAMBI alone -- reads only the distorted one: submit leaves the reference's
     // plane out of the staging buffer and commit out of picRef: half of what
     // the CPU copied for each pair, and one of the GPU's two copies.
     bool reference_read() const
     {
-        return !(v1 && !direct && !shared && !converting && (skip & 5) == 5 && !speed && !ciede);
+        return !(v1 && !direct && !shared && !converting && (skip & 5) == 5 && !speed && !ciede && !msSsimPlanes);
     }
 
     // The HDR models' picture conversion on the GPU (vv_v1_convert, shaders/
@@ -1501,9 +1522,9 @@ int vv_context::compile_pipelines()
     for (std::vector<Pass> *list : { &motion[0], &motion[1], &scored, &convertSides[0].passes, &convertSides[1].passes })
         for (Pass &pass : *list)
             passes.push_back(&pass);
-    for (Slot &slot : slots)  // VMAF v1's per slot (CAMBI's kept c-values, SpEED, CIEDE2000)
+    for (Slot &slot : slots)  // VMAF v1's per slot (CAMBI's kept c-values, SpEED, CIEDE2000, MS-SSIM)
         for (std::vector<Pass> *list : { &slot.cambiKeepPasses, &slot.speedPasses, &slot.speedPassesHost,
-                                         &slot.ciedePasses })
+                                         &slot.ciedePasses, &slot.msSsimPasses })
             for (Pass &pass : *list)
                 passes.push_back(&pass);
     auto words_of = [&](const Pass &pass) {
@@ -3371,20 +3392,15 @@ int vv_context::enable_ciede()
     // the caller scores those on the CPU.
     if (shared || converting)
         return fail(-4, "CIEDE2000 on the GPU takes its frames from host memory (vv_submit_v1)");
-    ciedeW = (uint32_t)(w + 1) / 2;
-    ciedeH = (uint32_t)(h + 1) / 2;
-    ciedeStrideBytes = (ciedeW * (bpc > 8 ? 2 : 1) + 3) & ~3u;
-    ciedePlaneBytes = ciedeStrideBytes * ciedeH;
+    if (int error = make_chroma_copies())
+        return error;
     const uint32_t constants[] = { (uint32_t)w, (uint32_t)h, strideBytes / 4, ciedeW, ciedeH, ciedeStrideBytes / 4,
                                    (uint32_t)bpc, kSlotCiede };
     const int shader = bpc > 8 ? kShader_ciede_16 : kShader_ciede_8;
-    ciedeFromStaging = !direct && (skip & 5) == 5 && (integratedGpu || barFrames);
     for (Slot &slot : slots) {
-        if (int error = create_buffer(slot.ciedeChroma, (VkDeviceSize)ciedePlaneBytes * 4, true, false, true))
-            return error;
         // The luma where the other features read it: the slot's own (direct)
-        // or the copies -- or, read by this pass alone, the slot's staging.
-        const bool fromSlot = direct || ciedeFromStaging;
+        // or the copies -- or, read by these passes alone, the slot's staging.
+        const bool fromSlot = direct || luma_from_staging();
         const Bound ref = fromSlot ? slot_ref(slot) : Bound(&picRef);
         const Bound dis = fromSlot ? slot_dis(slot) : Bound(&picDis);
         if (int error = add_pass(slot.ciedePasses, shader, { ref, dis, &slot.ciedeChroma, &acc }, constants,
@@ -3395,6 +3411,160 @@ int vv_context::enable_ciede()
         return compiled;
     ciede = true;
     return 0;
+}
+
+int vv_context::make_chroma_copies()
+{
+    if (ciedeW)  // made already
+        return 0;
+    const uint32_t chromaWidth = (uint32_t)(w + 1) / 2, chromaHeight = (uint32_t)(h + 1) / 2;
+    const uint32_t stride = (chromaWidth * (bpc > 8 ? 2 : 1) + 3) & ~3u;
+    for (Slot &slot : slots) {
+        if (int error = create_buffer(slot.ciedeChroma, (VkDeviceSize)stride * chromaHeight * 4, true, false, true))
+            return error;
+    }
+    ciedeW = chromaWidth;
+    ciedeH = chromaHeight;
+    ciedeStrideBytes = stride;
+    ciedePlaneBytes = stride * chromaHeight;
+    return 0;
+}
+
+// ---------------------------------------------------------------- MS-SSIM
+
+// ms_ssim.c's ms_ssim_size_fits: the 11-sample window fits in every scale
+// (as there, the sides halved rounding down).
+static bool ms_ssim_size_fits(uint32_t width, uint32_t height)
+{
+    for (int scale = 0; scale < kMsSsimScales; ++scale, width /= 2, height /= 2) {
+        if (width < 11 || height < 11)
+            return false;
+    }
+    return true;
+}
+
+// ssim_tools.c's ssim_default_constants (K1 0.01, K2 0.03, L 255), in float
+static void ms_ssim_constants(float constants[3])
+{
+    const int L = 255;
+    const float K1 = 0.01f, K2 = 0.03f;
+    constants[0] = (K1 * L) * (K1 * L);
+    constants[1] = (K2 * L) * (K2 * L);
+    constants[2] = constants[1] / 2.0f;
+}
+
+// Each plane's five scales: an SSIM pass per scale and a pass making the
+// next scale from it, both reading it, so they run side by side (overlapNext),
+// as do the planes' passes of the same scale (each plane has its own part of
+// msSsimScales): five turns of passes in MS-SSIM's chain.
+int vv_context::enable_ms_ssim(int planes)
+{
+    if (!v1)
+        return fail(-3, "MS-SSIM is calculated in a VMAF v1 context only");
+    if (frames || msSsimPlanes)
+        return fail(-3, "MS-SSIM is started once, before the first frame");
+    if (planes != 1 && planes != 3)
+        return fail(-3, "MS-SSIM takes the luma (1) or Y, Cb and Cr (3)");
+    // as CIEDE2000: its passes read the planes vv_submit_v1 copies into the slots
+    if (shared || converting)
+        return fail(-4, "MS-SSIM on the GPU takes its frames from host memory (vv_submit_v1)");
+    // The chroma planes as float_ms_ssim takes them: libvmaf's pictures' w / 2
+    // x h / 2 (rounding down: an odd width's last column of ciedeChroma, which
+    // holds (w + 1) / 2, is not read).
+    const uint32_t chromaWidth = (uint32_t)w / 2, chromaHeight = (uint32_t)h / 2;
+    if (!ms_ssim_size_fits((uint32_t)w, (uint32_t)h) || (planes == 3 && !ms_ssim_size_fits(chromaWidth, chromaHeight)))
+        return fail(-3, "the pictures are too small for MS-SSIM's five scales");
+    if (planes == 3) {
+        if (int error = make_chroma_copies())
+            return error;
+    }
+    // The scales' sizes (ms_ssim.c's next_scale: halved, rounding up) and places.
+    uint32_t floats = 0;
+    for (int plane = 0; plane < planes; ++plane) {
+        msSsimSize[plane][0][0] = plane ? chromaWidth : (uint32_t)w;
+        msSsimSize[plane][0][1] = plane ? chromaHeight : (uint32_t)h;
+        for (int scale = 1; scale < kMsSsimScales; ++scale) {
+            const uint32_t sw = (msSsimSize[plane][scale - 1][0] + 1) / 2, sh = (msSsimSize[plane][scale - 1][1] + 1) / 2;
+            msSsimSize[plane][scale][0] = sw;
+            msSsimSize[plane][scale][1] = sh;
+            for (int side = 0; side < 2; ++side, floats += sw * sh)
+                msSsimScaleAt[plane][scale - 1][side] = floats;
+        }
+    }
+    float constants[3];
+    ms_ssim_constants(constants);
+    uint32_t constantBits[3];
+    memcpy(constantBits, constants, sizeof constantBits);
+    const bool wide = bpc > 8;
+    for (Slot &slot : slots) {
+        if (int error = create_buffer(slot.msSsimScales, (VkDeviceSize)floats * sizeof(float), false))
+            return error;
+        const bool fromSlot = direct || luma_from_staging();  // as CIEDE2000's
+        for (int scale = 0; scale < kMsSsimScales; ++scale) {
+            for (int plane = 0; plane < planes; ++plane) {
+                // Scale 0: the luma where CIEDE2000 reads it, or the chroma
+                // plane in ciedeChroma (ref U, ref V, dis U, dis V); then
+                // msSsimScales.
+                Bound ref = fromSlot ? slot_ref(slot) : Bound(&picRef);
+                Bound dis = fromSlot ? slot_dis(slot) : Bound(&picDis);
+                uint32_t stride = strideBytes / 4, refFirst = 0, disFirst = 0;
+                if (plane) {
+                    ref = dis = Bound(&slot.ciedeChroma);
+                    stride = ciedeStrideBytes / 4;
+                    refFirst = (uint32_t)(plane - 1) * ciedePlaneBytes / 4;
+                    disFirst = (uint32_t)(plane + 1) * ciedePlaneBytes / 4;
+                }
+                const uint32_t sw = msSsimSize[plane][scale][0], sh = msSsimSize[plane][scale][1];
+                const uint32_t refAt = scale ? msSsimScaleAt[plane][scale - 1][0] : 0;
+                const uint32_t disAt = scale ? msSsimScaleAt[plane][scale - 1][1] : 0;
+                const uint32_t ssim[] = { sw, sh, scale ? 1u : 0u, stride, refFirst, disFirst, (uint32_t)bpc, refAt, disAt,
+                                          (uint32_t)(kSlotMsSsim + (plane * kMsSsimScales + scale) * 3),
+                                          constantBits[0], constantBits[1], constantBits[2] };
+                if (int error = add_pass(slot.msSsimPasses, wide ? kShader_ms_ssim_16 : kShader_ms_ssim_8,
+                                         { ref, dis, &slot.msSsimScales, &acc }, ssim, sizeof ssim,
+                                         groups(sw - 10, 16), groups(sh - 10, 16)))
+                    return error;
+                slot.msSsimPasses.back().overlapNext = true;
+                if (scale + 1 == kMsSsimScales)
+                    continue;
+                const uint32_t nw = msSsimSize[plane][scale + 1][0], nh = msSsimSize[plane][scale + 1][1];
+                const uint32_t next[] = { sw, sh, scale ? 1u : 0u, stride, refFirst, disFirst, (uint32_t)bpc, refAt, disAt,
+                                          msSsimScaleAt[plane][scale][0], msSsimScaleAt[plane][scale][1] };
+                if (int error = add_pass(slot.msSsimPasses, wide ? kShader_ms_ssim_next_16 : kShader_ms_ssim_next_8,
+                                         { ref, dis, &slot.msSsimScales, &acc }, next, sizeof next,
+                                         groups(nw, 16), groups(nh, 16)))
+                    return error;
+                slot.msSsimPasses.back().overlapNext = true;
+            }
+            slot.msSsimPasses.back().overlapNext = false;  // the turn's end: the next scale waits for this one
+        }
+    }
+    if (int compiled = compile_pipelines())  // the passes added here
+        return compiled;
+    msSsimPlanes = planes;
+    return 0;
+}
+
+// A frame's MS-SSIM of a plane from its sums, as ms_ssim.c's ms_ssim_of: each
+// scale's l, c and s the float of the mean, the score the product of their
+// powers.
+static double ms_ssim_score(const uint64_t *sums, int plane, const uint32_t size[kMsSsimScales][2])
+{
+    static const float alphas[kMsSsimScales] = { 0.0000f, 0.0000f, 0.0000f, 0.0000f, 0.1333f };
+    static const float betas[kMsSsimScales] = { 0.0448f, 0.2856f, 0.3001f, 0.2363f, 0.1333f };
+    static const float gammas[kMsSsimScales] = { 0.0448f, 0.2856f, 0.3001f, 0.2363f, 0.1333f };
+    double score = 1.0;
+    for (int scale = 0; scale < kMsSsimScales; ++scale) {
+        const uint64_t *terms = sums + kSlotMsSsim + (plane * kMsSsimScales + scale) * 3;
+        const double places = (double)(size[scale][0] - 10) * (size[scale][1] - 10);
+        float mean[3];
+        for (int t = 0; t < 3; ++t)  // the sum of units of 2^-32, signed
+            mean[t] = (float)((double)(int64_t)terms[t] * (1.0 / 4294967296.0) / places);
+        // (in double, as C's pow there: C++'s pow of two floats is float's)
+        score *= pow((double)mean[0], (double)alphas[scale]) * pow((double)mean[1], (double)betas[scale])
+                 * pow((double)mean[2], (double)gammas[scale]);
+    }
+    return score;
 }
 
 // ------------------------------------------------- the HDR picture conversion
@@ -3980,6 +4150,8 @@ int vv_context::collect(Slot &slot)
             frame.cambiError = (int8_t)cambi_score(sums, nullptr, 0, frame.cambi);
         if (ciede)  // ciede.c's: 45 - 20 log10 of the mean dE00 (+inf for identical pictures, as there)
             frame.ciede = 45.0 - 20.0 * log10((double)sums[kSlotCiede] * (1.0 / 1048576.0) / ((double)w * h));
+        for (int plane = 0; plane < msSsimPlanes; ++plane)
+            frame.msSsim[plane] = ms_ssim_score(sums, plane, msSsimSize[plane]);
     }
     if (speed && slot.scored)  // est_params on the pool's threads, from a copy of the planes
         speedPool.submit(slot.index, (const float *)slot.speedKeep.mapped);
@@ -4115,10 +4287,11 @@ int vv_context::submit_v1(const uint8_t *const planes[6], const ptrdiff_t stride
         return fail(-3, "this context takes its frames from GPU memory");
     if (!planes[0] || (score && !planes[3]))
         return fail(-3, "a frame needs its reference picture, a scored one its distorted one too");
-    if ((speed || ciede) && score) {
+    if ((speed || chroma_copied()) && score) {
         for (int plane : { 1, 2, 4, 5 }) {
             if (!planes[plane])
-                return fail(-3, speed ? "SpEED needs the chroma planes" : "CIEDE2000 needs the chroma planes");
+                return fail(-3, speed ? "SpEED needs the chroma planes"
+                                      : ciede ? "CIEDE2000 needs the chroma planes" : "MS-SSIM YUV needs the chroma planes");
         }
     }
     if (converting) {
@@ -4163,7 +4336,7 @@ int vv_context::submit_v1(const uint8_t *const planes[6], const ptrdiff_t stride
                                                 planes[order[i]], strides[order[i]], chromaW * sampleBytes,
                                                 chromaH };
     }
-    if (ciede && score) {
+    if (chroma_copied() && score) {
         uint8_t *chroma = (uint8_t *)pending->ciedeChroma.mapped;
         const int order[4] = { 1, 2, 4, 5 };  // ref U, ref V, dis U, dis V
         for (int i = 0; i < 4; ++i)
@@ -4301,7 +4474,7 @@ int vv_context::commit(bool score)
     if (converting)  // the frame's pictures converted on the GPU, ending with a barrier
         record_convert(cb, slotIndex, score ? 3u : 1u, stamp);
     const bool moves = !v1 || index >= (options.fiveFrameWindow ? 2u : 1u);
-    const std::vector<Pass> *lists[5] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
+    const std::vector<Pass> *lists[6] = { moves ? &motion[index % 2] : nullptr, score ? &scored : nullptr,
                                           score && cambi ? &slot.cambiKeepPasses : nullptr,
                                           // (shared and converting: from speedChroma, which the conversion
                                           // writes; without shared, speedPasses read it)
@@ -4309,7 +4482,8 @@ int vv_context::commit(bool score)
                                                                 ? &slot.speedPassesHost
                                                                 : &slot.speedPasses)
                                                          : nullptr,
-                                          score && ciede ? &slot.ciedePasses : nullptr };
+                                          score && ciede ? &slot.ciedePasses : nullptr,
+                                          score && msSsimPlanes ? &slot.msSsimPasses : nullptr };
     if (shared)
         slot.chromaFromHost = false;  // the next frame's: from staging unless vv_chroma_staging says
     auto record = [&](const Pass &pass) {
@@ -4338,12 +4512,12 @@ int vv_context::commit(bool score)
     const bool inTurns = !profile && !passLimit;
     if (v1 && inTurns) {
         // VMAF v1's features, independent of each other -- motion, ADM, CAMBI
-        // (and its kept c-values), SpEED, CIEDE2000 -- each a chain of passes that wait
-        // for the one before, recorded in turns: a pass (or passes that
+        // (and its kept c-values), SpEED, CIEDE2000, MS-SSIM -- each a chain of passes that
+        // wait for the one before, recorded in turns: a pass (or passes that
         // overlap) of each chain, then one barrier, so that each waits for
         // its own chain's and the others' passes run beside it (the small
         // ones left the GPU idle between barriers, at 1080p most).
-        std::vector<std::vector<const Pass *>> chains(5);
+        std::vector<std::vector<const Pass *>> chains(6);
         if (moves)
             for (const Pass &pass : motion[index % 2]) chains[0].push_back(&pass);
         if (score) {
@@ -4352,14 +4526,14 @@ int vv_context::commit(bool score)
             if (cambi)
                 for (const Pass &pass : slot.cambiKeepPasses) chains[2].push_back(&pass);
         }
-        for (int c = 3; c < 5; ++c)
+        for (int c = 3; c < 6; ++c)
             if (lists[c])
                 for (const Pass &pass : *lists[c]) chains[(size_t)c].push_back(&pass);
-        size_t at[5] = {};
+        size_t at[6] = {};
         // The stage each chain starts at: CAMBI's first (CLEAR's), the rest after
         // it (the best of the orders tried on a Radeon 780M, by a few percent);
-        // CIEDE2000's single pass with CAMBI's first.
-        const int offsets[5] = { 1, 1, 0, 2, 0 };
+        // CIEDE2000's single pass and MS-SSIM's first turn with CAMBI's first.
+        const int offsets[6] = { 1, 1, 0, 2, 0, 0 };
         int stage = 0;
         for (bool waiting = true; waiting; ++stage) {
             waiting = false;
@@ -5252,6 +5426,33 @@ VV_EXPORT int vv_v1_ciede_scores(vv_context *context, double *out, unsigned fram
     const unsigned n = (unsigned)std::min<size_t>(frames, records.size());
     for (unsigned i = 0; i < n; ++i)
         out[i] = records[i].scored ? records[i].ciede : NAN;
+    return (int)records.size();
+}
+
+// MS-SSIM (libvmaf's float_ms_ssim) of the frame pairs on the GPU: of the
+// luma (planes 1), or of Y, Cb and Cr (3: its enable_chroma, the frames 4:2:0,
+// the chroma planes (w + 1) / 2 x (h + 1) / 2, of which MS-SSIM takes
+// libvmaf's w / 2 x h / 2), for a context made by vv_create_v1,
+// before its first frame; its frames then go in with vv_submit_v1 (or, for
+// the luma alone, vv_submit). For
+// MS-SSIM alone, make the context with flag bits 16 and 18 (no motion, no
+// ADM). The scores are float_ms_ssim's within about 1e-7 (float arithmetic,
+// shaders/ms_ssim.slang). -4 for a context whose frames come from a decoder
+// or are converted (the caller scores those on the CPU); -3 for pictures
+// (or, with 3, chroma planes) too small for the five scales.
+VV_EXPORT int vv_v1_ms_ssim(vv_context *context, int planes) { return context->enable_ms_ssim(planes); }
+
+// Every frame's MS-SSIM of a plane (0 Y, 1 Cb, 2 Cr), after vv_flush, as
+// float_ms_ssim's (not in dB); NaN for a frame that was not scored. Returns
+// the number of frames.
+VV_EXPORT int vv_v1_ms_ssim_scores(vv_context *context, double *out, unsigned frames, int plane)
+{
+    if (plane < 0 || plane >= context->msSsimPlanes)
+        return fail(-3, "MS-SSIM of this plane is not calculated in this context");
+    const Blocks<FrameRecord> &records = context->records;
+    const unsigned n = (unsigned)std::min<size_t>(frames, records.size());
+    for (unsigned i = 0; i < n; ++i)
+        out[i] = records[i].scored ? records[i].msSsim[plane] : NAN;
     return (int)records.size();
 }
 
