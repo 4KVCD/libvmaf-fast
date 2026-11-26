@@ -84,7 +84,7 @@ static void free_picture_data(VmafPicturePool *pool, VmafPicture *pic)
     if (pool->cfg.free_picture_data)
         pool->cfg.free_picture_data(pic, pool->cfg.cookie);
     else
-        aligned_free(pic->data[0]);
+        aligned_calloc_free(pic->data[0]);  /* vmaf_picture_alloc's */
 }
 
 int vmaf_picture_pool_init(VmafPicturePool **pool,
