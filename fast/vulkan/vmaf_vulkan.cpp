@@ -2623,14 +2623,18 @@ int vv_context::init(int deviceIndex, int width, int height, int bitDepth, int f
     // iGPU: ADM 2.97 -> 2.42 ms a 1080p pair), but the fused decouple and
     // masking (adm_dcm) at 16 (0.64 -> 0.44 ms at scale 0), and so the CSF
     // denominator's passes (4K: scale 0 0.213 -> 0.197 ms, 1-3 0.153 -> 0.140);
-    // the others at the driver's choice. Subgroup operations are only integer
-    // sums here (the same in any order): the width changes no sum.
+    // MS-SSIM's two passes at 16 lanes (the driver chose 32: 4K 10-bit luma
+    // 22.3 -> 33.0 pairs a second). The others at the driver's choice. Subgroup
+    // operations are only integer sums here (the same in any order): the
+    // width changes no sum.
     if (subgroupSizeControl && properties.vendorID == 0x8086) {
         for (int i = 0; i < kShaderCount; ++i) {
             const char *name = kShaders[i].name;
             if (!strncmp(name, "adm_", 4))
                 subgroupSizes[i] = !strncmp(name, "adm_dcm", 7) || !strcmp(name, "adm_csf_den_0")
                                    || !strcmp(name, "adm_csf_den") ? 16 : 8;
+            else if (!strncmp(name, "ms_ssim", 7))
+                subgroupSizes[i] = 16;
         }
     }
     if (const char *text = getenv("VV_ADM_FUSED"))

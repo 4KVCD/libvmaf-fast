@@ -99,12 +99,23 @@ static const float kGaussian[11] = { 0.001028, 0.007599, 0.036001, 0.109361, 0.2
 groupshared float gRef[SPAN * SPAN], gDis[SPAN * SPAN];
 // Across: the tile's columns of the five maps for all SPAN rows.
 groupshared float gAcross[5][SPAN * TILE];
-groupshared int64_t gTerms[3][TILE * TILE];
+// The tile's l, c and s sums: of the low parts (0-2), then of the high parts
+// (3-5, two's complement), each exact in 32 bits (below).
+groupshared uint gSums[6];
 
-// A place's l, c or s as a whole number of 2^-32 (exact for |v| >= 2^-8).
-int64_t units(float v)
+// A place's l, c or s as a whole number of 2^-32 (exact for |v| >= 2^-8),
+// split into its high part (whole 2^16 units, floor) and low 16 bits, so a
+// tile's 256 places add up exactly in 32 bits: low sums < 2^24, high sums
+// within +-2^26 even for |s| up to 4 (float error can take s past 1). Every
+// step is exact: t is a whole number below 2^34 in a float, so is h, and
+// t - 65536 h is a whole number below 2^16. The tile's total, high * 65536
+// + low, is the sum of the places' 64-bit units in any order.
+void units(float v, out int high, out uint low)
 {
-    return int64_t(round(v * 4294967296.0));
+    const float t = round(v * 4294967296.0);
+    const float h = floor(t * (1.0 / 65536.0));
+    high = int(h);
+    low = uint(t - h * 65536.0);
 }
 
 [shader("compute")]
@@ -120,6 +131,8 @@ void main(uint3 group : SV_GroupID, uint3 inGroup : SV_GroupThreadID, uint local
         gRef[i] = sample(true, x, y);
         gDis[i] = sample(false, x, y);
     }
+    if (local < 6)
+        gSums[local] = 0;
     GroupMemoryBarrierWithGroupSync();
     for (uint i = local; i < SPAN * TILE; i += TILE * TILE) {
         const uint row = i / TILE, column = i % TILE;
@@ -147,7 +160,8 @@ void main(uint3 group : SV_GroupID, uint3 inGroup : SV_GroupThreadID, uint local
             down.add(gAcross[m][(inGroup.y + v) * TILE + inGroup.x] * kGaussian[v]);
         maps[m] = down.value();
     }
-    int64_t terms[3] = { 0, 0, 0 };
+    int high[3] = { 0, 0, 0 };
+    uint low[3] = { 0, 0, 0 };
     if (x0 + int(inGroup.x) < w - 10 && y0 + int(inGroup.y) < h - 10) {
         const float C1 = asfloat(pc[10]), C2 = asfloat(pc[11]), C3 = asfloat(pc[12]);
         const float muRef = maps[0], muDis = maps[1];
@@ -160,24 +174,24 @@ void main(uint3 group : SV_GroupID, uint3 inGroup : SV_GroupThreadID, uint local
         const float c = (2.0 * rootProduct + C2) / (sigmaRef + sigmaDis + C2);
         const float clamped = (sigmaBoth < 0.0 && rootProduct <= 0.0) ? 0.0 : sigmaBoth;
         const float s = (clamped + C3) / (rootProduct + C3);
-        terms[0] = units(l);
-        terms[1] = units(c);
-        terms[2] = units(s);
+        units(l, high[0], low[0]);
+        units(c, high[1], low[1]);
+        units(s, high[2], low[2]);
     }
-    for (uint t = 0; t < 3; ++t)
-        gTerms[t][local] = terms[t];
+    // 32-bit shared-memory adds: no 64-bit arithmetic, which Intel's GPUs
+    // emulate (4K 10-bit luma on a Core Ultra 9 285K: 33.0 -> 46.3 pairs a
+    // second), and no subgroup operations (any GPU, MoltenVK included).
+    for (uint t = 0; t < 3; ++t) {
+        InterlockedAdd(gSums[t], low[t]);
+        InterlockedAdd(gSums[3 + t], uint(high[t]));
+    }
     GroupMemoryBarrierWithGroupSync();
-    // The tile's sums, halving: no 64-bit subgroup operations (MoltenVK has none).
-    for (uint half = TILE * TILE / 2; half > 0; half /= 2) {
-        if (local < half)
-            for (uint t = 0; t < 3; ++t)
-                gTerms[t][local] += gTerms[t][local + half];
-        GroupMemoryBarrierWithGroupSync();
-    }
     if (local == 0)
-        for (uint t = 0; t < 3; ++t)
-            if (gTerms[t][0] != 0)
-                acc_add64(acc, pc[9] + t, uint64_t(gTerms[t][0]));
+        for (uint t = 0; t < 3; ++t) {
+            const int64_t total = int64_t(int(gSums[3 + t])) * 65536 + int64_t(gSums[t]);
+            if (total != 0)
+                acc_add64(acc, pc[9] + t, uint64_t(total));
+        }
 }
 
 #else  // STAGE 2: the next scale
