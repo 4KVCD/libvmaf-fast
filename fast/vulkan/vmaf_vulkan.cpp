@@ -3484,9 +3484,11 @@ int vv_context::enable_ms_ssim(int planes)
         return fail(-3, "MS-SSIM is started once, before the first frame");
     if (planes != 1 && planes != 3)
         return fail(-3, "MS-SSIM takes the luma (1) or Y, Cb and Cr (3)");
-    // as CIEDE2000: its passes read the planes vv_submit_v1 copies into the slots
-    if (shared || converting)
-        return fail(-4, "MS-SSIM on the GPU takes its frames from host memory (vv_submit_v1)");
+    // The chroma as CIEDE2000's: from the planes vv_submit_v1 copies into the
+    // slots. The luma also where a decoder writes it into the shared slots:
+    // the passes then read it there (direct, fromSlot below), as VMAF's do.
+    if (converting || (shared && planes != 1))
+        return fail(-4, "MS-SSIM on the GPU takes converted pictures and Cb and Cr from host memory (vv_submit_v1)");
     // The chroma planes as float_ms_ssim takes them: libvmaf's pictures' w / 2
     // x h / 2 (rounding down: an odd width's last column of ciedeChroma, which
     // holds (w + 1) / 2, is not read).
