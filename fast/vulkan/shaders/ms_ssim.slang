@@ -29,7 +29,8 @@
 // means and the score from them as ms_ssim.c does.
 //
 // Built with NO_CONTRACTION (every float multiply and add rounded on its
-// own), which the two-sums need.
+// own), which the two-sums need, except on MoltenVK
+// (build_vmaf_vulkan_shaders.py's MOLTENVK_CONTRACTED).
 
 #include "common.slang"
 

@@ -53,8 +53,10 @@ git -c advice.detachedHead=false clone --quiet --filter=blob:none --no-checkout 
 git -C "$work/Vulkan-Headers" -c advice.detachedHead=false checkout --quiet --force "$vulkan_headers_commit"
 
 # Metal has no 64-bit subgroup arithmetic: those sums in 32-bit pieces
-# (shaders/common.slang's wave_sum_u64), the same bits.
-python3 "$repository/fast/scripts/build_vmaf_vulkan_shaders.py" "$work/slang/bin/slangc" "$work/build" WAVE_INT64=0
+# (shaders/common.slang's wave_sum_u64), the same bits. --moltenvk: MS-SSIM's
+# shaders without NoContraction (build_vmaf_vulkan_shaders.py's
+# MOLTENVK_CONTRACTED).
+python3 "$repository/fast/scripts/build_vmaf_vulkan_shaders.py" --moltenvk "$work/slang/bin/slangc" "$work/build" WAVE_INT64=0
 
 # The commit it is built from, which vv_version() reports.
 commit="$(git -C "$repository" rev-parse --short=8 HEAD)"
