@@ -30,12 +30,17 @@
  *   max sample < 2^24, so a box sum converts to float exactly and times a
  *   power of two is (float)(sum * unit) in double.
  * - Table: table[sample] in double, each an exact float, for the other
- *   scales. Gathered 4 at a time.
+ *   scales. Each entry is (float)sample * product, a single rounding of
+ *   the exact product (see ssim_workspace_alloc), so the same float is
+ *   made here with one float multiply, 8 samples at a time, instead of
+ *   gathering the table 4 at a time (the gathers were most of a
+ *   letterboxed film's SSIM time: 4K cropped to 3840x1608 is scale 6).
+ *   Then widened to double and added, as before; no FMA, which would
+ *   round the product and the sum as one.
  */
 
 #include <immintrin.h>
 #include <stdint.h>
-#include <string.h>
 
 #include "ssim_decimate_avx2.h"
 
@@ -146,44 +151,59 @@ void ssim_box_sums_avx2(const uint32_t *col, int scale, int x0, int x1, float un
     }
 }
 
-void ssim_column_table_sums_avx2_8(const uint8_t *const *rows, int scale, int w,
-                                   const double *table, double *col)
+/* Adds table[s] of 8 samples, the float products (float)s * product, to the
+ * column sums: lanes 0-3 to lo, 4-7 to hi, each widened to double. */
+static inline void add_products_8(__m256i samples, __m256 product, __m256d *lo, __m256d *hi)
 {
+    const __m256 p = _mm256_mul_ps(_mm256_cvtepi32_ps(samples), product);
+    *lo = _mm256_add_pd(*lo, _mm256_cvtps_pd(_mm256_castps256_ps128(p)));
+    *hi = _mm256_add_pd(*hi, _mm256_cvtps_pd(_mm256_extractf128_ps(p, 1)));
+}
+
+void ssim_column_table_sums_avx2_8(const uint8_t *const *rows, int scale, int w,
+                                   float product, double *col)
+{
+    const __m256 vproduct = _mm256_set1_ps(product);
     int x = 0;
-    for (; x + 4 <= w; x += 4) {
-        __m256d sum = _mm256_setzero_pd();
+    for (; x + 8 <= w; x += 8) {
+        __m256d lo = _mm256_setzero_pd(), hi = _mm256_setzero_pd();
         for (int v = 0; v < scale; v++) {
-            int32_t four;  /* 4 samples; memcpy: any alignment */
-            memcpy(&four, rows[v] + x, sizeof(four));
-            const __m128i s = _mm_cvtsi32_si128(four);
-            sum = _mm256_add_pd(sum, _mm256_i32gather_pd(table, _mm_cvtepu8_epi32(s), 8));
+            const __m128i s = _mm_loadl_epi64((const __m128i *)(rows[v] + x));
+            add_products_8(_mm256_cvtepu8_epi32(s), vproduct, &lo, &hi);
         }
-        _mm256_storeu_pd(col + x, sum);
+        _mm256_storeu_pd(col + x, lo);
+        _mm256_storeu_pd(col + x + 4, hi);
     }
     for (; x < w; x++) {
         double sum = 0.0;
-        for (int v = 0; v < scale; v++)
-            sum += table[rows[v][x]];
+        for (int v = 0; v < scale; v++) {
+            const float p = (float)rows[v][x] * product;  /* its own statement: never fused */
+            sum += p;
+        }
         col[x] = sum;
     }
 }
 
 void ssim_column_table_sums_avx2_16(const uint16_t *const *rows, int scale, int w,
-                                    const double *table, double *col)
+                                    float product, double *col)
 {
+    const __m256 vproduct = _mm256_set1_ps(product);
     int x = 0;
-    for (; x + 4 <= w; x += 4) {
-        __m256d sum = _mm256_setzero_pd();
+    for (; x + 8 <= w; x += 8) {
+        __m256d lo = _mm256_setzero_pd(), hi = _mm256_setzero_pd();
         for (int v = 0; v < scale; v++) {
-            const __m128i s = _mm_loadl_epi64((const __m128i *)(rows[v] + x));
-            sum = _mm256_add_pd(sum, _mm256_i32gather_pd(table, _mm_cvtepu16_epi32(s), 8));
+            const __m128i s = _mm_loadu_si128((const __m128i *)(rows[v] + x));
+            add_products_8(_mm256_cvtepu16_epi32(s), vproduct, &lo, &hi);
         }
-        _mm256_storeu_pd(col + x, sum);
+        _mm256_storeu_pd(col + x, lo);
+        _mm256_storeu_pd(col + x + 4, hi);
     }
     for (; x < w; x++) {
         double sum = 0.0;
-        for (int v = 0; v < scale; v++)
-            sum += table[rows[v][x]];
+        for (int v = 0; v < scale; v++) {
+            const float p = (float)rows[v][x] * product;
+            sum += p;
+        }
         col[x] = sum;
     }
 }

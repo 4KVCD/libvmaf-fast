@@ -36,6 +36,9 @@
 #include "cpu.h"
 #include "feature/picture_copy.h"
 #include "mem.h"
+#if ARCH_X86
+#include "feature/x86/ssim_decimate_avx2.h"
+#endif
 
 /* A picture of noise over smooth gradients, with hard edges and extremes, in
  * each of its planes. */
@@ -190,6 +193,60 @@ static char *test_avx2_ssim_is_the_scalar_ssim()
     return NULL;
 }
 
+#if ARCH_X86
+/* libvmaf-fast: the AVX2 table sums make each sample's product with a float
+ * multiply, (float)s * (k / divisor), where ssim.c's table holds
+ * (float)s / divisor * k (picture_copy's value times the kernel's float).
+ * The two must be the same float for every sample value, every bit depth and
+ * every scale that is not a power of two (3 to 17: 8K is 17): one row of all
+ * the values (scale 1: each column sum is one product), 3 more columns than
+ * values for the scalar tail. */
+static char *test_avx2_table_products_are_the_tables()
+{
+    vmaf_init_cpu();
+    if (!(vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2))
+        return NULL;
+    static const unsigned depths[] = { 8, 10, 12, 16 };
+    const int w = 65536 + 3;
+    uint8_t *row8 = malloc(w);
+    uint16_t *row16 = malloc(sizeof(*row16) * w);
+    double *col = malloc(sizeof(*col) * w);
+    mu_assert("alloc", row8 && row16 && col);
+    for (size_t d = 0; d < sizeof depths / sizeof depths[0]; d++) {
+        const unsigned bpc = depths[d];
+        const int values = 1 << bpc;
+        const float divisor = bpc == 10 ? 4.0f : bpc == 12 ? 16.0f : bpc == 16 ? 256.0f : 1.0f;
+        for (int x = 0; x < w; x++) {
+            row8[x] = (uint8_t)(x % 256);
+            row16[x] = (uint16_t)(x % values);
+        }
+        for (int scale = 3; scale <= 17; scale++) {
+            if ((scale & (scale - 1)) == 0)
+                continue;
+            const float k = 1.0f / (scale * scale);
+            const int n = values + 3;
+            if (bpc == 8) {
+                const uint8_t *rows[] = { row8 };
+                ssim_column_table_sums_avx2_8(rows, 1, n, k / divisor, col);
+            } else {
+                const uint16_t *rows[] = { row16 };
+                ssim_column_table_sums_avx2_16(rows, 1, n, k / divisor, col);
+            }
+            for (int x = 0; x < n; x++) {
+                const int s = x % values;
+                const float value = bpc == 8 ? (float)s + 0 : (float)s / divisor + 0;
+                const float product = value * k;
+                mu_assert("an AVX2 product is not the table's", col[x] == (double)product);
+            }
+        }
+    }
+    free(row8);
+    free(row16);
+    free(col);
+    return NULL;
+}
+#endif
+
 static char *test_scale_one_and_odd_depths_are_refused()
 {
     VmafPicture ref, dis;
@@ -211,6 +268,9 @@ char *run_tests()
     mu_run_test(test_decimated_ssim_is_compute_ssims);
     mu_run_test(test_decimated_chroma_is_compute_ssims);
     mu_run_test(test_avx2_ssim_is_the_scalar_ssim);
+#if ARCH_X86
+    mu_run_test(test_avx2_table_products_are_the_tables);
+#endif
     mu_run_test(test_scale_one_and_odd_depths_are_refused);
     return NULL;
 }

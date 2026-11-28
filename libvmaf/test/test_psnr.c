@@ -95,32 +95,42 @@ static char *test_16b_large_diff()
 
 
 /* libvmaf-fast: the rows init picks (VMAFx's AVX2 ones where the CPU has
- * AVX2) sum every width to the scalar rows' value, for random errors and the
- * largest. */
+ * AVX2, and for 16-bit samples of at most 12 bits libvmaf-fast's) sum every
+ * width to the scalar rows' value, for random errors and the largest, at
+ * each bit depth: short rows for the tails, and rows past the 12-bit rows'
+ * 1024 samples between widenings, 4K's 3840 among them. */
 static char *test_rows_init_picks_are_the_scalar_rows()
 {
-    enum { N = 100 };
-    uint8_t r8[N], d8[N];
-    uint16_t r16[N], d16[N];
+    enum { N = 4100 };
+    static uint8_t r8[N], d8[N];
+    static uint16_t r16[N], d16[N];
+    static const unsigned depths[] = { 8, 10, 12, 16 };
+    static const unsigned long_rows[] = { 1023, 1024, 1025, 2047, 2048, 3840, N };
     uint32_t state = 1;
     vmaf_init_cpu();
-    PsnrState s = { .enable_luma = true };
-    VmafFeatureExtractor fex = { .priv = &s };
-    mu_assert("init failed", !init(&fex, VMAF_PIX_FMT_YUV400P, 8, 64, 64));
-
-    for (int pass = 0; pass < 2; pass++) {
-        for (unsigned j = 0; j < N; j++) {
-            state = state * 1664525u + 1013904223u;
-            r8[j] = pass ? (j & 1) * 255 : (uint8_t) (state >> 24);
-            d8[j] = pass ? 255 - r8[j] : (uint8_t) (state >> 16);
-            r16[j] = pass ? (j & 1) * 65535 : (uint16_t) (state >> 16);
-            d16[j] = pass ? 65535 - r16[j] : (uint16_t) state;
-        }
-        for (unsigned w = 1; w <= N; w++) {
-            mu_assert("an 8-bit row is not the scalar row's",
-                      s.sse_line_8(r8, d8, w) == sse_line_8_c(r8, d8, w));
-            mu_assert("a 16-bit row is not the scalar row's",
-                      s.sse_line_16(r16, d16, w) == sse_line_16_c(r16, d16, w));
+    for (size_t d = 0; d < sizeof depths / sizeof depths[0]; d++) {
+        const unsigned bpc = depths[d];
+        const uint16_t peak = (uint16_t)((1u << bpc) - 1);
+        PsnrState s = { .enable_luma = true };
+        VmafFeatureExtractor fex = { .priv = &s };
+        mu_assert("init failed", !init(&fex, VMAF_PIX_FMT_YUV400P, bpc, 64, 64));
+        for (int pass = 0; pass < 2; pass++) {
+            for (unsigned j = 0; j < N; j++) {
+                state = state * 1664525u + 1013904223u;
+                r8[j] = pass ? (j & 1) * 255 : (uint8_t) (state >> 24);
+                d8[j] = pass ? 255 - r8[j] : (uint8_t) (state >> 16);
+                r16[j] = pass ? (j & 1) * peak : (uint16_t) (state >> 16) & peak;
+                d16[j] = pass ? peak - r16[j] : (uint16_t) state & peak;
+            }
+            for (unsigned i = 0; i < 100 + sizeof long_rows / sizeof long_rows[0]; i++) {
+                const unsigned w = i < 100 ? i + 1 : long_rows[i - 100];
+                if (bpc == 8)
+                    mu_assert("an 8-bit row is not the scalar row's",
+                              s.sse_line_8(r8, d8, w) == sse_line_8_c(r8, d8, w));
+                else
+                    mu_assert("a 16-bit row is not the scalar row's",
+                              s.sse_line_16(r16, d16, w) == sse_line_16_c(r16, d16, w));
+            }
         }
     }
     return NULL;

@@ -133,7 +133,8 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
 #if ARCH_X86
     if (vmaf_get_cpu_flags() & VMAF_X86_CPU_FLAG_AVX2) {
         s->sse_line_8 = psnr_sse_line_8_avx2;
-        s->sse_line_16 = psnr_sse_line_16_avx2;
+        /* differences of samples of up to 12 bits fit pmaddwd's 16 bits */
+        s->sse_line_16 = bpc <= 12 ? psnr_sse_line_12_avx2 : psnr_sse_line_16_avx2;
     }
 #elif ARCH_AARCH64
     if (vmaf_get_cpu_flags() & VMAF_ARM_CPU_FLAG_NEON) {

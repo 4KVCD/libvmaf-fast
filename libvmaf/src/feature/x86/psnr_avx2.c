@@ -128,3 +128,45 @@ uint64_t psnr_sse_line_16_avx2(const uint16_t *ref, const uint16_t *dis, unsigne
 
     return result;
 }
+
+/*
+ * libvmaf-fast: psnr_sse_line_16_avx2's sum, for samples of at most 12 bits
+ * (integer_psnr.c picks it by bit depth): 5 instructions per 16 samples
+ * instead of about 20.
+ * A difference of two such samples fits 16 bits, so pmaddwd squares 16 of
+ * them and adds them in pairs into 8 exact 32-bit sums, each at most
+ * 2 * 4095^2 < 2^25. 64 of those still fit a 32-bit lane (< 2^31), so the
+ * lanes are widened into the 64-bit total only every 64 steps of 16
+ * samples. Integer sums in any order: the same total.
+ */
+uint64_t psnr_sse_line_12_avx2(const uint16_t *ref, const uint16_t *dis, unsigned w)
+{
+    assert(ref != NULL);
+    assert(dis != NULL);
+    assert(w > 0u);
+    enum { STEPS_PER_FLUSH = 64 };
+    __m256i total = _mm256_setzero_si256();  /* 4 x uint64 */
+    unsigned j = 0;
+    while (j + 16 <= w) {
+        __m256i sum = _mm256_setzero_si256();  /* 8 x uint32 */
+        for (int n = 0; n < STEPS_PER_FLUSH && j + 16 <= w; n++, j += 16) {
+            const __m256i r = _mm256_loadu_si256((const __m256i *)(ref + j));
+            const __m256i d = _mm256_loadu_si256((const __m256i *)(dis + j));
+            const __m256i diff = _mm256_sub_epi16(r, d);
+            sum = _mm256_add_epi32(sum, _mm256_madd_epi16(diff, diff));
+        }
+        total = _mm256_add_epi64(total, _mm256_cvtepu32_epi64(_mm256_castsi256_si128(sum)));
+        total = _mm256_add_epi64(total, _mm256_cvtepu32_epi64(_mm256_extracti128_si256(sum, 1)));
+    }
+
+    __m128i t128 = _mm_add_epi64(_mm256_castsi256_si128(total), _mm256_extracti128_si256(total, 1));
+    t128 = _mm_add_epi64(t128, _mm_shuffle_epi32(t128, 0x4E));
+    uint64_t result = 0;
+    _mm_storel_epi64((__m128i *)&result, t128);  /* not _mm_cvtsi128_si64: x86-64 only */
+
+    for (; j < w; j++) {
+        const uint32_t e = (uint32_t)abs((int32_t)ref[j] - (int32_t)dis[j]);
+        result += (uint64_t)e * e;
+    }
+    return result;
+}

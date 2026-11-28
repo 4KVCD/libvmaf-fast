@@ -30,11 +30,13 @@ void ssim_column_sums_avx2_16(const uint16_t *const *rows, int scale, int w, uin
  * every box sum < 2^24 and unit a power of two, so this is exact. */
 void ssim_box_sums_avx2(const uint32_t *col, int scale, int x0, int x1, float unit, float *out);
 
-/* col[x] = table[rows[0][x]] + ... + table[rows[scale - 1][x]] in double */
+/* col[x] = table[rows[0][x]] + ... + table[rows[scale - 1][x]] in double,
+ * ssim.c's table of each sample's float product: table[s] is
+ * (float)s * product, one float multiply, so it is made here, not read */
 void ssim_column_table_sums_avx2_8(const uint8_t *const *rows, int scale, int w,
-                                   const double *table, double *col);
+                                   float product, double *col);
 void ssim_column_table_sums_avx2_16(const uint16_t *const *rows, int scale, int w,
-                                    const double *table, double *col);
+                                    float product, double *col);
 
 /* out[x] = (float)(col[x * scale - scale / 2] + ... (scale of them)) for
  * x0 <= x < x1, every box inside col */

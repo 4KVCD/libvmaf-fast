@@ -27,4 +27,7 @@ uint32_t psnr_sse_line_8_avx2(const uint8_t *ref, const uint8_t *dis, unsigned w
 
 uint64_t psnr_sse_line_16_avx2(const uint16_t *ref, const uint16_t *dis, unsigned w);
 
+/* libvmaf-fast: psnr_sse_line_16_avx2's sum for samples of at most 12 bits */
+uint64_t psnr_sse_line_12_avx2(const uint16_t *ref, const uint16_t *dis, unsigned w);
+
 #endif /* X86_AVX2_PSNR_H_ */

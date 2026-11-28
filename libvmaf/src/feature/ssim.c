@@ -45,6 +45,7 @@
 #define ssim_column_table_sums_simd_8 ssim_column_table_sums_avx2_8
 #define ssim_column_table_sums_simd_16 ssim_column_table_sums_avx2_16
 #define ssim_box_table_sums_simd ssim_box_table_sums_avx2
+#define SSIM_TABLE_SUMS_ARG(ws) ((ws)->product)  /* makes the products itself */
 #elif ARCH_AARCH64
 #include "arm64/ssim_decimate_neon.h"
 #define SSIM_DECIMATE_SIMD_FLAG VMAF_ARM_CPU_FLAG_NEON
@@ -54,6 +55,7 @@
 #define ssim_column_table_sums_simd_8 ssim_column_table_sums_neon_8
 #define ssim_column_table_sums_simd_16 ssim_column_table_sums_neon_16
 #define ssim_box_table_sums_simd ssim_box_table_sums_neon
+#define SSIM_TABLE_SUMS_ARG(ws) ((ws)->table)
 #endif
 
 /* _ssim_map */
@@ -120,6 +122,7 @@ struct SsimWorkspace {
     unsigned bpc;
     double unit;          /* 1/(scale*scale) over the conversion's divisor */
     double *table;        /* each sample's float product; NULL: unit works */
+    float product;        /* table[s] = (float)s * product, one float multiply */
     bool simd_sums;       /* integer box sums fit ssim_box_sums_simd */
     int *columns;         /* each output's box columns, mirrored: sw * scale */
     double *acc;          /* the C code's row of box sums: sw */
@@ -177,6 +180,10 @@ SsimWorkspace *ssim_workspace_alloc(int w, int h, int scale, unsigned bpc,
             const float product = value * k;
             ws->table[i] = (double)product;
         }
+        /* value is (float)i over a power of two, exactly, so value * k is the
+         * exact i * (k / divisor) rounded once, as (float)i * product is:
+         * k / divisor is exact too (no underflow) */
+        ws->product = k / divisor;
     }
     const uint64_t max_box = (uint64_t)scale * scale * ((1u << bpc) - 1);
     ws->simd_sums = power_of_two && max_box < (1u << 24);
@@ -262,9 +269,11 @@ static void decimate_row_simd(const SsimWorkspace *ws, int wide, float *out)
     if (inside_hi < inside_lo) inside_hi = inside_lo;
     if (ws->table) {
         if (wide)
-            ssim_column_table_sums_simd_16(ws->rows16, scale, ws->w, ws->table, ws->col_table);
+            ssim_column_table_sums_simd_16(ws->rows16, scale, ws->w, SSIM_TABLE_SUMS_ARG(ws),
+                                           ws->col_table);
         else
-            ssim_column_table_sums_simd_8(ws->rows8, scale, ws->w, ws->table, ws->col_table);
+            ssim_column_table_sums_simd_8(ws->rows8, scale, ws->w, SSIM_TABLE_SUMS_ARG(ws),
+                                          ws->col_table);
         ssim_box_table_sums_simd(ws->col_table, scale, inside_lo, inside_hi, out);
     } else {
         if (wide)
