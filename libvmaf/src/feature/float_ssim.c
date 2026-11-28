@@ -28,7 +28,8 @@
 #include "picture_copy.h"
 
 /* The picture planes float_ssim scores: Y, and with enable_chroma Cb and Cr
- * (libvmaf-fast), each at its own size, with its own decimation scale. */
+ * (libvmaf-fast), each at its own size, with its own decimation scale; with
+ * enable_luma off, Cb and Cr alone. */
 #define SSIM_PLANES 3
 
 typedef struct SsimState {
@@ -39,6 +40,7 @@ typedef struct SsimState {
     bool enable_db;
     bool clip_db;
     bool enable_chroma;
+    bool enable_luma;
     double max_db[SSIM_PLANES];
     int scale;
     /* libvmaf-fast: each plane's compute_ssim_decimated buffers, kept from
@@ -86,6 +88,15 @@ static const VmafOption options[] = {
         .type = VMAF_OPT_TYPE_BOOL,
         .default_val.b = false,
     },
+    {
+        /* libvmaf-fast: off where the luma's score is known already (a
+         * saved one), so that only the chroma is scored, as psnr's */
+        .name = "enable_luma",
+        .help = "score the luma plane (float_ssim)",
+        .offset = offsetof(SsimState, enable_luma),
+        .type = VMAF_OPT_TYPE_BOOL,
+        .default_val.b = true,
+    },
     { 0 }
 };
 
@@ -118,6 +129,9 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
 
     if (pix_fmt == VMAF_PIX_FMT_YUV400P)
         s->enable_chroma = false;
+    if (!s->enable_luma && !s->enable_chroma)
+        return -EINVAL;  /* no plane to score */
+    const unsigned first = s->enable_luma ? 0 : 1;
     const unsigned planes = s->enable_chroma ? SSIM_PLANES : 1;
     /* each plane's size, as vmaf_picture_alloc makes it */
     const int ss_hor = pix_fmt != VMAF_PIX_FMT_YUV444P;
@@ -127,7 +141,7 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
     unsigned pw[SSIM_PLANES], ph[SSIM_PLANES];
     int scale[SSIM_PLANES];
     int largest = -1;  /* the decimated plane with the most decimated samples */
-    for (unsigned p = 0; p < planes; p++) {
+    for (unsigned p = first; p < planes; p++) {
         pw[p] = p ? w >> ss_hor : w;
         ph[p] = p ? h >> ss_ver : h;
         if (s->clip_db) {
@@ -152,7 +166,7 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
                                               bpc, NULL);
         if (!s->ws[largest]) return -ENOMEM;
     }
-    for (unsigned p = 0; p < planes; p++) {
+    for (unsigned p = first; p < planes; p++) {
         if (scale[p] > 1 && decimates) {
             if ((int)p == largest) continue;
             s->ws[p] = ssim_workspace_alloc(pw[p], ph[p], scale[p], bpc, s->ws[largest]);
@@ -204,7 +218,7 @@ static int extract(VmafFeatureExtractor *fex,
     (void) dist_pic_90;
 
     const int planes = s->enable_chroma ? SSIM_PLANES : 1;
-    for (int p = 0; p < planes; p++) {
+    for (int p = s->enable_luma ? 0 : 1; p < planes; p++) {
         double score, l_score, c_score, s_score;
         int err = plane_ssim(s, ref_pic, dist_pic, p, &score, &l_score, &c_score, &s_score);
         if (err) return err;
